@@ -27,3 +27,4 @@ CMakeUserPresets.json
 
 # Logs
 *.log
+__pycache__/
