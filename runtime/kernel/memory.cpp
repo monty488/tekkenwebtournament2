@@ -199,8 +199,8 @@ GUEST_IMPORT(NtAllocateVirtualMemory)
 // NTSTATUS NtFreeVirtualMemory(u32* baseAddress, u32* regionSize, u32 freeType, u32 debug)
 GUEST_IMPORT(NtFreeVirtualMemory)
 {
-    constexpr uint32_t MEM_RELEASE = 0x8000;
-    if (ctx.r5.u32 & MEM_RELEASE)
+    constexpr uint32_t X_MEM_RELEASE = 0x8000;
+    if (ctx.r5.u32 & X_MEM_RELEASE)
         Free(Load<uint32_t>(ctx.r3.u32));
     ctx.r3.u64 = STATUS_SUCCESS;
 }
@@ -230,6 +230,6 @@ GUEST_IMPORT(MmGetPhysicalAddress)
 // u32 MmQueryAddressProtect(u32 address)
 GUEST_IMPORT(MmQueryAddressProtect)
 {
-    constexpr uint32_t PAGE_READWRITE = 0x04;
-    ctx.r3.u64 = PAGE_READWRITE;
+    constexpr uint32_t X_PAGE_READWRITE = 0x04;
+    ctx.r3.u64 = X_PAGE_READWRITE;
 }

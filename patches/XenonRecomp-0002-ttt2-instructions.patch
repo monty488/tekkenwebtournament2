@@ -1,5 +1,5 @@
 diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
-index fa91527..eb0b0a5 100644
+index fa91527..269b252 100644
 --- a/XenonRecomp/recompiler.cpp
 +++ b/XenonRecomp/recompiler.cpp
 @@ -1133,6 +1133,7 @@ bool Recompiler::Recompile(
@@ -74,7 +74,20 @@ index fa91527..eb0b0a5 100644
 +            // Float -> half conversion of source element `src` into destination halfword `dst`
 +            // (host indices; vectors are byte-reversed so host f32[3] is x).
 +            auto emitHalf = [&](size_t dst, size_t src)
-+            {
+             {
+-        		// Strip sign from source
+-        		println("\t{}.u32 = ({}.u32[{}]&0x7FFFFFFF);", temp(), v(insn.operands[1]), i);
+-        		// If |source| is > 65504, clamp output to 0x7FFF, else save 8 exponent bits 
+-        		println("\t{0}.u8[0] = ({1}.f32 != {1}.f32) || ({1}.f32 > 65504.0f) ? 0xFF : (({2}.u32[{3}]&0x7f800000)>>23);", vTemp(), temp(), v(insn.operands[1]), i);
+-        		// If 8 exponent bits were saved, it can only be 0x8E at most
+-        		// If saved, save first 10 bits of mantissa
+-        		println("\t{}.u16 = {}.u8[0] != 0xFF ? (({}.u32[{}]&0x7FE000)>>13) : 0x0;", temp(), vTemp(), v(insn.operands[1]), i);
+-        		// If saved and > 127-15, exponent is converted from 8 to 5-bit by subtracting 0x70
+-        		// If saved but not > 127-15, clamp exponent at 0, add 0x400 to mantissa and shift right by (0x71-exponent)
+-        		// If right shift is greater than 31 bits, manually clamp mantissa to 0 or else the output of the shift will be wrong
+-        		println("\t{0}.u16[{1}] = {2}.u8[0] != 0xFF ? ({2}.u8[0] > 0x70 ? ((({2}.u8[0]-0x70)<<10)+{3}.u16) : (0x71-{2}.u8[0] > 31 ? 0x0 : ((0x400+{3}.u16)>>(0x71-{2}.u8[0])))) : 0x7FFF;", v(insn.operands[0]), i+(2*insn.operands[4]), vTemp(), temp());
+-        		// Add back original sign
+-        		println("\t{}.u16[{}] |= (({}.u32[{}]&0x80000000)>>16);", v(insn.operands[0]), i+(2*insn.operands[4]), v(insn.operands[1]), i);
 +                // Strip sign from source
 +                println("\t{}.u32 = ({}.u32[{}]&0x7FFFFFFF);", temp(), v(insn.operands[1]), src);
 +                // If |source| is > 65504, clamp output to 0x7FFF, else save 8 exponent bits
@@ -91,20 +104,7 @@ index fa91527..eb0b0a5 100644
 +            const uint32_t shift = insn.operands[4];
 +
 +            if (insn.operands[2] == 5)
-             {
--        		// Strip sign from source
--        		println("\t{}.u32 = ({}.u32[{}]&0x7FFFFFFF);", temp(), v(insn.operands[1]), i);
--        		// If |source| is > 65504, clamp output to 0x7FFF, else save 8 exponent bits 
--        		println("\t{0}.u8[0] = ({1}.f32 != {1}.f32) || ({1}.f32 > 65504.0f) ? 0xFF : (({2}.u32[{3}]&0x7f800000)>>23);", vTemp(), temp(), v(insn.operands[1]), i);
--        		// If 8 exponent bits were saved, it can only be 0x8E at most
--        		// If saved, save first 10 bits of mantissa
--        		println("\t{}.u16 = {}.u8[0] != 0xFF ? (({}.u32[{}]&0x7FE000)>>13) : 0x0;", temp(), vTemp(), v(insn.operands[1]), i);
--        		// If saved and > 127-15, exponent is converted from 8 to 5-bit by subtracting 0x70
--        		// If saved but not > 127-15, clamp exponent at 0, add 0x400 to mantissa and shift right by (0x71-exponent)
--        		// If right shift is greater than 31 bits, manually clamp mantissa to 0 or else the output of the shift will be wrong
--        		println("\t{0}.u16[{1}] = {2}.u8[0] != 0xFF ? ({2}.u8[0] > 0x70 ? ((({2}.u8[0]-0x70)<<10)+{3}.u16) : (0x71-{2}.u8[0] > 31 ? 0x0 : ((0x400+{3}.u16)>>(0x71-{2}.u8[0])))) : 0x7FFF;", v(insn.operands[0]), i+(2*insn.operands[4]), vTemp(), temp());
--        		// Add back original sign
--        		println("\t{}.u16[{}] |= (({}.u32[{}]&0x80000000)>>16);", v(insn.operands[0]), i+(2*insn.operands[4]), v(insn.operands[1]), i);
++            {
 +                // Pack modes 2 and 3 only differ for shift 3 (w vs z slot); see Xenia's vpkd3d128.
 +                if ((pack != 2 && pack != 3) || shift > 2)
 +                {
@@ -140,7 +140,7 @@ index fa91527..eb0b0a5 100644
          println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_or_si128(simde_mm_andnot_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)), simde_mm_and_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8))));", v(insn.operands[0]), v(insn.operands[3]), v(insn.operands[1]), v(insn.operands[3]), v(insn.operands[2]));
          break;
  
-@@ -2186,6 +2235,323 @@ bool Recompiler::Recompile(
+@@ -2186,6 +2235,336 @@ bool Recompiler::Recompile(
          println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_sub_epi16(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
          break;
  
@@ -210,8 +210,21 @@ index fa91527..eb0b0a5 100644
 +    {
 +        static constexpr const char* bits[] = { "lt", "gt", "eq", "so" };
 +        println("\t--{}.u64;", ctr());
-+        println("\tif ({}.u32 {} 0 && {}{}.{}) goto loc_{:X};", ctr(), id == PPC_INST_BDZF ? "==" : "!=",
-+            id == PPC_INST_BDZF ? "!" : "", cr(insn.operands[0] / 4), bits[insn.operands[0] % 4], insn.operands[1]);
++        const auto condition = fmt::format("{}.u32 {} 0 && {}{}.{}", ctr(), id == PPC_INST_BDZF ? "==" : "!=",
++            id == PPC_INST_BDZF ? "!" : "", cr(insn.operands[0] / 4), bits[insn.operands[0] % 4]);
++        if (insn.operands[1] < fn.base || insn.operands[1] >= fn.base + fn.size)
++        {
++            // Target outside this function: tail call, like printConditionalBranch.
++            println("\tif ({}) {{", condition);
++            print("\t");
++            printFunctionCall(insn.operands[1]);
++            println("\t\treturn;");
++            println("\t}}");
++        }
++        else
++        {
++            println("\tif ({}) goto loc_{:X};", condition, insn.operands[1]);
++        }
 +        break;
 +    }
 +
@@ -464,7 +477,7 @@ index fa91527..eb0b0a5 100644
      case PPC_INST_VUPKD3D128:
          // TODO: vectorize somehow?
          // NOTE: handling vector reversal here too
-@@ -2212,6 +2578,36 @@ bool Recompiler::Recompile(
+@@ -2212,6 +2591,36 @@ bool Recompiler::Recompile(
              println("\t{} = {};", v(insn.operands[0]), vTemp());
              break;
  

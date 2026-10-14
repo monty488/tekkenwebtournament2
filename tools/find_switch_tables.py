@@ -10,10 +10,12 @@ and recognises any ordering of:
   offset   : target = base + (load8/16(table + idx*n) << shift)
 
 It also fixes function boundaries. Leaf functions have no .pdata entry, and
-XenonRecomp's analyser sizes them by scanning for a return, which stops before
-the cases of a jump table. For every switch whose labels fall outside its
-.pdata function, an explicit { address, size } is written into the generated
-block of the main TOML (between the BEGIN/END GENERATED FUNCTIONS markers).
+XenonRecomp's analyser guesses their size, stopping too early around jump
+tables and bdzf chains. For every function start (pdata entries and bl targets),
+the reachable code is found by following branches and switch labels without
+entering another function. Every leaf function, and every .pdata function the
+walk outgrows, gets an explicit { address, size } in the generated block of
+the main TOML (between the BEGIN/END GENERATED FUNCTIONS markers).
 
 Usage: python -I tools/find_switch_tables.py <game/scan> <switch_tables.toml> [main.toml]
 Reads image.bin + image_info.toml (written by ttt2-scan).
@@ -191,7 +193,25 @@ BEGIN = "# BEGIN GENERATED FUNCTIONS (tools/find_switch_tables.py)"
 END = "# END GENERATED FUNCTIONS"
 
 
-def fix_function_bounds(found, word, sections, code):
+# XenonRecomp generates the register save/restore helpers itself: (name, size of the _14 entry).
+HELPERS = {
+    "restgprlr_14_address": 18 * 4 + 12, "savegprlr_14_address": 18 * 4 + 8,
+    "restfpr_14_address": 18 * 4 + 4, "savefpr_14_address": 18 * 4 + 4,
+    "restvmx_14_address": 18 * 8 + 4, "savevmx_14_address": 18 * 8 + 4,
+    "restvmx_64_address": 64 * 8 + 4, "savevmx_64_address": 64 * 8 + 4,
+}
+
+
+def helper_regions(main_toml_text):
+    regions = []
+    for key, size in HELPERS.items():
+        m = re.search(rf"^{key}\s*=\s*(0x[0-9A-Fa-f]+)", main_toml_text, re.M)
+        if m and int(m.group(1), 16):
+            regions.append((int(m.group(1), 16), int(m.group(1), 16) + size))
+    return regions
+
+
+def fix_function_bounds(found, word, sections, code, helpers=()):
     import bisect
 
     pbase, psize = sections[".pdata"]
@@ -201,39 +221,138 @@ def fix_function_bounds(found, word, sections, code):
         if begin:
             pdata.append((begin, ((info >> 8) & 0x3FFFFF) * 4))
     pdata.sort()
-    pstarts = [b for b, _ in pdata]
+    pdata_size = dict(pdata)
 
-    # Every bl target is a function start as far as XenonRecomp is concerned.
-    starts = set(pstarts)
+    switches = {addr: labels for addr, _, labels in found}
+    code_ranges = [(b, b + s) for b, s in code]
+
+    def in_code(a):
+        return any(lo <= a < hi for lo, hi in code_ranges)
+
+    def helper_end(a):
+        for lo, hi in helpers:
+            if lo <= a < hi:
+                return hi
+        return None
+
+    def branch_target(a, i):
+        disp = (i & 0x03FFFFFC) if (i >> 26) == 18 else (i & 0xFFFC)
+        if (i >> 26) == 18 and disp & 0x02000000:
+            disp -= 0x04000000
+        if (i >> 26) == 16 and disp & 0x8000:
+            disp -= 0x10000
+        return disp if (i & 2) else (a + disp) & 0xFFFFFFFF  # AA bit
+
+    # Every branch in the image, as (source, target, is_bl).
+    branches = []
     for sec_base, sec_size in code:
         for a in range(sec_base, sec_base + sec_size, 4):
             i = word(a)
-            if (i >> 26) == 18 and (i & 3) == 1:
-                disp = i & 0x03FFFFFC
-                if disp & 0x02000000:
-                    disp -= 0x04000000
-                starts.add((a + disp) & 0xFFFFFFFF)
-    starts = sorted(starts)
+            if (i >> 26) in (16, 18):
+                branches.append((a, branch_target(a, i), bool(i & 1)))
 
-    bounds = {}
-    for addr, _, labels in found:
-        i = bisect.bisect_right(pstarts, addr) - 1
-        if i >= 0 and pdata[i][0] <= addr < pdata[i][0] + pdata[i][1] and                 all(pdata[i][0] <= l < pdata[i][0] + pdata[i][1] for l in labels):
-            continue  # .pdata already covers it
+    # Function entry points: .pdata, bl targets, then (iteratively) any address another
+    # function branches into.
+    starts = set(pdata_size) | {t for _, t, link in branches if link}
+    starts = {s for s in starts if in_code(s) and helper_end(s) is None}
 
-        # Start: nearest known function start at or before the switch.
-        start = starts[bisect.bisect_right(starts, addr) - 1]
-        if i >= 0 and pdata[i][0] + pdata[i][1] > start and pdata[i][0] <= addr < pdata[i][0] + pdata[i][1]:
-            start = pdata[i][0]
-        # End: next known function start after the last case, minus zero padding.
-        last = max(labels + [addr])
-        j = bisect.bisect_right(starts, last)
-        end = starts[j] if j < len(starts) else last + 4
-        while end - 4 > last and word(end - 4) == 0:
-            end -= 4
-        if start in bounds:
-            end = max(end, start + bounds[start])
-        bounds[start] = end - start
+    def compute(starts):
+        ordered = sorted(starts)
+
+        def extent(start):
+            """End of the code reachable from `start` without entering another function."""
+            end = start + 4
+            seen = set()
+            work = [start]
+            while work:
+                a = work.pop()
+                while a not in seen and in_code(a) and helper_end(a) is None and (a == start or a not in starts):
+                    seen.add(a)
+                    end = max(end, a + 4)
+                    i = word(a)
+                    op = i >> 26
+                    if i == 0x4E800020:                               # blr
+                        break
+                    if op == 18 and not (i & 1):                      # b (tail call if it leaves)
+                        t = branch_target(a, i)
+                        if t not in starts:
+                            work.append(t)
+                        break
+                    if op == 16 and not (i & 1):                      # bc / bdz / bdzf / ...
+                        t = branch_target(a, i)
+                        if t not in starts:
+                            work.append(t)
+                        if ((i >> 21) & 0x14) == 0x14:                # branch always
+                            break
+                    elif i == BCTR:
+                        work.extend(switches.get(a, []))
+                        break
+                    a += 4
+            return end
+
+        def capped_extent(s):
+            # Never overlap the next known function: XenonRecomp's symbol table matches by
+            # containment, and overlapping ranges make its analysis sweep loop forever.
+            e = extent(s)
+            j = bisect.bisect_right(ordered, s)
+            return min(e, ordered[j]) if j < len(ordered) else e
+
+        bounds = {}
+        for s in ordered:
+            e = capped_extent(s)
+            if s in pdata_size:
+                # Trust .pdata unless the walk outgrows it, but still stop at the next
+                # entry point so no two functions overlap.
+                j = bisect.bisect_right(ordered, s)
+                limit = ordered[j] if j < len(ordered) else s + pdata_size[s]
+                e = min(max(e, s + pdata_size[s]), limit)
+                if e == s + pdata_size[s]:
+                    continue  # .pdata size is already right
+            bounds[s] = e - s
+
+        # XenonRecomp then sweeps each code section linearly and starts a new function at
+        # every address nothing covers. Mirror that sweep so those functions get
+        # control-flow-based sizes too instead of XenonRecomp's guess.
+        layout = {}
+        for sec_base, sec_size in code:
+            a, sec_end = sec_base, sec_base + sec_size
+            while a < sec_end:
+                if word(a) == 0:                   # padding (skipped via invalid_instructions)
+                    a += 4
+                    continue
+                h = helper_end(a)
+                if h is not None:
+                    a = h
+                    continue
+                if a in bounds:
+                    size = bounds[a]
+                elif a in pdata_size:
+                    size = pdata_size[a]
+                else:
+                    size = max(capped_extent(a) - a, 4)
+                    bounds[a] = size
+                layout[a] = size
+                a += size
+        return bounds, layout
+
+    for _ in range(10):
+        bounds, layout = compute(starts)
+        fstarts = sorted(layout)
+
+        def owner(a):
+            k = bisect.bisect_right(fstarts, a) - 1
+            return fstarts[k] if k >= 0 and a < fstarts[k] + layout[fstarts[k]] else None
+
+        new = set()
+        for src, dst, link in branches:
+            if link or dst in starts or not in_code(dst) or helper_end(dst) is not None:
+                continue
+            od = owner(dst)
+            if od is not None and od != dst and owner(src) != od:
+                new.add(dst)  # another function jumps into the middle: it is an entry point
+        if not new:
+            break
+        starts |= new
 
     return sorted(bounds.items())
 
@@ -277,7 +396,8 @@ def main():
             elif any(fields(word(a - 4 * k))["op"] == 10 for k in range(2, 10)):
                 unresolved.append(a)  # has a bounds check nearby but no recognised dispatch
 
-    functions = fix_function_bounds(found, word, load_sections(scan_dir), code)
+    helpers = helper_regions(Path(sys.argv[3]).read_text()) if len(sys.argv) > 3 else []
+    functions = fix_function_bounds(found, word, load_sections(scan_dir), code, helpers)
 
     lines = ["# Generated by tools/find_switch_tables.py", ""]
     for a, r, labels in found:

@@ -70,16 +70,40 @@ namespace guest
         ctx.r3.u64 = 0;                                 \
     }
 
-// Common NTSTATUS / Win32 codes.
-constexpr uint32_t STATUS_SUCCESS               = 0x00000000;
-constexpr uint32_t STATUS_PENDING               = 0x00000103;
-constexpr uint32_t STATUS_NOT_IMPLEMENTED       = 0xC0000002;
-constexpr uint32_t STATUS_INVALID_HANDLE        = 0xC0000008;
-constexpr uint32_t STATUS_INVALID_PARAMETER     = 0xC000000D;
-constexpr uint32_t STATUS_END_OF_FILE           = 0xC0000011;
-constexpr uint32_t STATUS_NO_MEMORY             = 0xC0000017;
-constexpr uint32_t STATUS_OBJECT_NAME_NOT_FOUND = 0xC0000034;
-constexpr uint32_t STATUS_OBJECT_PATH_NOT_FOUND = 0xC000003A;
+// Common NTSTATUS / Win32 codes. XenonUtils/xbox.h pulls in <windows.h> on
+// Windows, which already defines some of these as macros (same values), so
+// only define what is missing.
+#ifndef STATUS_SUCCESS
+#define STATUS_SUCCESS               0x00000000u
+#endif
+#ifndef STATUS_PENDING
+#define STATUS_PENDING               0x00000103u
+#endif
+#ifndef STATUS_NOT_IMPLEMENTED
+#define STATUS_NOT_IMPLEMENTED       0xC0000002u
+#endif
+#ifndef STATUS_INVALID_HANDLE
+#define STATUS_INVALID_HANDLE        0xC0000008u
+#endif
+#ifndef STATUS_INVALID_PARAMETER
+#define STATUS_INVALID_PARAMETER     0xC000000Du
+#endif
+#ifndef STATUS_END_OF_FILE
+#define STATUS_END_OF_FILE           0xC0000011u
+#endif
+#ifndef STATUS_NO_MEMORY
+#define STATUS_NO_MEMORY             0xC0000017u
+#endif
+#ifndef STATUS_OBJECT_NAME_NOT_FOUND
+#define STATUS_OBJECT_NAME_NOT_FOUND 0xC0000034u
+#endif
+#ifndef STATUS_OBJECT_PATH_NOT_FOUND
+#define STATUS_OBJECT_PATH_NOT_FOUND 0xC000003Au
+#endif
 
-constexpr uint32_t ERROR_SUCCESS                = 0;
-constexpr uint32_t ERROR_DEVICE_NOT_CONNECTED   = 0x48F;
+#ifndef ERROR_SUCCESS
+#define ERROR_SUCCESS                0u
+#endif
+#ifndef ERROR_DEVICE_NOT_CONNECTED
+#define ERROR_DEVICE_NOT_CONNECTED   0x48Fu
+#endif

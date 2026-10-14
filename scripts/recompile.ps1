@@ -8,10 +8,27 @@ if ((Get-Content $config -Raw) -match '(?m)^\w+_address\s*=\s*0x0+\s*$') {
 }
 
 & "$PSScriptRoot\apply-patches.ps1"
+
+# Generate into an empty directory: when a run produces fewer translation units, the old
+# extra ppc_recomp.N.cpp files would otherwise linger and get compiled (duplicate symbols).
+# Files whose content is unchanged get their previous timestamp back so Ninja skips them.
+$prevDir = "$PpcDir.prev"
+if (Test-Path $prevDir) { Remove-Item -Recurse -Force $prevDir }
+if (Test-Path $PpcDir) { Rename-Item $PpcDir $prevDir }
 New-Item -ItemType Directory -Force $PpcDir | Out-Null
 
 $context = Join-Path $Third 'XenonRecomp\XenonUtils\ppc_context.h'
 Invoke-Checked (Find-HostTool 'XenonRecomp') @($config, $context)
+
+if (Test-Path $prevDir) {
+    foreach ($file in Get-ChildItem $PpcDir -File) {
+        $old = Join-Path $prevDir $file.Name
+        if ((Test-Path $old) -and ((Get-FileHash $old).Hash -eq (Get-FileHash $file.FullName).Hash)) {
+            $file.LastWriteTime = (Get-Item $old).LastWriteTime
+        }
+    }
+    Remove-Item -Recurse -Force $prevDir
+}
 
 Invoke-Checked python @('-I', (Join-Path $PSScriptRoot 'gen_import_stubs.py'))
 

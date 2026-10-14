@@ -101,7 +101,7 @@ using namespace guest;
 //                         u32 startAddress, u32 parameter, u32 creationFlags)
 GUEST_IMPORT(ExCreateThread)
 {
-    constexpr uint32_t CREATE_SUSPENDED = 0x1;
+    constexpr uint32_t X_CREATE_SUSPENDED = 0x1;
 
     const uint32_t pHandle = ctx.r3.u32;
     const uint32_t pThreadId = ctx.r5.u32;
@@ -112,7 +112,7 @@ GUEST_IMPORT(ExCreateThread)
 
     auto thread = std::make_shared<GuestThread>();
     thread->id = g_nextThreadId.fetch_add(1);
-    thread->suspendCount = (flags & CREATE_SUSPENDED) ? 1 : 0;
+    thread->suspendCount = (flags & X_CREATE_SUSPENDED) ? 1 : 0;
 
     std::thread([thread, xapiStartup, startAddress, parameter]
     {
