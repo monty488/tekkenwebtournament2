@@ -28,14 +28,14 @@ non_volatile_as_local = false
 
 # Register save/restore helpers. Fill from game/scan/recomp_addresses.toml.
 # XenonRecomp will refuse to run while these are 0.
-restgprlr_14_address = 0x00000000
-savegprlr_14_address = 0x00000000
-restfpr_14_address   = 0x00000000
-savefpr_14_address   = 0x00000000
-restvmx_14_address   = 0x00000000
-savevmx_14_address   = 0x00000000
-restvmx_64_address   = 0x00000000
-savevmx_64_address   = 0x00000000
+restgprlr_14_address = 0x82BAF6A0
+savegprlr_14_address = 0x82BAF650
+restfpr_14_address = 0x82BB033C
+savefpr_14_address = 0x82BB02F0
+restvmx_14_address = 0x82BB1558
+savevmx_14_address = 0x82BB12C0
+restvmx_64_address = 0x82BB15EC
+savevmx_64_address = 0x82BB1354
 
 # setjmp/longjmp are redirected to native versions. Find longjmp near calls to
 # RtlUnwind; setjmp usually follows it. Delete these lines if TTT2 doesn't use them.
@@ -57,3 +57,77 @@ invalid_instructions = [
 # name = "ExampleMidAsmHook"
 # address = 0x00000000
 # registers = ["r3"]
+
+# BEGIN GENERATED FUNCTIONS (tools/find_switch_tables.py)
+functions = [
+    { address = 0x82285320, size = 0x1BC },
+    { address = 0x822AAF88, size = 0x90 },
+    { address = 0x822AB018, size = 0x90 },
+    { address = 0x822AB0A8, size = 0x94 },
+    { address = 0x822C5718, size = 0x330 },
+    { address = 0x822C5DD0, size = 0xC0 },
+    { address = 0x822D6690, size = 0xD0 },
+    { address = 0x822E2758, size = 0x13C },
+    { address = 0x822E6B70, size = 0xF0 },
+    { address = 0x822EA9C8, size = 0x5A8 },
+    { address = 0x822FA2F8, size = 0x24C },
+    { address = 0x822FA950, size = 0x364 },
+    { address = 0x822FACB8, size = 0x1798 },
+    { address = 0x823566F8, size = 0x440 },
+    { address = 0x8235A3E0, size = 0x90 },
+    { address = 0x8236D4E0, size = 0x1D0 },
+    { address = 0x82377EA0, size = 0x124 },
+    { address = 0x82399188, size = 0x140 },
+    { address = 0x82399A40, size = 0x130 },
+    { address = 0x823BAD70, size = 0x110 },
+    { address = 0x823E72E0, size = 0x90 },
+    { address = 0x82404518, size = 0xFC },
+    { address = 0x824BF7F0, size = 0xF4 },
+    { address = 0x824C03E8, size = 0xA8 },
+    { address = 0x824CD888, size = 0x108 },
+    { address = 0x824D8118, size = 0x160 },
+    { address = 0x824D8A60, size = 0x16C },
+    { address = 0x824F18F8, size = 0x128 },
+    { address = 0x824F1A20, size = 0x524 },
+    { address = 0x824F5250, size = 0xD8 },
+    { address = 0x824F5AB8, size = 0x178 },
+    { address = 0x82526D30, size = 0x128 },
+    { address = 0x8258CB18, size = 0x888 },
+    { address = 0x8258D3A0, size = 0x788 },
+    { address = 0x8258E9C8, size = 0x2F4 },
+    { address = 0x8258ECC0, size = 0x3A8 },
+    { address = 0x8258F068, size = 0x66C },
+    { address = 0x8258F6D8, size = 0x1034 },
+    { address = 0x82590710, size = 0x128 },
+    { address = 0x82590A38, size = 0x134 },
+    { address = 0x8259A318, size = 0x144 },
+    { address = 0x8261C738, size = 0xB44 },
+    { address = 0x82636F38, size = 0xB0 },
+    { address = 0x82636FE8, size = 0xC8 },
+    { address = 0x8268FCF0, size = 0xEC },
+    { address = 0x8268FDE0, size = 0x114 },
+    { address = 0x826D2608, size = 0x1A0 },
+    { address = 0x826FCD38, size = 0x1A4 },
+    { address = 0x82751610, size = 0x124 },
+    { address = 0x82751868, size = 0xD0 },
+    { address = 0x82787750, size = 0xE0 },
+    { address = 0x8289F218, size = 0x140 },
+    { address = 0x8289F358, size = 0xFC },
+    { address = 0x8289F7D8, size = 0xB8 },
+    { address = 0x8289FE08, size = 0x194 },
+    { address = 0x828A0400, size = 0x150 },
+    { address = 0x828A0550, size = 0x194 },
+    { address = 0x828A06E8, size = 0x18C },
+    { address = 0x828B9E60, size = 0x458 },
+    { address = 0x82B54BF8, size = 0x288 },
+    { address = 0x82B54E80, size = 0x368 },
+    { address = 0x82B551E8, size = 0x29C },
+    { address = 0x82B55488, size = 0x328 },
+    { address = 0x82B55FE8, size = 0x378 },
+    { address = 0x82B56360, size = 0x380 },
+    { address = 0x82B566E0, size = 0x3F0 },
+    { address = 0x82B56AD0, size = 0x29C },
+    { address = 0x82B56D70, size = 0x29C },
+    { address = 0x82C84208, size = 0x150 },
+]
+# END GENERATED FUNCTIONS

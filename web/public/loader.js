@@ -44,13 +44,22 @@ async function opfsRoot() {
   return navigator.storage.getDirectory();
 }
 
+// Case-insensitive, like the console's file system (TTT2 ships "Default.xex").
 async function fileExists(root, path) {
   try {
     let dir = root;
-    const parts = path.split('/');
-    for (const part of parts.slice(0, -1)) dir = await dir.getDirectoryHandle(part);
-    await dir.getFileHandle(parts.at(-1));
-    return true;
+    const parts = path.toLowerCase().split('/');
+    for (const [i, part] of parts.entries()) {
+      let next = null;
+      for await (const [name, handle] of dir.entries()) {
+        if (name.toLowerCase() === part) { next = handle; break; }
+      }
+      if (!next) return false;
+      if (i === parts.length - 1) return next.kind === 'file';
+      if (next.kind !== 'directory') return false;
+      dir = next;
+    }
+    return false;
   } catch {
     return false;
   }
@@ -84,7 +93,7 @@ async function importGameFolder() {
   for await (const entry of walk(picked)) {
     if (entry[0].startsWith('files/') || entry[0].startsWith('scan/')) entries.push(entry);
   }
-  if (!entries.some(([p]) => p === 'scan/image.bin')) {
+  if (!entries.some(([p]) => p.toLowerCase() === 'scan/image.bin')) {
     alert('That folder has no scan/image.bin. Pick the repo\'s game folder after running scripts/scan-xex.ps1.');
     return;
   }

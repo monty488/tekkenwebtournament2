@@ -10,14 +10,19 @@ Rough milestones, in order. Each depends on the previous one.
 - [x] Runtime skeleton: guest memory, threads, TLS, critical sections, file I/O, input
 - [x] Auto-generated import stubs from the game's real import list
 - [x] Web shell: capability checks, OPFS import, COOP/COEP dev server
-- [ ] First successful `scripts/recompile.ps1` on the real XEX
-- [ ] First successful native and web builds (none of the C++ has been compiled yet)
+- [x] First successful `scripts/recompile.ps1` on the real XEX
+- [ ] First successful native and web builds (generated TUs compile individually; full link not attempted yet)
 
 ## M1: Recompilation is clean
-- [ ] Fill helper addresses; find setjmp/longjmp
-- [ ] Resolve every XenonRecomp warning (missing instructions, unresolved jump tables)
-- [ ] Teach XenonAnalyse TTT2's jump table patterns if needed
-- [ ] Mark non-code data in `.text` as `invalid_instructions`
+- [x] Fill helper addresses (all eight found uniquely by `ttt2-scan`)
+- [ ] Find setjmp/longjmp, if TTT2 uses them
+- [x] Resolve every XenonRecomp warning: ~70 missing instructions added
+      (`patches/XenonRecomp-0002-ttt2-instructions.patch`), zero warnings left
+- [x] Jump tables: `tools/find_switch_tables.py` finds 526 (XenonAnalyse found 0) and
+      fixes 69 leaf-function boundaries
+- [ ] Remaining traps: 4 instructions in data-as-code (`macchwu`, `maclhwu`, `blrl`).
+      Confirm they are unreachable, or mark them `invalid_instructions`
+- [ ] Unit-test the new instruction implementations against Xenia's PPC tests (XenonTests)
 
 ## M2: Boots to the render loop (native first)
 - [ ] Dispatcher objects: events, semaphores, mutants, waits, timers

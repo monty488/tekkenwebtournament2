@@ -12,7 +12,8 @@ $xiso = Find-HostTool 'extract-xiso'
 $files = Join-Path $GameDir 'files'
 New-Item -ItemType Directory -Force $files | Out-Null
 
-Invoke-Checked $xiso @('-x', (Resolve-Path $Iso).Path, '-d', $files)
+# extract-xiso stops parsing options at the first file name, so -d must come first.
+Invoke-Checked $xiso @('-d', $files, '-x', (Resolve-Path $Iso).Path)
 
 if (-not (Test-Path (Join-Path $files 'default.xex'))) {
     throw ("default.xex not found after extraction. If your dump is a Games-on-Demand (GOD) " +

@@ -15,10 +15,18 @@ What XenonRecomp needs from us (`recomp/config/TTT2.toml`):
 
 * **Register save/restore helper addresses.** `tools/ttt2-scan` finds these by the
   byte patterns from XenonRecomp's README.
-* **Jump tables.** `XenonAnalyse` detects them. Its patterns were written for
-  Sonic Unleashed, so expect to add detection for TTT2's compiler output if
-  `XenonRecomp` reports unresolved `bctr`s.
-* **Function boundaries** that the analyser gets wrong (`functions = [...]`).
+* **Jump tables.** XenonAnalyse's fixed patterns find none in TTT2, because its
+  compiler schedules the dispatch as `lis, rlwinm, addi, lwzx` rather than
+  `lis, addi, rlwinm, lwzx`. Some bounds checks are also conditional returns or
+  copy the index first. `tools/find_switch_tables.py` symbolically executes the
+  instructions before each `bctr` instead, and finds 526 tables.
+* **Function boundaries.** Leaf functions have no `.pdata`, and XenonRecomp sizes
+  them by scanning for a return, which cuts off jump-table cases. The same script
+  writes explicit `functions` entries into a generated block of `TTT2.toml`.
+* **Missing instructions.** TTT2 uses about 70 instructions Sonic Unleashed didn't,
+  mostly halfword VMX, update-form loads/stores and half-float pack/unpack. They
+  are added by `patches/XenonRecomp-0002-ttt2-instructions.patch`. These are
+  unverified, so test them against Xenia's PPC tests before trusting them.
 * **setjmp/longjmp** addresses, if the game uses them.
 
 ### WebAssembly-specific CPU issues
