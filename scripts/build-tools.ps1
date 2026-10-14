@@ -4,6 +4,7 @@
 Require-Command cmake 'Run scripts\bootstrap.ps1'
 Require-Command ninja 'Run scripts\bootstrap.ps1'
 Require-Command clang-cl 'Run scripts\bootstrap.ps1 (LLVM)'
+Enter-MsvcEnv
 
 & "$PSScriptRoot\apply-patches.ps1"
 

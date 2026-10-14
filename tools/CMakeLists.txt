@@ -6,6 +6,10 @@
 # thirdparty trees define targets that collide with XenonRecomp's (fmt, xxHash);
 # scripts/build-tools.ps1 builds all three.
 cmake_minimum_required(VERSION 3.20)
+
+# XenonRecomp links the static CRT; everything linking XenonUtils must match.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 project(TTT2Tools CXX C)
 
 if (EMSCRIPTEN)

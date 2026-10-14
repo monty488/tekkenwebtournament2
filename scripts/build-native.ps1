@@ -3,6 +3,7 @@
 param([ValidateSet('Debug', 'Release', 'RelWithDebInfo')][string]$Config = 'Debug')
 . "$PSScriptRoot\common.ps1"
 Require-Command clang-cl 'Run scripts\bootstrap.ps1'
+Enter-MsvcEnv
 
 $out = Join-Path $BuildDir "native-$($Config.ToLower())"
 Invoke-Checked cmake @('-S', $Root, '-B', $out, '-G', 'Ninja', "-DCMAKE_BUILD_TYPE=$Config",
