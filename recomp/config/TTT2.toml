@@ -1,0 +1,59 @@
+# XenonRecomp configuration for Tekken Tag Tournament 2 (Xbox 360).
+# Paths are relative to this file. Reference: thirdparty/XenonRecomp/README.md
+#
+# Workflow:
+#   1. scripts/extract-game.ps1   -> game/files/default.xex
+#   2. scripts/scan-xex.ps1       -> game/scan/recomp_addresses.toml  (copy values below)
+#                                 -> recomp/config/TTT2_switch_tables.toml (XenonAnalyse)
+#   3. scripts/recompile.ps1      -> recomp/ppc/*.cpp
+
+[main]
+file_path = "../../game/files/default.xex"
+# Uncomment if you have a title update. XenonRecomp writes the patched XEX itself.
+# patch_file_path = "../../game/update/default.xexp"
+# patched_file_path = "../../game/update/default_patched.xex"
+out_directory_path = "../ppc"
+switch_table_file_path = "TTT2_switch_tables.toml"
+
+# Keep every optimization OFF until the game boots. Turning these on is a
+# big speed win (important on WebAssembly) but hides ABI violations.
+skip_lr = false
+skip_msr = false
+ctr_as_local = false
+xer_as_local = false
+reserved_as_local = false
+cr_as_local = false
+non_argument_as_local = false
+non_volatile_as_local = false
+
+# Register save/restore helpers. Fill from game/scan/recomp_addresses.toml.
+# XenonRecomp will refuse to run while these are 0.
+restgprlr_14_address = 0x00000000
+savegprlr_14_address = 0x00000000
+restfpr_14_address   = 0x00000000
+savefpr_14_address   = 0x00000000
+restvmx_14_address   = 0x00000000
+savevmx_14_address   = 0x00000000
+restvmx_64_address   = 0x00000000
+savevmx_64_address   = 0x00000000
+
+# setjmp/longjmp are redirected to native versions. Find longjmp near calls to
+# RtlUnwind; setjmp usually follows it. Delete these lines if TTT2 doesn't use them.
+# longjmp_address = 0x00000000
+# setjmp_address  = 0x00000000
+
+# Functions XenonAnalyse sizes wrong (typically ones containing jump tables).
+# functions = [
+#     { address = 0x00000000, size = 0x0 },
+# ]
+
+# Non-code data embedded in .text (exception handler records, padding).
+invalid_instructions = [
+    { data = 0x00000000, size = 4 }, # Padding
+]
+
+# Mid-asm hooks are how the runtime intercepts things that aren't whole functions.
+# [[midasm_hook]]
+# name = "ExampleMidAsmHook"
+# address = 0x00000000
+# registers = ["r3"]

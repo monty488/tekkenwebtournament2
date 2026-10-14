@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "web-shell",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["web/serve.mjs", "web/public", "8080"],
+      "port": 8080
+    }
+  ]
+}
