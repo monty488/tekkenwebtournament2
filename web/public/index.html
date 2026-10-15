@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TTT2 Web</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Tekken Tag Tournament 2 <span>web recomp</span></h1>
+      <p class="note">Bring your own game. Files you import stay in this browser's private storage (OPFS) and are never uploaded.</p>
+    </header>
+
+    <section id="checks" aria-label="Browser support">
+      <h2>Browser support</h2>
+      <ul id="check-list"></ul>
+    </section>
+
+    <section id="import" aria-label="Game files">
+      <h2>Game files</h2>
+      <p>Pick your local <code>game</code> folder from the repo, the one that contains <code>files/</code> (extracted disc) and <code>scan/</code> (from <code>scripts/scan-xex.ps1</code>).</p>
+      <div class="row">
+        <button id="pick">Import game folder…</button>
+        <button id="clear" class="secondary">Delete imported data</button>
+      </div>
+      <progress id="progress" value="0" max="1" hidden></progress>
+      <p id="import-status" class="muted">Checking storage…</p>
+    </section>
+
+    <section id="play" aria-label="Play">
+      <div class="row">
+        <button id="launch" disabled>Launch</button>
+        <button id="fullscreen" class="secondary" disabled>Fullscreen</button>
+      </div>
+      <canvas id="screen" width="1280" height="720"></canvas>
+      <details>
+        <summary>Controls</summary>
+        <p>Gamepad: standard Xbox layout (X = 1, Y = 2, A = 3, B = 4, RB = Tag).<br>
+           Keyboard: WASD/arrows move, U = 1, I = 2, J = 3, K = 4, O = Tag, Enter = Start.</p>
+      </details>
+      <pre id="log" aria-live="polite"></pre>
+    </section>
+  </main>
+  <script type="module" src="loader.js"></script>
+</body>
+</html>

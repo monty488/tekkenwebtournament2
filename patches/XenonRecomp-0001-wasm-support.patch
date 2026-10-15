@@ -1,0 +1,47 @@
+diff --git a/XenonUtils/ppc_context.h b/XenonUtils/ppc_context.h
+index 31a86cd..da5fa31 100644
+--- a/XenonUtils/ppc_context.h
++++ b/XenonUtils/ppc_context.h
+@@ -253,6 +253,25 @@ struct PPCFPSCRRegister
+     {
+         __asm__ __volatile__("msr fpcr, %0" : : "r"(csr));
+     }
++#elif defined(__wasm__)
++    // WebAssembly has no rounding-mode or denormal-flush control: arithmetic is always
++    // round-to-nearest and denormals are preserved. Keep a soft copy of the requested
++    // state so guest reads of FPSCR round-trip, but it has no effect on host math.
++    static constexpr size_t RoundShift = 0;
++    static constexpr size_t RoundMask = 3;
++    static constexpr size_t FlushMask = 4;
++    static constexpr size_t GuestToHost[] = { 0, 1, 2, 3 };
++    static inline thread_local uint32_t softcsr = 0;
++
++    inline uint32_t getcsr() noexcept
++    {
++        return softcsr;
++    }
++
++    inline void setcsr(uint32_t csr) noexcept
++    {
++        softcsr = csr;
++    }
+ #else
+ #   error "Missing implementation for FPSCR."
+ #endif
+@@ -696,6 +715,16 @@ inline uint64_t __rdtsc()
+                  : "=r"(ret)::"memory");
+     return ret;
+ }
++#elif defined(__wasm__)
++// mftb: the Xbox 360 timebase ticks at 49.875 MHz. Derive it from the monotonic
++// clock so KeQueryPerformanceFrequency can report the console value unchanged.
++#include <ctime>
++inline uint64_t __rdtsc()
++{
++    timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return uint64_t(ts.tv_sec) * 49875000ull + uint64_t(ts.tv_nsec) * 49875ull / 1000000ull;
++}
+ #elif !defined(__x86_64__) && !defined(_M_X64)
+ #   error "Missing implementation for __rdtsc()"
+ #endif

@@ -1,0 +1,57 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "native-debug",
+      "displayName": "Native (clang-cl) Debug",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/native-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_COMPILER": "clang-cl",
+        "CMAKE_CXX_COMPILER": "clang-cl"
+      }
+    },
+    {
+      "name": "native-release",
+      "inherits": "native-debug",
+      "displayName": "Native (clang-cl) Release",
+      "binaryDir": "${sourceDir}/build/native-release",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
+    },
+    {
+      "name": "web-release",
+      "displayName": "WebAssembly (Emscripten) Release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/web-release",
+      "toolchainFile": "$env{EMSDK}/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "web-debug",
+      "inherits": "web-release",
+      "displayName": "WebAssembly (Emscripten) Debug",
+      "binaryDir": "${sourceDir}/build/web-debug",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
+    },
+    {
+      "name": "tools",
+      "displayName": "Host tools (XenonRecomp, XenonAnalyse, ttt2-scan)",
+      "generator": "Ninja",
+      "sourceDir": "${sourceDir}/tools",
+      "binaryDir": "${sourceDir}/build/tools/xenon",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_COMPILER": "clang-cl",
+        "CMAKE_CXX_COMPILER": "clang-cl"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "native-debug", "configurePreset": "native-debug" },
+    { "name": "native-release", "configurePreset": "native-release" },
+    { "name": "web-release", "configurePreset": "web-release" },
+    { "name": "web-debug", "configurePreset": "web-debug" },
+    { "name": "tools", "configurePreset": "tools" }
+  ]
+}
