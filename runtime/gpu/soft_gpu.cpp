@@ -189,6 +189,67 @@ namespace gpu
             return uint16_t(sign | (exp << 10) | ((bits >> 13) & 0x3FF));
         }
 
+        // Xenos piecewise-linear gamma (as in Xenia): four segments with slopes 4, 2, 1, 1/2.
+        float LinearToPwlGamma(float x)
+        {
+            x = x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x);
+            if (x < 0.0625f) return x * 4.0f;
+            if (x < 0.125f) return x * 2.0f + 0.125f;
+            if (x < 0.5f) return x + 0.25f;
+            return x * 0.5f + 0.5f;
+        }
+
+        float PwlGammaToLinear(float g)
+        {
+            g = g < 0.0f ? 0.0f : (g > 1.0f ? 1.0f : g);
+            if (g < 0.25f) return g * 0.25f;
+            if (g < 0.375f) return (g - 0.125f) * 0.5f;
+            if (g < 0.75f) return g - 0.25f;
+            return (g - 0.5f) * 2.0f;
+        }
+
+        // 20e4 depth floats (k_24_8_FLOAT): 4-bit exponent (bias 15), 20-bit mantissa, [0, 2).
+        float Float20e4To32(uint32_t v)
+        {
+            uint32_t mantissa = v & 0xFFFFF;
+            uint32_t exponent = (v >> 20) & 0xF;
+            if (!exponent)
+            {
+                if (!mantissa)
+                    return 0.0f;
+                // Denormal: normalise.
+                uint32_t shift = 0;
+                while (!(mantissa & 0x100000))
+                {
+                    mantissa <<= 1;
+                    ++shift;
+                }
+                exponent = 1 - shift;
+                mantissa &= 0xFFFFF;
+            }
+            return AsFloat(((exponent + 112) << 23) | (mantissa << 3));
+        }
+
+        uint32_t Float32To20e4(float f)
+        {
+            uint32_t bits;
+            std::memcpy(&bits, &f, 4);
+            if (int32_t(bits) <= 0)
+                return 0;
+            if (bits >= 0x40000000u) // >= 2.0
+                return 0xFFFFFF;
+            if (bits < 0x38800000u) // below the normal range: denormal
+            {
+                const uint32_t shift = std::min(113u - (bits >> 23), 24u);
+                bits = (0x800000u | (bits & 0x7FFFFFu)) >> shift;
+            }
+            else
+            {
+                bits -= 0x38000000u; // rebias the exponent from 127 to 15
+            }
+            return ((bits + 3 + ((bits >> 3) & 1)) >> 3) & 0xFFFFFF;
+        }
+
         uint32_t Swap32(uint32_t v, uint32_t endian)
         {
             switch (endian & 3)
@@ -235,6 +296,7 @@ namespace gpu
 
         std::vector<F4> g_edramColor(size_t(kEdramTiles) * kTileSamples, F4{ 0, 0, 0, 0 });
         std::vector<float> g_edramDepth(size_t(kEdramTiles) * kTileSamples, 1.0f);
+        std::vector<uint8_t> g_edramStencil(size_t(kEdramTiles) * kTileSamples, 0);
 
         bool Is64bppColor(uint32_t format)
         {
@@ -334,19 +396,29 @@ namespace gpu
             return h0 ^ (h1 * 31);
         }
 
+        // Block size (texels per side) and bytes per block of a texture format; false if unknown.
+        bool FormatBlock(uint32_t format, uint32_t& blockW, uint32_t& blockBytes)
+        {
+            blockW = 1;
+            switch (format)
+            {
+            case 2: blockBytes = 1; return true;
+            case 3: case 4: case 10: case 15: case 24: case 30: blockBytes = 2; return true;
+            case 6: case 7: case 14: case 16: case 17: case 22: case 23: case 25: case 31: case 33: case 36: case 50: blockBytes = 4; return true;
+            case 26: case 32: case 34: case 37: blockBytes = 8; return true;
+            case 35: case 38: blockBytes = 16; return true;
+            case 18: case 51: case 58: case 59: blockW = 4; blockBytes = 8; return true;
+            case 19: case 20: case 49: case 52: case 53: blockW = 4; blockBytes = 16; return true;
+            default: return false;
+            }
+        }
+
         // Bytes of guest memory mip 0 occupies (0 if the format is unknown).
         uint32_t TextureByteSize(const TextureInfo& info)
         {
-            uint32_t blockW = 1, blockBytes;
-            switch (info.format)
-            {
-            case 2: blockBytes = 1; break;
-            case 3: case 4: case 10: case 15: blockBytes = 2; break;
-            case 6: case 14: case 50: blockBytes = 4; break;
-            case 18: case 51: blockW = 4; blockBytes = 8; break;
-            case 19: case 20: case 52: case 53: blockW = 4; blockBytes = 16; break;
-            default: return 0;
-            }
+            uint32_t blockW, blockBytes;
+            if (!FormatBlock(info.format, blockW, blockBytes))
+                return 0;
             const uint32_t blocksX = (info.width + blockW - 1) / blockW;
             uint32_t blocksY = (info.height + blockW - 1) / blockW;
             uint32_t pitch = std::max((info.pitch ? info.pitch : info.width) / blockW, blocksX);
@@ -356,6 +428,179 @@ namespace gpu
                 blocksY = (blocksY + 31) & ~31u;
             }
             return pitch * blocksY * blockBytes;
+        }
+
+        // Scales a raw component by the fetch constant's per-component sign mode:
+        // 0 unsigned, 1 signed, 2 unsigned biased (x2-1), 3 gamma.
+        float NormalizeComponent(uint32_t raw, uint32_t bits, uint32_t sign, bool integer)
+        {
+            if (sign == 1)
+            {
+                const int32_t s = int32_t(raw << (32 - bits)) >> (32 - bits);
+                return integer ? float(s) : std::max(float(s) / float((1u << (bits - 1)) - 1), -1.0f);
+            }
+            if (integer)
+                return float(raw);
+            const float v = float(double(raw) / double((1ull << bits) - 1));
+            return sign == 2 ? v * 2.0f - 1.0f : (sign == 3 ? PwlGammaToLinear(v) : v);
+        }
+
+        // BC4-style 8-byte block (DXT5A, each half of DXN): 16 values in [0, 1].
+        void DecodeBc4(const uint8_t* b, float out[16])
+        {
+            const uint32_t a0 = b[0], a1 = b[1];
+            uint32_t v[8] = { a0, a1 };
+            for (int i = 2; i < 8; i++)
+                v[i] = a0 > a1 ? ((8 - i) * a0 + (i - 1) * a1) / 7 : (i < 6 ? ((6 - i) * a0 + (i - 1) * a1) / 5 : (i == 6 ? 0 : 255));
+            uint64_t bits = 0;
+            for (int i = 0; i < 6; i++)
+                bits |= uint64_t(b[2 + i]) << (8 * i);
+            for (int i = 0; i < 16; i++)
+                out[i] = float(v[(bits >> (3 * i)) & 7]) / 255.0f;
+        }
+
+        // Formats ConvertToBgra does not handle (or would lose precision on), decoded straight
+        // to format components (comp0 = X ...). Single-component formats replicate X to all
+        // four, two-component formats replicate Y to Z and W (as Xenia's host swizzles do).
+        bool DecodeComponents(const TextureInfo& info, const uint32_t fetch[6], std::vector<F4>& out)
+        {
+            uint32_t blockW, blockBytes;
+            switch (info.format)
+            {
+            case 7: case 16: case 17: case 22: case 23: case 24: case 25: case 26: case 30: case 31: case 32:
+            case 33: case 34: case 35: case 36: case 37: case 38: case 49: case 58: case 59:
+                break;
+            default:
+                return false;
+            }
+            FormatBlock(info.format, blockW, blockBytes);
+            uint32_t sign[4];
+            for (int k = 0; k < 4; k++)
+                sign[k] = (fetch[0] >> (2 + 2 * k)) & 3;
+            const bool integer = fetch[3] & 1;
+
+            const uint32_t log2Bpb = blockBytes == 1 ? 0 : blockBytes == 2 ? 1 : blockBytes == 4 ? 2 : blockBytes == 8 ? 3 : 4;
+            const uint32_t blocksX = (info.width + blockW - 1) / blockW;
+            const uint32_t blocksY = (info.height + blockW - 1) / blockW;
+            uint32_t pitchBlocks = (info.pitch ? info.pitch : info.width) / blockW;
+            if (info.tiled)
+                pitchBlocks = (pitchBlocks + 31) & ~31u;
+            pitchBlocks = std::max(pitchBlocks, blocksX);
+            out.assign(size_t(info.width) * info.height, F4{ 0, 0, 0, 0 });
+            const uint8_t* base = guest::ToHost<const uint8_t>(info.base);
+
+            auto readBlock = [&](uint32_t offset, uint8_t* dst) {
+                // Undo the GPU endian swap so the bytes read as little-endian data.
+                std::memcpy(dst, base + offset, blockBytes);
+                if (info.endian == 1)
+                    for (uint32_t i = 0; i + 1 < blockBytes; i += 2) std::swap(dst[i], dst[i + 1]);
+                else if (info.endian == 2)
+                    for (uint32_t i = 0; i + 3 < blockBytes; i += 4) { std::swap(dst[i], dst[i + 3]); std::swap(dst[i + 1], dst[i + 2]); }
+                else if (info.endian == 3)
+                    for (uint32_t i = 0; i + 3 < blockBytes; i += 4) { std::swap(dst[i], dst[i + 2]); std::swap(dst[i + 1], dst[i + 3]); }
+            };
+            auto word = [](const uint8_t* p, int i) { uint32_t v; std::memcpy(&v, p + i * 4, 4); return v; };
+            auto half = [](const uint8_t* p, int i) { uint16_t v; std::memcpy(&v, p + i * 2, 2); return v; };
+            auto norm = [&](uint32_t raw, uint32_t bits, int k) { return NormalizeComponent(raw, bits, sign[k], integer); };
+
+            Pool().Run(int(blocksY), [&](int byIndex) {
+                const uint32_t by = uint32_t(byIndex);
+                uint8_t b[16];
+                for (uint32_t bx = 0; bx < blocksX; bx++)
+                {
+                    const uint32_t offset = info.tiled ? TiledOffset2D(bx, by, pitchBlocks, log2Bpb) : (by * pitchBlocks + bx) * blockBytes;
+                    readBlock(offset, b);
+                    if (blockW == 4)
+                    {
+                        float r[16], g[16];
+                        if (info.format == 58) // DXT3A: 4-bit values
+                            for (int i = 0; i < 16; i++)
+                                r[i] = float((b[i / 2] >> ((i & 1) * 4)) & 15) / 15.0f;
+                        else
+                            DecodeBc4(b, r);
+                        if (info.format == 49) // DXN: X block then Y block
+                            DecodeBc4(b + 8, g);
+                        for (uint32_t t = 0; t < 16; t++)
+                        {
+                            const uint32_t x = bx * 4 + t % 4, y = by * 4 + t / 4;
+                            if (x >= info.width || y >= info.height)
+                                continue;
+                            F4& o = out[size_t(y) * info.width + x];
+                            if (info.format == 49)
+                            {
+                                const float cx = sign[0] == 1 || sign[0] == 2 ? r[t] * 2.0f - 1.0f : r[t];
+                                const float cy = sign[1] == 1 || sign[1] == 2 ? g[t] * 2.0f - 1.0f : g[t];
+                                o = { cx, cy, cy, cy };
+                            }
+                            else
+                            {
+                                o = { r[t], r[t], r[t], r[t] };
+                            }
+                        }
+                        continue;
+                    }
+                    if (bx >= info.width || by >= info.height)
+                        continue;
+                    F4 c{ 0, 0, 0, 0 };
+                    switch (info.format)
+                    {
+                    case 7: { const uint32_t v = word(b, 0); c = { norm(v & 0x3FF, 10, 0), norm((v >> 10) & 0x3FF, 10, 1), norm((v >> 20) & 0x3FF, 10, 2), norm(v >> 30, 2, 3) }; break; }
+                    case 16: { const uint32_t v = word(b, 0); c = { norm(v & 0x3FF, 10, 0), norm((v >> 10) & 0x7FF, 11, 1), norm(v >> 21, 11, 2), 1.0f }; break; }
+                    case 17: { const uint32_t v = word(b, 0); c = { norm(v & 0x7FF, 11, 0), norm((v >> 11) & 0x7FF, 11, 1), norm(v >> 22, 10, 2), 1.0f }; break; }
+                    case 22: { const uint32_t v = word(b, 0); const float d = float(v >> 8) / float(0xFFFFFF); c = { d, d, d, d }; break; }
+                    case 23: { const float d = Float20e4To32(word(b, 0) >> 8); c = { d, d, d, d }; break; }
+                    case 24: { const float v = norm(half(b, 0), 16, 0); c = { v, v, v, v }; break; }
+                    case 25: { const float x = norm(half(b, 0), 16, 0), y = norm(half(b, 1), 16, 1); c = { x, y, y, y }; break; }
+                    case 26: c = { norm(half(b, 0), 16, 0), norm(half(b, 1), 16, 1), norm(half(b, 2), 16, 2), norm(half(b, 3), 16, 3) }; break;
+                    case 30: { const float v = HalfToFloat(half(b, 0)); c = { v, v, v, v }; break; }
+                    case 31: { const float x = HalfToFloat(half(b, 0)), y = HalfToFloat(half(b, 1)); c = { x, y, y, y }; break; }
+                    case 32: c = { HalfToFloat(half(b, 0)), HalfToFloat(half(b, 1)), HalfToFloat(half(b, 2)), HalfToFloat(half(b, 3)) }; break;
+                    case 33: { const float v = norm(word(b, 0), 32, 0); c = { v, v, v, v }; break; }
+                    case 34: { const float x = norm(word(b, 0), 32, 0), y = norm(word(b, 1), 32, 1); c = { x, y, y, y }; break; }
+                    case 35: c = { norm(word(b, 0), 32, 0), norm(word(b, 1), 32, 1), norm(word(b, 2), 32, 2), norm(word(b, 3), 32, 3) }; break;
+                    case 36: { const float v = AsFloat(word(b, 0)); c = { v, v, v, v }; break; }
+                    case 37: { const float x = AsFloat(word(b, 0)), y = AsFloat(word(b, 1)); c = { x, y, y, y }; break; }
+                    case 38: c = { AsFloat(word(b, 0)), AsFloat(word(b, 1)), AsFloat(word(b, 2)), AsFloat(word(b, 3)) }; break;
+                    }
+                    out[size_t(by) * info.width + bx] = c;
+                }
+            });
+            return true;
+        }
+
+        void DumpTexture(const Texture& tex, const TextureInfo& info)
+        {
+            char name[96];
+            std::snprintf(name, sizeof(name), "tex_%08X_f%u_%ux%u.bmp", info.base, info.format, tex.width, tex.height);
+            std::FILE* f = std::fopen(name, "wb");
+            if (!f)
+                return;
+            const uint32_t imageBytes = tex.width * tex.height * 4;
+            uint8_t header[54] = { 'B', 'M' };
+            auto put32 = [&](int at, uint32_t v) { for (int i = 0; i < 4; i++) header[at + i] = uint8_t(v >> (8 * i)); };
+            put32(2, 54 + imageBytes);
+            put32(10, 54);
+            put32(14, 40);
+            put32(18, tex.width);
+            put32(22, uint32_t(-int32_t(tex.height)));
+            header[26] = 1;
+            header[28] = 32;
+            put32(34, imageBytes);
+            std::fwrite(header, 1, sizeof(header), f);
+            // Swizzled components as RGB over a checkerboard where alpha < 1.
+            for (uint32_t y = 0; y < tex.height; y++)
+                for (uint32_t x = 0; x < tex.width; x++)
+                {
+                    const F4& t = tex.texels[size_t(y) * tex.width + x];
+                    const float bg = ((x / 8 + y / 8) & 1) ? 0.6f : 0.3f;
+                    const float a = Saturate(t[3]);
+                    uint8_t px[4];
+                    for (int k = 0; k < 3; k++)
+                        px[2 - k] = uint8_t(std::lround(Saturate(t[k] * a + bg * (1.0f - a)) * 255.0f));
+                    px[3] = 255;
+                    std::fwrite(px, 1, 4, f);
+                }
+            std::fclose(f);
         }
 
         void DecodeTexture(Texture& tex, const uint32_t fetch[6])
@@ -374,30 +619,74 @@ namespace gpu
 
             ++g_stats.decodes;
             g_stats.decodedTexels += uint64_t(info.width) * info.height;
-            std::vector<uint32_t> bgra;
-            const ParallelFor parallel = [](uint32_t count, const std::function<void(uint32_t)>& fn) {
-                constexpr uint32_t kRows = 8;
-                Pool().Run(int((count + kRows - 1) / kRows), [&](int band) {
-                    for (uint32_t row = uint32_t(band) * kRows; row < std::min(count, uint32_t(band + 1) * kRows); row++)
-                        fn(row);
-                });
-            };
-            if (!ConvertToBgra(info, bgra, parallel))
-            {
-                static bool warned[64];
-                if (!warned[info.format & 63])
-                {
-                    warned[info.format & 63] = true;
-                    std::fprintf(stderr, "[gpu] soft: unsupported texture format %u\n", info.format);
-                }
-                return;
-            }
-
-            // ConvertToBgra keeps 8_8_8_8 in native component order (X in the low byte) and
-            // packs every other format as B,G,R,A bytes with R = component 0.
-            const bool native8888 = info.format == 6 || info.format == 14 || info.format == 50;
-            const bool twoComp = info.format == 10; // k_8_8: comp0 = low byte, comp1 = high byte
             const uint32_t swizzle = (fetch[3] >> 1) & 0xFFF;
+            const int expAdjust = int32_t(fetch[3] << 13) >> 26; // bits 13-18, signed
+            const float expScale = std::ldexp(1.0f, expAdjust);
+            uint32_t sign[4];
+            for (int k = 0; k < 4; k++)
+                sign[k] = (fetch[0] >> (2 + 2 * k)) & 3;
+            const bool integer = fetch[3] & 1;
+
+            // Format components (comp0 = X ...) per texel, before the fetch swizzle.
+            std::vector<F4> comps;
+            if (!DecodeComponents(info, fetch, comps))
+            {
+                std::vector<uint32_t> bgra;
+                const ParallelFor parallel = [](uint32_t count, const std::function<void(uint32_t)>& fn) {
+                    constexpr uint32_t kRows = 8;
+                    Pool().Run(int((count + kRows - 1) / kRows), [&](int band) {
+                        for (uint32_t row = uint32_t(band) * kRows; row < std::min(count, uint32_t(band + 1) * kRows); row++)
+                            fn(row);
+                    });
+                };
+                if (!ConvertToBgra(info, bgra, parallel))
+                {
+                    static bool warned[64];
+                    if (!warned[info.format & 63])
+                    {
+                        warned[info.format & 63] = true;
+                        std::fprintf(stderr, "[gpu] soft: unsupported texture format %u\n", info.format);
+                    }
+                    return;
+                }
+
+                // ConvertToBgra keeps 8_8_8_8 in native component order (X in the low byte)
+                // and packs every other format as B,G,R,A bytes with R = component 0. Formats
+                // with 8-bit components keep their raw bytes, so signed modes can be applied.
+                const bool native8888 = info.format == 6 || info.format == 14 || info.format == 50;
+                const bool twoComp = info.format == 10; // k_8_8: comp0 = low byte, comp1 = high byte
+                const bool oneComp = info.format == 2;  // k_8
+                const bool rawBytes = native8888 || twoComp || oneComp;
+                const bool anySign = sign[0] || sign[1] || sign[2] || sign[3] || integer;
+                comps.resize(bgra.size());
+                constexpr size_t kChunk = 16384;
+                Pool().Run(int((bgra.size() + kChunk - 1) / kChunk), [&](int chunk) {
+                    const size_t end = std::min(bgra.size(), size_t(chunk + 1) * kChunk);
+                    for (size_t i = size_t(chunk) * kChunk; i < end; i++)
+                    {
+                        const uint32_t c = bgra[i];
+                        uint32_t raw[4];
+                        if (native8888)
+                            raw[0] = c & 0xFF, raw[1] = (c >> 8) & 0xFF, raw[2] = (c >> 16) & 0xFF, raw[3] = c >> 24;
+                        else if (twoComp)
+                            raw[0] = (c >> 16) & 0xFF, raw[1] = c >> 24, raw[2] = raw[1], raw[3] = raw[1];
+                        else if (oneComp)
+                            raw[0] = raw[1] = raw[2] = raw[3] = c & 0xFF;
+                        else
+                            raw[0] = (c >> 16) & 0xFF, raw[1] = (c >> 8) & 0xFF, raw[2] = c & 0xFF, raw[3] = c >> 24;
+                        F4& comp = comps[i];
+                        for (int k = 0; k < 4; k++)
+                        {
+                            if (!anySign)
+                                comp[k] = float(raw[k]) / 255.0f;
+                            else if (rawBytes || sign[k] != 1)
+                                comp[k] = NormalizeComponent(raw[k], 8, sign[k], integer);
+                            else // signed mode on an expanded format: approximate from unorm
+                                comp[k] = float(raw[k]) / 255.0f * 2.0f - 1.0f;
+                        }
+                    }
+                });
+            }
 
             tex.width = info.width;
             tex.height = info.height;
@@ -405,31 +694,24 @@ namespace gpu
             tex.clampY = (fetch[0] >> 13) & 7;
             tex.magFilter = (fetch[3] >> 19) & 3;
             tex.minFilter = (fetch[3] >> 21) & 3;
-            tex.texels.resize(bgra.size());
+            tex.texels.resize(comps.size());
             constexpr size_t kChunk = 16384;
-            Pool().Run(int((bgra.size() + kChunk - 1) / kChunk), [&](int chunk) {
-                const size_t end = std::min(bgra.size(), size_t(chunk + 1) * kChunk);
+            Pool().Run(int((comps.size() + kChunk - 1) / kChunk), [&](int chunk) {
+                const size_t end = std::min(comps.size(), size_t(chunk + 1) * kChunk);
                 for (size_t i = size_t(chunk) * kChunk; i < end; i++)
                 {
-                    const uint32_t c = bgra[i];
-                    const float b0 = float(c & 0xFF) / 255.0f, b1 = float((c >> 8) & 0xFF) / 255.0f;
-                    const float b2 = float((c >> 16) & 0xFF) / 255.0f, b3 = float(c >> 24) / 255.0f;
-                    F4 comp;
-                    if (native8888)
-                        comp = { b0, b1, b2, b3 };
-                    else if (twoComp)
-                        comp = { b2, b3, 0.0f, 0.0f };
-                    else
-                        comp = { b2, b1, b0, b3 };
+                    const F4& comp = comps[i];
                     F4& out = tex.texels[i];
                     for (int k = 0; k < 4; k++)
                     {
                         const uint32_t sel = (swizzle >> (k * 3)) & 7;
-                        out[k] = sel < 4 ? comp[sel] : (sel == 5 ? 1.0f : 0.0f);
+                        out[k] = sel < 4 ? comp[sel] * expScale : (sel == 5 ? 1.0f : 0.0f);
                     }
                 }
             });
             tex.ok = true;
+            if (g_softDumpTextures)
+                DumpTexture(tex, info);
         }
 
         const Texture& LoadTexture(const uint32_t fetch[6])
@@ -1253,6 +1535,9 @@ namespace gpu
             float scale[3] = { 1, 1, 1 }, offset[3] = { 0, 0, 0 };
             float windowX = 0, windowY = 0;
             bool windowOffset = false;
+            // PA_SU_SC_MODE_CNTL: face culling; front faces wind clockwise in window
+            // space (y down) when frontCW is set, counter-clockwise otherwise.
+            bool cullFront = false, cullBack = false, frontCW = false;
             float pixelCenter = 0.0f;
             bool clip = true;
             // scissor (pixels, exclusive max)
@@ -1264,6 +1549,10 @@ namespace gpu
             F4 blendConstant{};
             Surface depth;
             bool depthTest = false, depthWrite = false;
+            // Stencil (RB_DEPTHCONTROL / RB_STENCILREFMASK[_BF]): [0] front, [1] back faces.
+            struct StencilFace { uint32_t func = 7, fail = 0, zpass = 0, zfail = 0, ref = 0, mask = 0xFF, writeMask = 0xFF; };
+            bool stencil = false;
+            StencilFace stencilFace[2];
             uint32_t depthFunc = 7;
             bool alphaTest = false;
             uint32_t alphaFunc = 7;
@@ -1287,6 +1576,9 @@ namespace gpu
                 const uint32_t modeCntl = Reg(0x2205);
                 const uint32_t windowOffsetReg = Reg(0x2080);
                 windowOffset = (modeCntl >> 16) & 1;
+                cullFront = modeCntl & 1;
+                cullBack = (modeCntl >> 1) & 1;
+                frontCW = (modeCntl >> 2) & 1;
                 windowX = float(int32_t(windowOffsetReg << 17) >> 17);
                 windowY = float(int32_t((windowOffsetReg >> 16) << 17) >> 17);
                 pixelCenter = (Reg(0x2302) & 1) ? 0.5f : 0.0f;
@@ -1330,6 +1622,21 @@ namespace gpu
                 depthTest = (depthControl >> 1) & 1;
                 depthWrite = depthTest && ((depthControl >> 2) & 1);
                 depthFunc = (depthControl >> 4) & 7;
+                stencil = depthControl & 1;
+                const bool backfaceStencil = (depthControl >> 7) & 1;
+                for (int f = 0; f < 2; f++)
+                {
+                    StencilFace& sf = stencilFace[f];
+                    const uint32_t shift = (f == 1 && backfaceStencil) ? 12 : 0;
+                    sf.func = (depthControl >> (8 + shift)) & 7;
+                    sf.fail = (depthControl >> (11 + shift)) & 7;
+                    sf.zpass = (depthControl >> (14 + shift)) & 7;
+                    sf.zfail = (depthControl >> (17 + shift)) & 7;
+                    const uint32_t refMask = Reg((f == 1 && backfaceStencil) ? 0x210C : 0x210D);
+                    sf.ref = refMask & 0xFF;
+                    sf.mask = (refMask >> 8) & 0xFF;
+                    sf.writeMask = (refMask >> 16) & 0xFF;
+                }
 
                 const uint32_t colorControl = Reg(0x2202);
                 alphaTest = (colorControl >> 3) & 1;
@@ -1408,6 +1715,7 @@ namespace gpu
                 ScreenVertex v[3];
                 struct Edge { float ax, ay, dx, dy; bool owns; } edges[3];
                 float invArea;
+                bool front;
                 int x0, x1, y0, y1;
             };
             std::vector<Setup> setups;
@@ -1437,12 +1745,48 @@ namespace gpu
                 return { x, y, z, (rs.vte & (1u << 8)) ? 1.0f : invW, &v };
             }
 
-            bool ShadePixel(int px, int py, const ScreenVertex* const t[3], const float bary[3], float z)
+            static uint8_t StencilOp(uint32_t op, uint8_t v, uint8_t ref)
             {
-                // Early depth test (depth exported by the shader is tested after it runs).
+                switch (op)
+                {
+                case 1: return 0;
+                case 2: return ref;
+                case 3: return v == 255 ? 255 : uint8_t(v + 1);
+                case 4: return v == 0 ? 0 : uint8_t(v - 1);
+                case 5: return uint8_t(~v);
+                case 6: return uint8_t(v + 1);
+                case 7: return uint8_t(v - 1);
+                default: return v;
+                }
+            }
+
+            void UpdateStencil(int px, int py, const RasterState::StencilFace& sf, uint32_t op)
+            {
+                if (!op || !sf.writeMask)
+                    return;
+                rs.depth.ForEachSample(uint32_t(px), uint32_t(py), [&](size_t i) {
+                    const uint8_t v = g_edramStencil[i];
+                    g_edramStencil[i] = uint8_t((v & ~sf.writeMask) | (StencilOp(op, v, uint8_t(sf.ref)) & sf.writeMask));
+                });
+            }
+
+            bool ShadePixel(int px, int py, const ScreenVertex* const t[3], const float bary[3], float z, bool front)
+            {
+                // Early stencil and depth tests (sample 0; depth exported by the shader is
+                // still tested against the interpolated value).
                 const size_t depthIndex = rs.depth.Index(uint32_t(px) * rs.depth.scaleX, uint32_t(py) * rs.depth.scaleY);
-                if (rs.depthTest && !Compare(rs.depthFunc, z, g_edramDepth[depthIndex]))
+                const RasterState::StencilFace& sf = rs.stencilFace[front ? 0 : 1];
+                if (rs.stencil && !Compare(sf.func, float(sf.ref & sf.mask), float(g_edramStencil[depthIndex] & sf.mask)))
+                {
+                    UpdateStencil(px, py, sf, sf.fail);
                     return false;
+                }
+                if (rs.depthTest && !Compare(rs.depthFunc, z, g_edramDepth[depthIndex]))
+                {
+                    if (rs.stencil)
+                        UpdateStencil(px, py, sf, sf.zfail);
+                    return false;
+                }
 
                 Invocation inv;
                 inv.ps = 0.0f;
@@ -1480,6 +1824,8 @@ namespace gpu
 
                 if (inv.exported & (1ull << 61))
                     z = inv.exports[61][0];
+                if (rs.stencil)
+                    UpdateStencil(px, py, sf, sf.zpass);
                 if (rs.depthWrite)
                 {
                     const float dz = std::clamp(z, 0.0f, 1.0f);
@@ -1508,12 +1854,16 @@ namespace gpu
                 return true;
             }
 
-            void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& c)
+            void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& c, bool cull = false)
             {
                 Setup su;
                 su.v[0] = a; su.v[1] = b; su.v[2] = c;
                 float area = (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y);
                 if (area == 0.0f || !std::isfinite(area))
+                    return;
+                // area > 0: clockwise on screen. Rectangles always count as front faces.
+                su.front = !cull || (area > 0.0f) == rs.frontCW;
+                if (cull && (su.front ? rs.cullFront : rs.cullBack))
                     return;
                 if (area < 0.0f)
                 {
@@ -1565,7 +1915,7 @@ namespace gpu
                         if (!inside)
                             continue;
                         const float z = bary[0] * t[0]->z + bary[1] * t[1]->z + bary[2] * t[2]->z;
-                        written += ShadePixel(px, py, t, bary, z);
+                        written += ShadePixel(px, py, t, bary, z, su.front);
                     }
                 }
                 return written;
@@ -1621,7 +1971,7 @@ namespace gpu
                      a.position[2] < 0 || b.position[2] < 0 || c.position[2] < 0);
                 if (!needsClip)
                 {
-                    Triangle(ToScreen(a), ToScreen(b), ToScreen(c));
+                    Triangle(ToScreen(a), ToScreen(b), ToScreen(c), true);
                     return;
                 }
 
@@ -1657,7 +2007,7 @@ namespace gpu
                 for (const Vertex& v : poly)
                     sv.push_back(ToScreen(extraVertices.emplace_back(v)));
                 for (size_t i = 1; i + 1 < sv.size(); i++)
-                    Triangle(sv[0], sv[i], sv[i + 1]);
+                    Triangle(sv[0], sv[i], sv[i + 1], true);
             }
         };
 
@@ -1711,6 +2061,12 @@ namespace gpu
             case 10: // k_8_8
                 out[0] = ToUnorm(c[0], 8) | (ToUnorm(c[1], 8) << 8);
                 return 2;
+            case 22: // k_24_8: depth in the high 24 bits, stencil (c[1], 0-255) in the low 8
+                out[0] = (ToUnorm(c[0], 24) << 8) | (uint32_t(c[1]) & 0xFF);
+                return 4;
+            case 23: // k_24_8_FLOAT
+                out[0] = (Float32To20e4(c[0]) << 8) | (uint32_t(c[1]) & 0xFF);
+                return 4;
             case 25: // k_16_16
                 out[0] = ToUnorm(c[0], 16) | (ToUnorm(c[1], 16) << 16);
                 return 4;
@@ -1786,6 +2142,7 @@ namespace gpu
 
             const uint32_t copyControl = Reg(0x2318);
             const uint32_t source = copyControl & 7;
+            const uint32_t sampleSelect = (copyControl >> 4) & 7;
             const bool colorClear = (copyControl >> 8) & 1;
             const bool depthClear = (copyControl >> 9) & 1;
             const uint32_t command = (copyControl >> 20) & 3;
@@ -1838,12 +2195,38 @@ namespace gpu
                         if (source < 4)
                         {
                             const Surface& s = rs.color[source];
-                            c = g_edramColor[s.Index(uint32_t(x) * s.scaleX, uint32_t(y) * s.scaleY)];
+                            const uint32_t samples = s.scaleX * s.scaleY;
+                            if (sampleSelect >= 4 && samples > 1)
+                            {
+                                // Averaged resolve (01, 23 and 0123 all reduce to the full
+                                // pixel here: samples are written with the same coverage).
+                                c = { 0, 0, 0, 0 };
+                                s.ForEachSample(uint32_t(x), uint32_t(y), [&](size_t i) {
+                                    for (int k = 0; k < 4; k++)
+                                        c[k] += g_edramColor[i][k];
+                                });
+                                for (float& v : c)
+                                    v /= float(samples);
+                            }
+                            else
+                            {
+                                // Sample n: 2x stacks samples vertically, 4x is 2x2.
+                                const uint32_t n = sampleSelect < samples ? sampleSelect : 0;
+                                const uint32_t sx = s.scaleX == 2 ? (n & 1) : 0;
+                                const uint32_t sy = s.scaleX == 2 ? (n >> 1) : n;
+                                c = g_edramColor[s.Index(uint32_t(x) * s.scaleX + sx, uint32_t(y) * s.scaleY + sy)];
+                            }
+                            // EDRAM keeps linear values; k_8_8_8_8_GAMMA targets hold them
+                            // gamma-encoded, which is what the copy writes out.
+                            if (s.format == 1)
+                                for (int k = 0; k < 3; k++)
+                                    c[k] = LinearToPwlGamma(c[k]);
                         }
                         else
                         {
-                            const float d = g_edramDepth[rs.depth.Index(uint32_t(x) * rs.depth.scaleX, uint32_t(y) * rs.depth.scaleY)];
-                            c = { d, d, d, d };
+                            const size_t i = rs.depth.Index(uint32_t(x) * rs.depth.scaleX, uint32_t(y) * rs.depth.scaleY);
+                            const float d = g_edramDepth[i];
+                            c = { d, float(g_edramStencil[i]), d, d }; // y = stencil for k_24_8 packing
                         }
                         if (expBias)
                             for (float& v : c)
@@ -1864,7 +2247,9 @@ namespace gpu
                 F4 c;
                 if (s.format == 2 || s.format == 10)
                     c = { float(v & 0x3FF) / 1023.0f, float((v >> 10) & 0x3FF) / 1023.0f, float((v >> 20) & 0x3FF) / 1023.0f, float(v >> 30) / 3.0f };
-                else if (s.format == 6 || s.format == 7)
+                else if (s.format == 6) // k_16_16_FLOAT: both halves in RB_COLOR_CLEAR
+                    c = { HalfToFloat(uint16_t(v)), HalfToFloat(uint16_t(v >> 16)), 0.0f, 0.0f };
+                else if (s.format == 7) // k_16_16_16_16_FLOAT: low dword in RB_COLOR_CLEAR_LO
                 {
                     const uint32_t lo = Reg(0x231F);
                     c = { HalfToFloat(uint16_t(lo)), HalfToFloat(uint16_t(lo >> 16)), HalfToFloat(uint16_t(v)), HalfToFloat(uint16_t(v >> 16)) };
@@ -1880,10 +2265,12 @@ namespace gpu
             }
             if (depthClear)
             {
-                const float d = float(Reg(0x231D) >> 8) / float(0xFFFFFF);
+                const uint32_t clear = Reg(0x231D);
+                const float d = (Reg(0x2002) >> 16) & 1 ? Float20e4To32(clear >> 8) : float(clear >> 8) / float(0xFFFFFF);
+                const uint8_t st = uint8_t(clear & 0xFF);
                 parallelRows([&](int y) {
                     for (int x = ex0; x < ex1; x++)
-                        rs.depth.ForEachSample(uint32_t(x), uint32_t(y), [&](size_t i) { g_edramDepth[i] = d; });
+                        rs.depth.ForEachSample(uint32_t(x), uint32_t(y), [&](size_t i) { g_edramDepth[i] = d; g_edramStencil[i] = st; });
                 });
             }
 
@@ -1933,6 +2320,9 @@ namespace gpu
         }
     }
 
+    bool g_softLogVertices = false;
+    bool g_softDumpTextures = false;
+
     uint64_t SoftPixelsWritten() { return g_pixels.load(); }
     uint64_t SoftResolves() { return g_resolves.load(); }
 
@@ -1965,6 +2355,8 @@ namespace gpu
             return;
 
         ++g_stats.draws;
+        if (g_softDumpTextures)
+            g_textureCache.clear(); // decode (and so dump) everything this draw samples
         state.Load();
         for (auto& t : state.textures)
             t.store(nullptr);
@@ -2029,6 +2421,18 @@ namespace gpu
             slots[i] = it->second;
         }
         rs.interpolatorMask = interpolatorMask;
+        if (g_softLogVertices)
+        {
+            for (size_t i = 0; i < indices.size(); i++)
+            {
+                const Vertex& v = vertices[slots[i]];
+                std::fprintf(stderr, "[gpu]       v%zu idx=%u pos=(%g %g %g %g)", i, indices[i], v.position[0], v.position[1], v.position[2], v.position[3]);
+                for (int k = 0; k < 2; k++)
+                    if (interpolatorMask & (1u << k))
+                        std::fprintf(stderr, " o%d=(%g %g %g %g)", k, v.interpolators[k][0], v.interpolators[k][1], v.interpolators[k][2], v.interpolators[k][3]);
+                std::fprintf(stderr, "\n");
+            }
+        }
         g_stats.vertex += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - vertexStart).count());
 
         Renderer renderer{ state, rs, Program{ psCode.data(), uint32_t(psCode.size()), true } };
@@ -2068,9 +2472,14 @@ namespace gpu
             for (size_t i = 1; i + 1 < n; i++)
                 tri(0, uint32_t(i), uint32_t(i + 1));
             break;
-        case 6: // triangle strip
+        case 6: // triangle strip (odd triangles swap their first two vertices to keep the winding)
             for (size_t i = 0; i + 2 < n; i++)
-                tri(uint32_t(i), uint32_t(i + 1), uint32_t(i + 2));
+            {
+                if (i & 1)
+                    tri(uint32_t(i + 1), uint32_t(i), uint32_t(i + 2));
+                else
+                    tri(uint32_t(i), uint32_t(i + 1), uint32_t(i + 2));
+            }
             break;
         case 13: // quad list
             for (size_t i = 0; i + 3 < n; i += 4)

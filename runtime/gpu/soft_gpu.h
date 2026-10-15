@@ -39,6 +39,11 @@ namespace gpu
     // Called on every swap: drops cached texture decodes (the CPU may rewrite textures).
     void SoftEndFrame();
 
+    // Debug: when set, SoftDraw prints every vertex's exported position and interpolators.
+    extern bool g_softLogVertices;
+    // Debug: when set, every texture decoded is also written to tex_<address>_<format>.bmp.
+    extern bool g_softDumpTextures;
+
     // Debug counters.
     uint64_t SoftPixelsWritten();
     uint64_t SoftResolves();

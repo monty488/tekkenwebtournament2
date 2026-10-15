@@ -46,9 +46,15 @@ namespace hid
         }();
         if (!button)
             return 0;
-        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
-        return (ms % 2000) < 150 ? button : 0;
+        // TTT2_AUTOPRESS_DELAY=<ms>: start pressing only that long after the first poll.
+        // TTT2_AUTOPRESS_COUNT=<n>: stop after n presses.
+        static const auto start = std::chrono::steady_clock::now();
+        static const long long delay = [] { const char* v = std::getenv("TTT2_AUTOPRESS_DELAY"); return v ? std::atoll(v) : 0ll; }();
+        static const long long count = [] { const char* v = std::getenv("TTT2_AUTOPRESS_COUNT"); return v ? std::atoll(v) : 0ll; }();
+        const long long elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count() - delay;
+        if (elapsed < 0 || (count && elapsed / 2000 >= count))
+            return 0;
+        return (elapsed % 2000) < 150 ? button : 0;
     }
 
 #if defined(__EMSCRIPTEN__)

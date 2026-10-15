@@ -21,6 +21,7 @@
 #include "../kernel/guest.h"
 #include "../kernel/threads.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -275,6 +276,10 @@ namespace gpu
         call.immediateIndices = std::move(immediate);
         call.vertexShader = StageCode(0, vsStorage);
         call.pixelShader = StageCode(1, psStorage);
+        static const bool logVertices = [] { const char* v = std::getenv("TTT2_GPU_LOG_VERTS"); return v && *v == '1'; }();
+        g_softLogVertices = logVertices && g_logFrame && g_swapCount + 1 == g_logFrame;
+        static const bool dumpTextures = [] { const char* v = std::getenv("TTT2_GPU_DUMP_TEX"); return v && *v == '1'; }();
+        g_softDumpTextures = dumpTextures && g_logFrame && g_swapCount + 1 == g_logFrame;
         SoftDraw(call);
     }
 
@@ -292,7 +297,29 @@ namespace gpu
             initiator & 0x3F, initiator >> 16, kSource[(initiator >> 6) & 3], (initiator >> 11) & 1, indexBase, indexBytes,
             ReadRegister(0x2208), ReadRegister(0x2000), ReadRegister(0x2001), ReadRegister(0x2002),
             g_shaders[0].address, g_shaders[0].dwords, g_shaders[1].address, g_shaders[1].dwords);
-        if (g_drawsLogged == 1)
+        if (frameLog)
+            std::fprintf(stderr, "[gpu]   depthctl=%08X stencil=%08X/%08X blend=%08X colorctl=%08X mask=%08X sc=%08X-%08X wsc=%08X-%08X su=%08X vte=%08X\n",
+                ReadRegister(0x2200), ReadRegister(0x210C), ReadRegister(0x210D), ReadRegister(0x2201), ReadRegister(0x2202),
+                ReadRegister(0x2104), ReadRegister(0x200E), ReadRegister(0x200F), ReadRegister(0x2081), ReadRegister(0x2082),
+                ReadRegister(0x2205), ReadRegister(0x2206));
+        // In frame-log mode, dump each distinct shader pair once, with the draw state.
+        bool dumpState = g_drawsLogged == 1 && !frameLog;
+        if (frameLog)
+        {
+            static std::vector<std::vector<uint32_t>> seen;
+            std::vector<uint32_t> key;
+            for (int stage = 0; stage < 2; stage++)
+            {
+                const ShaderSlot& sh = g_shaders[stage];
+                key.push_back(sh.dwords);
+                for (uint32_t i = 0; i < sh.dwords; i++)
+                    key.push_back(sh.address ? guest::Load<uint32_t>(sh.address + i * 4) : (i < sh.immediate.size() ? sh.immediate[i] : 0));
+            }
+            dumpState = std::find(seen.begin(), seen.end(), key) == seen.end();
+            if (dumpState)
+                seen.push_back(std::move(key));
+        }
+        if (dumpState)
         {
             // Full dump of the first draw: shaders, non-zero context registers, constants.
             for (int stage = 0; stage < 2; stage++)

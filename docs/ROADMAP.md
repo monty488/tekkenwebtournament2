@@ -48,16 +48,32 @@ Rough milestones, in order. Each depends on the previous one.
       interpreter, triangle/rect/quad rasteriser with depth, blending and alpha test,
       EDRAM model, resolves (tiled, endian-swapped) with clears. The loading screen
       and the Bandai Namco splash render correctly in the native window
-- [ ] Software renderer speed: ~65 ms/frame on 16 threads (shader interpretation
-      dominates); points, lines, stencil, culling, MSAA resolve and several texture
-      formats (e.g. depth textures, format 23) are missing
-- [ ] The game stops submitting frames after a timing-dependent point (frame 8 to
-      ~600; happens with rendering off too): a guest-side race to find
+- [x] Past the boot logos: the intro movie (YUV planes + subtitle strips), the title
+      screen and the attract-mode screens ("Get ready for the next battle", the VS
+      screen with character portraits) render correctly in dumped frames
+- [x] Stencil, face culling (PA_SU_SC_MODE_CNTL, strip winding), averaged MSAA resolves,
+      depth/stencil resolves (k_24_8, k_24_8_FLOAT), gamma render targets (PWL encode on
+      resolve), texture sign/gamma/exp_adjust, and float/16-bit/depth/DXN/DXT3A/DXT5A
+      texture formats. Culling is unverified until a 3D scene is reachable
+- [ ] Software renderer gaps: points and lines, mip levels/LOD (mip 0 only), cube and
+      3D textures, per-sample coverage (MSAA edges)
+- [ ] Software renderer speed: ~45-65 ms/frame on 16 threads (shader interpretation
+      dominates)
+- [ ] The bottom-corner "PRESS START" overlaps a "FREE PLAY" string: the game submits
+      both, fully opaque, in one strip draw (probably game-side state, e.g. a blink
+      timer or credit mode; not yet explained)
+- [x] The game stops submitting frames after a timing-dependent point: fixed in the
+      kernel HLE (audio callback argument, wakeup storms, critical sections)
+- [ ] Menus are not reachable yet: pressing Start during the movie or at the title hangs
+      the main thread in the sound-player teardown (XAudio2 voices never drain; XMA is
+      unimplemented, see M4). The movie also freezes or ends early for the same reason
+- [ ] The attract-mode fight crashes on an indirect call to 824B0DA4, which is not a
+      recompiled function (missing function boundary, see M1)
 - [ ] Identify the game's statically linked D3D functions
 - [ ] WebGPU backend: device, swap chain, render targets, depth
 - [ ] XenosRecomp → HLSL → SPIR-V → WGSL shader cache
 - [ ] Texture untiling and format conversion (CPU version done for the common formats)
-- [ ] Menus render, then a stage plus characters
+- [ ] Menus render (blocked on audio, above), then a stage plus characters
 
 ## M4: Sound
 - [ ] Render-driver callback thread and AudioWorklet output
