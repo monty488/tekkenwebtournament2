@@ -18,6 +18,7 @@ if (TTT2_HAVE_RECOMP)
         gpu/soft_gpu.cpp
         gpu/presenter_win.cpp
         apu/audio.cpp
+        apu/xma.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../recomp/generated/import_stubs.cpp
     )
     target_include_directories(ttt2 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

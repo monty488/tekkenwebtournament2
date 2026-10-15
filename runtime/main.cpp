@@ -8,6 +8,7 @@
 #include "kernel/memory.h"
 #include "kernel/module.h"
 #include "kernel/threads.h"
+#include "apu/xma.h"
 #include "hid/input.h"
 #include "vfs/vfs.h"
 
@@ -90,6 +91,7 @@ int main(int argc, char** argv)
     InstallFunctionTable();
     if (!guest::InitModule(dataRoot / "scan"))
         return 1;
+    apu::InitXma();
     hid::Init();
     guest::StartWatchdog();
 

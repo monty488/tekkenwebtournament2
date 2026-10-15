@@ -21,6 +21,13 @@ target_compile_options(TTT2Recomp PRIVATE
     -fno-strict-aliasing
 )
 
+# Routes MMIO stores to device register files that take commands (recomp/mmio.h).
+if (MSVC)
+    target_compile_options(TTT2Recomp PRIVATE /FI${CMAKE_CURRENT_SOURCE_DIR}/mmio.h)
+else()
+    target_compile_options(TTT2Recomp PRIVATE -include ${CMAKE_CURRENT_SOURCE_DIR}/mmio.h)
+endif()
+
 if (EMSCRIPTEN)
     # Browsers reject wasm functions with more than 50,000 locals or bodies over ~7.6 MB.
     # -O2 keeps giant recompiled functions under those limits far more often than -O0.

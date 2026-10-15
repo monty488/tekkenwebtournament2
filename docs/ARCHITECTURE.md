@@ -156,12 +156,16 @@ The game's XAudio2 is statically linked. It mixes in software and hands 256-samp
 (`XAudioRegisterRenderDriverClient` / `XAudioSubmitRenderDriverFrame`, stubbed
 in `runtime/apu/audio.cpp`). The runtime must:
 
-* call the registered client callback every 256 samples (5.33 ms at 48 kHz),
-  from a dedicated guest thread;
+* call every registered client callback every 256 samples (5.33 ms at 48 kHz),
+  from a dedicated guest thread (TTT2 runs two XAudio2 engines, each with its own
+  client; an engine whose callback stops never drains its voices);
 * downmix 5.1 to stereo and push into a `SharedArrayBuffer` ring buffer read by an
   **AudioWorklet**;
-* decode **XMA**, the hardware decoder exposed through `XMA*` kernel calls.
-  FFmpeg's `xma2` decoder, compiled to wasm, is the most direct route.
+* decode **XMA**, the hardware decoder exposed through `XMA*` kernel calls and the
+  register file at 0x7FEA0000. `runtime/apu/xma.cpp` emulates the contexts (Xenia's
+  layout) and outputs silence; MMIO stores to the register file reach it through
+  `recomp/mmio.h`. FFmpeg's `xma2` decoder, compiled to wasm, is the most direct
+  route to real output.
 
 ## 8. Input
 
