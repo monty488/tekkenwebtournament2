@@ -9,12 +9,15 @@
 #include "input.h"
 #include "../kernel/guest.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <atomic>
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <string>
+#include <vector>
 
 #if defined(__EMSCRIPTEN__)
 #include <emscripten/html5.h>
@@ -34,17 +37,26 @@ namespace hid
         bool connected = false;
     };
 
-    // Testing aid: TTT2_AUTOPRESS=start|a taps that button for 150 ms every 2 s on player 1.
+    // Testing aid: TTT2_AUTOPRESS=start|a|b taps that button for 150 ms every 2 s on player 1.
+    // A comma-separated list (e.g. start,start,a) names the button for each press in turn
+    // ("none" skips one); the last entry repeats.
     static uint16_t AutoPressButtons()
     {
-        static const uint16_t button = [] {
-            const char* v = std::getenv("TTT2_AUTOPRESS");
-            if (!v) return uint16_t(0);
-            if (std::strcmp(v, "start") == 0) return uint16_t(XAMINPUT_GAMEPAD_START);
-            if (std::strcmp(v, "a") == 0) return uint16_t(XAMINPUT_GAMEPAD_A);
-            return uint16_t(0);
+        static const std::vector<uint16_t> buttons = [] {
+            std::vector<uint16_t> list;
+            for (const char* p = std::getenv("TTT2_AUTOPRESS"); p && *p;)
+            {
+                const char* end = std::strchr(p, ',');
+                const std::string name(p, end ? size_t(end - p) : std::strlen(p));
+                list.push_back(name == "start" ? XAMINPUT_GAMEPAD_START
+                    : name == "a"              ? XAMINPUT_GAMEPAD_A
+                    : name == "b"              ? XAMINPUT_GAMEPAD_B
+                                               : 0);
+                p = end ? end + 1 : nullptr;
+            }
+            return list;
         }();
-        if (!button)
+        if (buttons.empty())
             return 0;
         // TTT2_AUTOPRESS_DELAY=<ms>: start pressing only that long after the first poll.
         // TTT2_AUTOPRESS_COUNT=<n>: stop after n presses.
@@ -54,7 +66,8 @@ namespace hid
         const long long elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count() - delay;
         if (elapsed < 0 || (count && elapsed / 2000 >= count))
             return 0;
-        return (elapsed % 2000) < 150 ? button : 0;
+        const size_t press = std::min(size_t(elapsed / 2000), buttons.size() - 1);
+        return (elapsed % 2000) < 150 ? buttons[press] : 0;
     }
 
 #if defined(__EMSCRIPTEN__)
