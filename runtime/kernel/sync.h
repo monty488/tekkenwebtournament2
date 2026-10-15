@@ -9,6 +9,7 @@
 #include "objects.h"
 
 #include <condition_variable>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -20,15 +21,34 @@ namespace guest
     std::condition_variable& WaitCondition();
     void NotifyWaiters();
 
+    struct Waitable;
+
+    // A thread blocked in WaitForObjects (wait-any). Signals are handed to the oldest
+    // eligible waiter directly, as the NT kernel does: an auto-reset event set while a
+    // thread waits on it wakes that thread and stays unsignalled, so the setter cannot
+    // take it back by waiting on it right away.
+    struct Waiter
+    {
+        uint32_t threadId = 0;
+        const std::vector<std::shared_ptr<Waitable>>* objects = nullptr;
+        int satisfiedIndex = -1;
+    };
+
     struct Waitable : KernelObject
     {
         // Both called with WaitMutex() held.
         virtual bool IsSignaled(uint32_t threadId) = 0;
         virtual void Acquire(uint32_t threadId) {}
 
+        std::deque<Waiter*> waiters; // guarded by WaitMutex()
+
         // Guest-visible object (dispatcher header) for ObReferenceObjectByHandle/Ke* APIs.
         uint32_t guestObject = 0;
     };
+
+    // Hands the object's available state to queued waiters (call with WaitMutex() held,
+    // after changing the state), then updates the guest header.
+    void DeliverSignals(Waitable& object);
 
     struct Event : Waitable
     {

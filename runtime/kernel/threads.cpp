@@ -34,46 +34,84 @@ namespace guest
         return t_threadId;
     }
 
-    uint32_t RunGuestThread(uint32_t startAddress, uint32_t arg0, uint32_t arg1)
+    GuestEnv CreateGuestEnv(uint8_t cpu)
     {
         // Static TLS comes from the XEX's TLS directory; keep at least TLS_SIZE so titles
         // without one still get a valid block.
         const TlsInfo& tlsInfo = GetTlsInfo();
         const uint32_t tlsSize = (std::max(tlsInfo.dataSize, TLS_SIZE) + 0xF) & ~0xFu;
 
-        const uint32_t block = AllocVirtual(PCR_SIZE + tlsSize + TEB_SIZE + STACK_SIZE);
-        if (!block)
+        GuestEnv env;
+        env.block = AllocVirtual(PCR_SIZE + tlsSize + TEB_SIZE + STACK_SIZE);
+        if (!env.block)
         {
-            TTT2_LOG("RunGuestThread: could not allocate thread block");
-            return 0;
+            TTT2_LOG("CreateGuestEnv: could not allocate thread block");
+            return env;
         }
 
-        const uint32_t pcr = block;
-        const uint32_t tls = pcr + PCR_SIZE;
+        env.pcr = env.block;
+        const uint32_t tls = env.pcr + PCR_SIZE;
         const uint32_t teb = tls + tlsSize;
-        const uint32_t stackTop = teb + TEB_SIZE + STACK_SIZE;
+        env.stackTop = teb + TEB_SIZE + STACK_SIZE;
 
         if (tlsInfo.rawAddress && tlsInfo.rawSize)
             std::memcpy(ToHost(tls), ToHost(tlsInfo.rawAddress), std::min(tlsInfo.rawSize, tlsSize));
 
-        Store<uint32_t>(pcr + 0x000, tls);                // PCR->TlsData
-        Store<uint32_t>(pcr + 0x100, teb);                // PCR->CurrentThread
-        *ToHost<uint8_t>(pcr + 0x10C) = 0;                // PCR->CurrentCpu
-        Store<uint32_t>(teb + 0x14C, CurrentThreadId());  // KTHREAD->ThreadId
-
-        PPCContext ctx{};
-        ctx.r1.u64 = stackTop;
-        ctx.r3.u64 = arg0;
-        ctx.r4.u64 = arg1;
-        ctx.r13.u64 = pcr;
-        ctx.fpscr.loadFromHost();
+        Store<uint32_t>(env.pcr + 0x000, tls);                // PCR->TlsData
+        Store<uint32_t>(env.pcr + 0x100, teb);                // PCR->CurrentThread
+        *ToHost<uint8_t>(env.pcr + 0x10C) = cpu;              // PCR->CurrentCpu
+        Store<uint32_t>(teb + 0x14C, CurrentThreadId());      // KTHREAD->ThreadId
 
         RegisterGuestThread();
-        Call(ctx, startAddress);
-        UnregisterGuestThread();
+        return env;
+    }
 
-        Free(block);
+    void DestroyGuestEnv(GuestEnv& env)
+    {
+        UnregisterGuestThread();
+        if (env.block)
+            Free(env.block);
+        env = {};
+    }
+
+    uint32_t CallGuest(const GuestEnv& env, uint32_t address, std::initializer_list<uint32_t> args)
+    {
+        PPCContext ctx{};
+        ctx.r1.u64 = env.stackTop;
+        ctx.r13.u64 = env.pcr;
+        PPCRegister* argRegs[] = { &ctx.r3, &ctx.r4, &ctx.r5, &ctx.r6, &ctx.r7, &ctx.r8, &ctx.r9, &ctx.r10 };
+        size_t i = 0;
+        for (uint32_t arg : args)
+            if (i < std::size(argRegs))
+                argRegs[i++]->u64 = arg;
+        ctx.fpscr.loadFromHost();
+        Call(ctx, address);
         return ctx.r3.u32;
+    }
+
+    // Thrown by ExTerminateThread and caught at the thread's entry, unwinding the
+    // recompiled frames in between (they hold no resources).
+    struct GuestThreadExit
+    {
+        uint32_t exitCode;
+    };
+
+    uint32_t RunGuestThread(uint32_t startAddress, uint32_t arg0, uint32_t arg1)
+    {
+        GuestEnv env = CreateGuestEnv();
+        if (!env.block)
+            return 0;
+        uint32_t result;
+        try
+        {
+            result = CallGuest(env, startAddress, { arg0, arg1 });
+        }
+        catch (const GuestThreadExit& exit)
+        {
+            result = exit.exitCode;
+        }
+        DestroyGuestEnv(env);
+        return result;
     }
 
     uint64_t TimebaseFrequency()
@@ -134,6 +172,7 @@ GUEST_IMPORT(ExCreateThread)
             std::lock_guard lock(WaitMutex());
             thread->exitCode = exitCode;
             thread->finished = true;
+            DeliverSignals(*thread);
         }
         NotifyWaiters();
     }).detach();
@@ -148,7 +187,7 @@ GUEST_IMPORT(ExCreateThread)
 // NTSTATUS NtResumeThread(u32 handle, u32* previousSuspendCount)
 GUEST_IMPORT(NtResumeThread)
 {
-    auto thread = Handles().Get<GuestThread>(ctx.r3.u32);
+    auto thread = std::dynamic_pointer_cast<GuestThread>(WaitableFromHandle(ctx.r3.u32));
     if (!thread)
     {
         ctx.r3.u64 = STATUS_INVALID_HANDLE;
@@ -167,6 +206,37 @@ GUEST_IMPORT(NtResumeThread)
     if (ctx.r4.u32)
         Store<uint32_t>(ctx.r4.u32, uint32_t(previous));
     ctx.r3.u64 = STATUS_SUCCESS;
+}
+
+// NTSTATUS NtSuspendThread(u32 handle, u32* previousSuspendCount)
+// A thread suspending itself (the common idle pattern: "queue empty -> suspend until a
+// producer resumes me") blocks here until NtResumeThread. Suspending another thread only
+// records the count: host threads cannot be stopped at an arbitrary guest instruction.
+GUEST_IMPORT(NtSuspendThread)
+{
+    auto thread = std::dynamic_pointer_cast<GuestThread>(WaitableFromHandle(ctx.r3.u32));
+    if (!thread)
+    {
+        ctx.r3.u64 = STATUS_INVALID_HANDLE;
+        return;
+    }
+
+    int previous;
+    {
+        std::unique_lock lock(WaitMutex());
+        previous = thread->suspendCount++;
+        if (ctx.r4.u32)
+            Store<uint32_t>(ctx.r4.u32, uint32_t(previous));
+        if (thread->id == CurrentThreadId())
+            WaitCondition().wait(lock, [&] { return thread->suspendCount == 0; });
+    }
+    ctx.r3.u64 = STATUS_SUCCESS;
+}
+
+// void ExTerminateThread(u32 exitCode): never returns.
+GUEST_IMPORT(ExTerminateThread)
+{
+    throw GuestThreadExit{ ctx.r3.u32 };
 }
 
 GUEST_IMPORT(KeGetCurrentProcessType)
@@ -263,10 +333,18 @@ GUEST_IMPORT(RtlEnterCriticalSection)
 {
     auto* cs = ToHost<XRTL_CRITICAL_SECTION>(ctx.r3.u32);
     const uint32_t self = CurrentThreadId();
+    const auto start = std::chrono::steady_clock::now();
+    bool reported = false;
     for (uint32_t spins = 0; !TryEnter(cs, self); ++spins)
     {
         if (spins > 64)
             std::this_thread::yield();
+        if (!reported && (spins & 0xFFF) == 0 && std::chrono::steady_clock::now() - start > std::chrono::seconds(2))
+        {
+            reported = true;
+            TTT2_LOG("T%u waiting >2s for critical section %08X owned by T%u (recursion %d)", self,
+                ctx.r3.u32, std::atomic_ref<uint32_t>(cs->OwningThread).load(), cs->RecursionCount);
+        }
     }
 }
 

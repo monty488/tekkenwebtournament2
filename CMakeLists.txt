@@ -43,6 +43,9 @@ if (TTT2_HAVE_RECOMP)
     set(TTT2_INDIRECT_CALL_HEADER ${CMAKE_CURRENT_SOURCE_DIR}/runtime/kernel/indirect_call.h)
     if (MSVC)
         add_compile_options("/FI${TTT2_INDIRECT_CALL_HEADER}")
+        # Recompiled functions are extern "C"; /EHsc would assume they never throw, but
+        # ExTerminateThread unwinds through them (runtime/kernel/threads.cpp).
+        add_compile_options(/EHc-)
     else()
         add_compile_options(-include ${TTT2_INDIRECT_CALL_HEADER})
     endif()

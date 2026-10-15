@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -24,40 +25,47 @@
 
 namespace guest
 {
+    // Per-thread bookkeeping is written lock-free by its own thread on every kernel call
+    // and only read (under g_mutex, for the map) by the watchdog/sampler.
     struct ThreadInfo
     {
-        const char* lastImport = "(none)";
-        uint64_t lastLr = 0;
-        uint64_t calls = 0;
+        std::atomic<const char*> lastImport{ "(none)" };
+        std::atomic<uint64_t> lastLr{ 0 };
+        std::atomic<uint64_t> calls{ 0 };
 #ifdef _WIN32
         HANDLE handle = nullptr;
 #endif
     };
 
     static std::mutex g_mutex;
-    static std::unordered_map<uint32_t, ThreadInfo> g_threads;
+    static std::unordered_map<uint32_t, std::unique_ptr<ThreadInfo>> g_threads;
     static std::atomic<uint64_t> g_totalCalls{ 0 };
+    static thread_local ThreadInfo* t_info = nullptr;
     static const bool g_trace = [] { const char* v = std::getenv("TTT2_TRACE"); return v && *v && *v != '0'; }();
 
     void RegisterGuestThread()
     {
         std::lock_guard lock(g_mutex);
-        auto& info = g_threads[CurrentThreadId()];
+        auto& slot = g_threads[CurrentThreadId()];
+        if (!slot)
+            slot = std::make_unique<ThreadInfo>();
 #ifdef _WIN32
-        if (!info.handle)
-            DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &info.handle, 0, FALSE, DUPLICATE_SAME_ACCESS);
+        if (!slot->handle)
+            DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &slot->handle, 0, FALSE, DUPLICATE_SAME_ACCESS);
 #endif
+        t_info = slot.get();
     }
 
     void UnregisterGuestThread()
     {
         std::lock_guard lock(g_mutex);
+        t_info = nullptr;
         auto it = g_threads.find(CurrentThreadId());
         if (it == g_threads.end())
             return;
 #ifdef _WIN32
-        if (it->second.handle)
-            CloseHandle(it->second.handle);
+        if (it->second->handle)
+            CloseHandle(it->second->handle);
 #endif
         g_threads.erase(it);
     }
@@ -65,18 +73,16 @@ namespace guest
     void TraceImport(const char* name, const PPCContext& ctx)
     {
         g_totalCalls.fetch_add(1, std::memory_order_relaxed);
-        const uint32_t tid = CurrentThreadId();
         uint64_t lr = 0;
 #ifndef PPC_CONFIG_SKIP_LR
         lr = ctx.lr;
 #endif
-        {
-            std::lock_guard lock(g_mutex);
-            auto& info = g_threads[tid];
-            info.lastImport = name;
-            info.lastLr = lr;
-            ++info.calls;
-        }
+        if (!t_info)
+            RegisterGuestThread();
+        t_info->lastImport.store(name, std::memory_order_relaxed);
+        t_info->lastLr.store(lr, std::memory_order_relaxed);
+        t_info->calls.fetch_add(1, std::memory_order_relaxed);
+        const uint32_t tid = CurrentThreadId();
         if (g_trace)
         {
             std::fprintf(stderr, "[trace] T%u %s(%08X, %08X, %08X, %08X) lr=%08llX\n", tid, name,
@@ -157,10 +163,10 @@ namespace guest
                     for (auto& [tid, info] : g_threads)
                     {
                         std::fprintf(stderr, "    T%u: %llu calls, last %s (lr=%08llX)\n", tid,
-                            (unsigned long long)info.calls, info.lastImport, (unsigned long long)info.lastLr);
+                            (unsigned long long)info->calls.load(), info->lastImport.load(), (unsigned long long)info->lastLr.load());
 #ifdef _WIN32
-                        if (info.handle)
-                            DumpThreadStack(info.handle);
+                        if (info->handle)
+                            DumpThreadStack(info->handle);
 #endif
                     }
                 }
@@ -175,6 +181,27 @@ namespace guest
         const int seconds = v ? std::atoi(v) : 5;
         if (seconds > 0)
             std::thread(WatchdogThread, seconds).detach();
+
+        // TTT2_SAMPLE_AT=<ms>: dump every guest thread's stack once at that time, regardless
+        // of activity (the watchdog never fires while any thread keeps calling the kernel).
+        if (const char* at = std::getenv("TTT2_SAMPLE_AT"))
+        {
+            const int ms = std::atoi(at);
+            std::thread([ms] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+                std::lock_guard lock(g_mutex);
+                std::fprintf(stderr, "[sample] at %d ms:\n", ms);
+                for (auto& [tid, info] : g_threads)
+                {
+                    std::fprintf(stderr, "    T%u: %llu calls, last %s (lr=%08llX)\n", tid,
+                        (unsigned long long)info->calls.load(), info->lastImport.load(), (unsigned long long)info->lastLr.load());
+#ifdef _WIN32
+                    if (info->handle)
+                        DumpThreadStack(info->handle);
+#endif
+                }
+            }).detach();
+        }
     }
 }
 

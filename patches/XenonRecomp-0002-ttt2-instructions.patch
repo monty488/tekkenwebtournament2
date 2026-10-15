@@ -1,8 +1,38 @@
 diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
-index fa91527..269b252 100644
+index fa91527..75a5d88 100644
 --- a/XenonRecomp/recompiler.cpp
 +++ b/XenonRecomp/recompiler.cpp
-@@ -1133,6 +1133,7 @@ bool Recompiler::Recompile(
+@@ -827,23 +827,25 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_DIVD:
+-        println("\t{}.s64 = {}.s64 / {}.s64;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        // PowerPC divides never trap: x / 0 and INT64_MIN / -1 give an undefined result (0 here,
++        // as in Xenia), while the host would raise an exception.
++        println("\t{0}.s64 = ({2}.s64 == 0 || ({1}.s64 == INT64_MIN && {2}.s64 == -1)) ? 0 : {1}.s64 / {2}.s64;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
+         break;
+ 
+     case PPC_INST_DIVDU:
+-        println("\t{}.u64 = {}.u64 / {}.u64;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        println("\t{0}.u64 = {2}.u64 == 0 ? 0 : {1}.u64 / {2}.u64;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
+         if (strchr(insn.opcode->name, '.'))
+             println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
+         break;
+ 
+     case PPC_INST_DIVW:
+-        println("\t{}.s32 = {}.s32 / {}.s32;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        println("\t{0}.s32 = ({2}.s32 == 0 || ({1}.s32 == INT_MIN && {2}.s32 == -1)) ? 0 : {1}.s32 / {2}.s32;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
+         if (strchr(insn.opcode->name, '.'))
+             println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
+         break;
+ 
+     case PPC_INST_DIVWU:
+-        println("\t{}.u32 = {}.u32 / {}.u32;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
++        println("\t{0}.u32 = {2}.u32 == 0 ? 0 : {1}.u32 / {2}.u32;", r(insn.operands[0]), r(insn.operands[1]), r(insn.operands[2]));
+         if (strchr(insn.opcode->name, '.'))
+             println("\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());
+         break;
+@@ -1133,6 +1135,7 @@ bool Recompiler::Recompile(
          println("\t{}.s64 = {};", r(insn.operands[0]), int32_t(insn.operands[1] << 16));
          break;
  
@@ -10,7 +40,7 @@ index fa91527..269b252 100644
      case PPC_INST_LVEWX:
      case PPC_INST_LVEWX128:
      case PPC_INST_LVX:
-@@ -1369,6 +1370,8 @@ bool Recompiler::Recompile(
+@@ -1369,6 +1372,8 @@ bool Recompiler::Recompile(
  
      case PPC_INST_RLDICL:
          println("\t{}.u64 = __builtin_rotateleft64({}.u64, {}) & 0x{:X};", r(insn.operands[0]), r(insn.operands[1]), insn.operands[2], ComputeMask(insn.operands[3], 63));
@@ -19,7 +49,7 @@ index fa91527..269b252 100644
          break;
  
      case PPC_INST_RLDICR:
-@@ -1769,6 +1772,7 @@ bool Recompiler::Recompile(
+@@ -1769,6 +1774,7 @@ bool Recompiler::Recompile(
          println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_and_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
          break;
  
@@ -27,7 +57,7 @@ index fa91527..269b252 100644
      case PPC_INST_VANDC128:
          println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_andnot_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[2]), v(insn.operands[1]));
          break;
-@@ -1831,7 +1835,22 @@ bool Recompiler::Recompile(
+@@ -1831,7 +1837,22 @@ bool Recompiler::Recompile(
  
      case PPC_INST_VCMPBFP:
      case PPC_INST_VCMPBFP128:
@@ -51,7 +81,7 @@ index fa91527..269b252 100644
          break;
  
      case PPC_INST_VCMPEQFP:
-@@ -1877,6 +1896,8 @@ bool Recompiler::Recompile(
+@@ -1877,6 +1898,8 @@ bool Recompiler::Recompile(
  
      case PPC_INST_VCMPGTUH:
          println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_cmpgt_epu16(simde_mm_load_si128((simde__m128i*){}.u16), simde_mm_load_si128((simde__m128i*){}.u16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
@@ -60,7 +90,7 @@ index fa91527..269b252 100644
          break;
  
      case PPC_INST_VEXPTEFP:
-@@ -2014,27 +2035,54 @@ bool Recompiler::Recompile(
+@@ -2014,27 +2037,54 @@ bool Recompiler::Recompile(
              println("\t{}.u32[{}] = {}.u32;", v(insn.operands[0]), insn.operands[4], temp());
              break;
  
@@ -132,7 +162,7 @@ index fa91527..269b252 100644
  
          default:
              println("\t__builtin_debugtrap();");
-@@ -2088,6 +2136,7 @@ bool Recompiler::Recompile(
+@@ -2088,6 +2138,7 @@ bool Recompiler::Recompile(
          break;
  
      case PPC_INST_VSEL:
@@ -140,7 +170,7 @@ index fa91527..269b252 100644
          println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_or_si128(simde_mm_andnot_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)), simde_mm_and_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8))));", v(insn.operands[0]), v(insn.operands[3]), v(insn.operands[1]), v(insn.operands[3]), v(insn.operands[2]));
          break;
  
-@@ -2186,6 +2235,336 @@ bool Recompiler::Recompile(
+@@ -2186,6 +2237,336 @@ bool Recompiler::Recompile(
          println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_sub_epi16(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
          break;
  
@@ -477,7 +507,7 @@ index fa91527..269b252 100644
      case PPC_INST_VUPKD3D128:
          // TODO: vectorize somehow?
          // NOTE: handling vector reversal here too
-@@ -2212,6 +2591,36 @@ bool Recompiler::Recompile(
+@@ -2212,6 +2593,36 @@ bool Recompiler::Recompile(
              println("\t{} = {};", v(insn.operands[0]), vTemp());
              break;
  
@@ -514,3 +544,33 @@ index fa91527..269b252 100644
          default:
              println("\t__builtin_debugtrap();");
              break;
+@@ -2438,6 +2849,29 @@ bool Recompiler::Recompile(const Function& fn)
+         ++data;
+     }
+ 
++    // A function boundary can split code that falls through: e.g. an SEH funclet whose
++    // shared epilogue is also the target of a branch from another funclet. Continue into
++    // the function that starts at the boundary instead of silently returning.
++    {
++        const uint32_t last = ByteSwap(*(data - 1));
++        const uint32_t op = last >> 26;
++        const bool terminates = last == 0 || last == 0x4E800020 || last == 0x4E800420 ||
++            (op == 18 && !(last & 1)) || op == 3 || (op == 31 && ((last >> 1) & 0x3FF) == 4);
++        if (!terminates)
++        {
++            auto next = image.symbols.find(base);
++            if (next != image.symbols.end() && next->address == base && next->type == Symbol_Function)
++            {
++                println("\t// falls through into the next function");
++                println("\t{}(ctx, base);", next->name);
++            }
++            else
++            {
++                fmt::println("Function at {:X} falls through at {:X} into no function", fn.base, base);
++            }
++        }
++    }
++
+ #if 0
+     if (insn.opcode == nullptr || (insn.opcode->id != PPC_INST_B && insn.opcode->id != PPC_INST_BCTR && insn.opcode->id != PPC_INST_BLR))
+         fmt::println("Function at {:X} ends prematurely with instruction {} at {:X}", fn.base, insn.opcode != nullptr ? insn.opcode->name : "INVALID", base - 4);

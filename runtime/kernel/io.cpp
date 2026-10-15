@@ -5,7 +5,9 @@
 #include "objects.h"
 #include "../vfs/vfs.h"
 
+#include <cctype>
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 namespace guest
@@ -140,6 +142,8 @@ GUEST_IMPORT(NtQueryInformationFile)
 {
     constexpr uint32_t FileStandardInformation = 5;
     constexpr uint32_t FilePositionInformation = 14;
+    constexpr uint32_t FileSectorInformation = 27;      // Xbox-specific
+    constexpr uint32_t FileNetworkOpenInformation = 34;
 
     auto file = Handles().Get<GuestFile>(ctx.r3.u32);
     const uint32_t ioStatusBlock = ctx.r4.u32;
@@ -167,6 +171,29 @@ GUEST_IMPORT(NtQueryInformationFile)
     case FilePositionInformation:
         Store<uint64_t>(info, Tell64(file->file));
         SetIoStatus(ioStatusBlock, STATUS_SUCCESS, 8);
+        ctx.r3.u64 = STATUS_SUCCESS;
+        return;
+
+    case FileSectorInformation:
+    {
+        // Starting DVD sector, used by titles to order reads. There is no disc layout here;
+        // give each file a distinct, stable sector derived from its path.
+        uint32_t hash = 2166136261u;
+        for (char c : file->path)
+            hash = (hash ^ uint8_t(std::tolower((unsigned char)c))) * 16777619u;
+        Store<uint32_t>(info, hash & 0x00FFFFFF);
+        SetIoStatus(ioStatusBlock, STATUS_SUCCESS, 4);
+        ctx.r3.u64 = STATUS_SUCCESS;
+        return;
+    }
+
+    case FileNetworkOpenInformation:
+        // Creation/access/write/change times (u64 each), AllocationSize, EndOfFile, Attributes.
+        std::memset(ToHost(info), 0, 0x38);
+        Store<uint64_t>(info + 0x20, (file->size + 0xFFF) & ~0xFFFull);
+        Store<uint64_t>(info + 0x28, file->size);
+        Store<uint32_t>(info + 0x30, 0x80); // FILE_ATTRIBUTE_NORMAL
+        SetIoStatus(ioStatusBlock, STATUS_SUCCESS, 0x38);
         ctx.r3.u64 = STATUS_SUCCESS;
         return;
 

@@ -2,6 +2,7 @@
 #include "memory.h"
 #include "threads.h"
 
+#include <atomic>
 #include <chrono>
 #include <thread>
 #include <unordered_map>
@@ -128,14 +129,61 @@ namespace guest
         return std::chrono::steady_clock::now() + std::chrono::nanoseconds(-value * 100);
     }
 
+    void DeliverSignals(Waitable& object)
+    {
+        for (auto it = object.waiters.begin(); it != object.waiters.end();)
+        {
+            Waiter* w = *it;
+            if (w->satisfiedIndex >= 0)
+            {
+                ++it; // already woken by another object; it unregisters itself
+                continue;
+            }
+            if (!object.IsSignaled(w->threadId))
+                break; // FIFO: later waiters cannot jump the queue
+            object.Acquire(w->threadId);
+            for (size_t i = 0; i < w->objects->size(); i++)
+            {
+                if ((*w->objects)[i].get() == &object)
+                {
+                    w->satisfiedIndex = int(i);
+                    break;
+                }
+            }
+            it = object.waiters.erase(it);
+        }
+        SyncGuestHeader(object);
+    }
+
     uint32_t WaitForObjects(const std::vector<std::shared_ptr<Waitable>>& objects, bool waitAll, uint32_t timeout)
     {
         const uint32_t tid = CurrentThreadId();
         const auto deadline = Deadline(timeout);
 
         std::unique_lock lock(g_waitMutex);
+
+        // Wait-any waiters queue on every object so signals can be handed to them.
+        Waiter waiter;
+        waiter.threadId = tid;
+        waiter.objects = &objects;
+        bool queued = false;
+        auto unqueue = [&] {
+            if (!queued)
+                return;
+            for (auto& o : objects)
+                if (o)
+                    std::erase(o->waiters, &waiter);
+            queued = false;
+        };
+
         for (;;)
         {
+            if (waiter.satisfiedIndex >= 0)
+            {
+                unqueue();
+                return STATUS_SUCCESS + uint32_t(waiter.satisfiedIndex);
+            }
+
             if (waitAll)
             {
                 bool all = true;
@@ -155,12 +203,31 @@ namespace guest
             {
                 for (size_t i = 0; i < objects.size(); i++)
                 {
-                    if (objects[i] && objects[i]->IsSignaled(tid))
+                    // Only take state no earlier, still-blocked waiter is owed.
+                    auto owedToEarlier = [&](const Waitable& o) {
+                        for (Waiter* w : o.waiters)
+                        {
+                            if (w == &waiter)
+                                return false;
+                            if (w->satisfiedIndex < 0)
+                                return true;
+                        }
+                        return false;
+                    };
+                    if (objects[i] && objects[i]->IsSignaled(tid) && !owedToEarlier(*objects[i]))
                     {
                         objects[i]->Acquire(tid);
                         SyncGuestHeader(*objects[i]);
+                        unqueue();
                         return STATUS_SUCCESS + uint32_t(i);
                     }
+                }
+                if (!queued)
+                {
+                    for (auto& o : objects)
+                        if (o)
+                            o->waiters.push_back(&waiter);
+                    queued = true;
                 }
             }
 
@@ -169,7 +236,10 @@ namespace guest
                 // Checked after a final pass over the objects above, so a signal that
                 // races the deadline still wins.
                 if (std::chrono::steady_clock::now() >= *deadline)
+                {
+                    unqueue();
                     return STATUS_TIMEOUT;
+                }
                 g_waitCv.wait_until(lock, *deadline);
             }
             else
@@ -199,7 +269,7 @@ namespace guest
                 return STATUS_SEMAPHORE_LIMIT_EXCEEDED;
             ++s->count;
         }
-        SyncGuestHeader(*object);
+        DeliverSignals(*object);
         g_waitCv.notify_all();
         return STATUS_SUCCESS;
     }
@@ -278,16 +348,16 @@ GUEST_IMPORT(NtPulseEvent)
     auto e = std::dynamic_pointer_cast<Event>(WaitableFromHandle(ctx.r3.u32));
     if (!e) { ctx.r3.u64 = STATUS_INVALID_HANDLE; return; }
     {
+        // Satisfy the threads waiting right now (one for auto-reset, all for manual),
+        // then leave the event reset, atomically.
         std::lock_guard lock(WaitMutex());
         if (ctx.r4.u32) Store<int32_t>(ctx.r4.u32, e->signaled);
         e->signaled = true;
+        DeliverSignals(*e);
+        e->signaled = false;
+        if (e->guestObject) Store<int32_t>(e->guestObject + 4, 0);
     }
     NotifyWaiters();
-    std::this_thread::yield();
-    {
-        std::lock_guard lock(WaitMutex());
-        e->signaled = false;
-    }
     ctx.r3.u64 = STATUS_SUCCESS;
 }
 
@@ -370,7 +440,7 @@ GUEST_IMPORT(NtReleaseSemaphore)
             return;
         }
         s->count += release;
-        if (s->guestObject) Store<int32_t>(s->guestObject + 4, s->count);
+        DeliverSignals(*s);
     }
     NotifyWaiters();
     ctx.r3.u64 = STATUS_SUCCESS;
@@ -445,4 +515,50 @@ GUEST_IMPORT(NtDuplicateObject)
     if (ctx.r5.u32 & 1) // DUPLICATE_CLOSE_SOURCE
         Handles().Close(ctx.r3.u32);
     ctx.r3.u64 = STATUS_SUCCESS;
+}
+
+// ---- Spinlocks ---------------------------------------------------------------
+// A KSPIN_LOCK is one dword: 0 when free, the owner's id while held. Interrupt levels
+// are not modelled, so the "raised IRQL" variants behave the same.
+
+static void AcquireSpinLock(uint32_t address)
+{
+    std::atomic_ref<uint32_t> lock(*ToHost<uint32_t>(address));
+    const uint32_t self = CurrentThreadId();
+    for (uint32_t spins = 0;; ++spins)
+    {
+        uint32_t expected = 0;
+        if (lock.compare_exchange_weak(expected, self, std::memory_order_acquire))
+            return;
+        if (spins > 64)
+            std::this_thread::yield();
+    }
+}
+
+static void ReleaseSpinLock(uint32_t address)
+{
+    std::atomic_ref<uint32_t>(*ToHost<uint32_t>(address)).store(0, std::memory_order_release);
+}
+
+// KIRQL KfAcquireSpinLock(KSPIN_LOCK* lock) -> previous IRQL
+GUEST_IMPORT(KfAcquireSpinLock)
+{
+    AcquireSpinLock(ctx.r3.u32);
+    ctx.r3.u64 = 0;
+}
+
+// void KfReleaseSpinLock(KSPIN_LOCK* lock, KIRQL oldIrql)
+GUEST_IMPORT(KfReleaseSpinLock)
+{
+    ReleaseSpinLock(ctx.r3.u32);
+}
+
+GUEST_IMPORT(KeAcquireSpinLockAtRaisedIrql)
+{
+    AcquireSpinLock(ctx.r3.u32);
+}
+
+GUEST_IMPORT(KeReleaseSpinLockFromRaisedIrql)
+{
+    ReleaseSpinLock(ctx.r3.u32);
 }

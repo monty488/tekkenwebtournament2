@@ -1,4 +1,4 @@
-if (TTT2_HAVE_RECOMP)
+﻿if (TTT2_HAVE_RECOMP)
     add_executable(ttt2
         main.cpp
         kernel/memory.cpp
@@ -7,6 +7,7 @@ if (TTT2_HAVE_RECOMP)
         kernel/sync.cpp
         kernel/xconfig.cpp
         kernel/xam.cpp
+        kernel/dpc.cpp
         kernel/objects.cpp
         kernel/threads.cpp
         kernel/io.cpp

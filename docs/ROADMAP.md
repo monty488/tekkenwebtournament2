@@ -31,13 +31,20 @@ Rough milestones, in order. Each depends on the previous one.
 - [x] Static TLS sized and initialised from the XEX TLS directory
 - [x] Dispatcher objects: events, mutants, semaphores, thread objects; waits by handle
       and by guest dispatcher header (timers still to do)
-- [ ] Graphics interrupt / vblank: call the callback from `VdSetGraphicsInterruptCallback`
-      every frame (the game is waiting on this now)
-- [ ] Vd* ring buffer / command buffer APIs, then `VdSwap` reached repeatedly
+- [x] Graphics interrupt at 60 Hz (vblank, source 0) with the interrupt-status register
+      reading "vblank"; DPCs dispatched on their own thread
+- [x] Ring buffer + minimal command processor: walks PM4, executes memory writes, fence
+      events, conditional writes, scratch-register write-back, interrupts and indirect
+      buffers; skips draws. `VdSwap` now fires every vblank (1000+ frames, ~60 fps)
+- [x] NT wait semantics: FIFO waiter queues with direct hand-off; thread self-suspend;
+      ExTerminateThread; non-trapping integer divides; fall-through across split functions
+- [ ] Some worker threads wait >2 s on locks the main thread holds: check for a leak
 - [ ] Remaining memory, I/O and XAM calls from the stub log (~208 still stubbed)
 - [ ] Content/save APIs (XContent*), profile/sign-in (currently: nobody signed in)
 
 ## M3: Pictures
+- [ ] Decode the draw/state PM4 packets the command processor currently skips
+      (`runtime/gpu/video.cpp`), or hook the game's D3D functions above them
 - [ ] Identify the game's statically linked D3D functions
 - [ ] WebGPU backend: device, swap chain, render targets, depth
 - [ ] XenosRecomp → HLSL → SPIR-V → WGSL shader cache

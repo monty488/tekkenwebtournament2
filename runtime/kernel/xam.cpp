@@ -71,3 +71,60 @@ GUEST_IMPORT(RtlTimeToTimeFields)
     Store<uint16_t>(out + 0xC, uint16_t(dayTime / 10000ull % 1000));            // millisecond
     Store<uint16_t>(out + 0xE, weekday);
 }
+
+// void XGetVideoMode(XVIDEO_MODE* mode): same answer as VdQueryVideoMode.
+GUEST_IMPORT(XGetVideoMode)
+{
+    auto* mode = ToHost<XVIDEO_MODE>(ctx.r3.u32);
+    *mode = {};
+    mode->DisplayWidth = 1280;
+    mode->DisplayHeight = 720;
+    mode->IsWidescreen = 1;
+    mode->IsHighDefinition = 1;
+    mode->RefreshRate = 0x42700000; // 60.0f
+    mode->VideoStandard = 1;        // NTSC
+    mode->Unknown4A = 0x4A;
+    mode->Unknown01 = 0x01;
+}
+
+// u32 XamUserCheckPrivilege(u32 userIndex, u32 privilege, u32* result)
+GUEST_IMPORT(XamUserCheckPrivilege)
+{
+    if (ctx.r5.u32)
+        Store<uint32_t>(ctx.r5.u32, 0);
+    ctx.r3.u64 = 0x525; // ERROR_NO_SUCH_USER: nobody is signed in
+}
+
+// void RtlInitAnsiString(ANSI_STRING* dest, const char* source)
+GUEST_IMPORT(RtlInitAnsiString)
+{
+    const uint32_t dest = ctx.r3.u32;
+    const uint32_t source = ctx.r4.u32;
+    const uint16_t length = source ? uint16_t(std::strlen(ToHost<const char>(source))) : 0;
+    Store<uint16_t>(dest + 0, length);
+    Store<uint16_t>(dest + 2, source ? uint16_t(length + 1) : 0);
+    Store<uint32_t>(dest + 4, source);
+}
+
+// void RtlInitUnicodeString(UNICODE_STRING* dest, const wchar16* source /* big-endian */)
+GUEST_IMPORT(RtlInitUnicodeString)
+{
+    const uint32_t dest = ctx.r3.u32;
+    const uint32_t source = ctx.r4.u32;
+    uint16_t chars = 0;
+    if (source)
+        while (Load<uint16_t>(source + chars * 2) != 0)
+            ++chars;
+    Store<uint16_t>(dest + 0, uint16_t(chars * 2));
+    Store<uint16_t>(dest + 2, source ? uint16_t(chars * 2 + 2) : 0);
+    Store<uint32_t>(dest + 4, source);
+}
+
+// void RtlFillMemoryUlong(void* dest, u32 length, u32 pattern): fill with a big-endian dword.
+GUEST_IMPORT(RtlFillMemoryUlong)
+{
+    const uint32_t dest = ctx.r3.u32;
+    const uint32_t length = ctx.r4.u32 & ~3u;
+    for (uint32_t i = 0; i < length; i += 4)
+        Store<uint32_t>(dest + i, ctx.r5.u32);
+}
