@@ -1,6 +1,7 @@
 // Bring-up diagnostics.
 //
 //   TTT2_TRACE=1        log every kernel/XAM import call (thread, name, r3-r6, return address)
+//   TTT2_TRACE_RANGE=<lo>-<hi>  the same, only for calls made from guest code in [lo, hi) (hex)
 //   TTT2_WATCHDOG=<s>   if no import is called for <s> seconds (default 5), print each guest
 //                       thread's last import and, on Windows, the recompiled functions it is
 //                       executing right now (symbolised from ttt2.pdb). 0 disables it.
@@ -83,7 +84,14 @@ namespace guest
         t_info->lastLr.store(lr, std::memory_order_relaxed);
         t_info->calls.fetch_add(1, std::memory_order_relaxed);
         const uint32_t tid = CurrentThreadId();
-        if (g_trace)
+        // TTT2_TRACE_RANGE=<lo>-<hi> (hex): trace only imports called from that code range.
+        static const auto range = [] {
+            std::pair<uint64_t, uint64_t> r{ 0, 0 };
+            if (const char* v = std::getenv("TTT2_TRACE_RANGE"))
+                std::sscanf(v, "%llx-%llx", (unsigned long long*)&r.first, (unsigned long long*)&r.second);
+            return r;
+        }();
+        if (g_trace || (range.second && lr >= range.first && lr < range.second))
         {
             std::fprintf(stderr, "[trace] T%u %s(%08X, %08X, %08X, %08X) lr=%08llX\n", tid, name,
                 ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, (unsigned long long)lr);

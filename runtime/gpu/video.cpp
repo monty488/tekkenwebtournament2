@@ -51,6 +51,17 @@ namespace gpu
     static std::atomic<uint32_t> g_rptrWriteback{ 0 }; // guest address, 0 = disabled
     static uint32_t g_rptr = 0;                         // command processor thread only
 
+    // ---- Stall diagnostics: TTT2_GPU_STALL=1 -------------------------------------
+    // Every 2 s logs D3D's fences (device = interrupt callback data; dev+11024 -> GPU-written
+    // fence, dev+11036 = last issued, dev+11088 = D3D's ring write pointer). If the fence stops
+    // short of the issued one for 3 s, dumps device state and the last 512 PM4 packets.
+    static const bool g_stallLog = [] { const char* v = std::getenv("TTT2_GPU_STALL"); return v && *v == '1'; }();
+    struct TraceEntry { uint32_t pos, header, d0, d1, d2, depth; };
+    static TraceEntry g_trace[512]; // CP thread only
+    static uint32_t g_traceNext = 0;
+    static uint32_t g_fenceAddr = 0;
+    static uint32_t g_fenceLastValue = 0;
+
     uint64_t PresentedFrames() { return g_frames.load(); }
 
     static uint32_t PhysicalToGuest(uint32_t physical)
@@ -82,6 +93,8 @@ namespace gpu
     static void GpuWrite(uint32_t address, uint32_t value)
     {
         const uint32_t target = PhysicalToGuest(address & ~3u);
+        if (g_stallLog && target == g_fenceAddr)
+            g_fenceLastValue = value;
         switch (address & 3)
         {
         case 0: *guest::ToHost<uint32_t>(target) = value; break;                          // no swap: host order
@@ -91,12 +104,16 @@ namespace gpu
         }
     }
 
-    static void DispatchInterrupt(const guest::GuestEnv& env, uint32_t source)
+    // Runs the interrupt callback as if on hardware thread `cpu`: D3D's handler reads
+    // PCR->CurrentCpu to pick which CPU's interrupt bit to acknowledge and which per-CPU
+    // queue (and worker thread) a command-stream callback goes to.
+    static void DispatchInterrupt(const guest::GuestEnv& env, uint32_t source, uint8_t cpu)
     {
         const uint32_t callback = g_interruptCallback.load();
         if (!callback)
             return;
         std::lock_guard lock(g_interruptMutex);
+        *guest::ToHost<uint8_t>(env.pcr + 0x10C) = cpu; // PCR->CurrentCpu
         guest::CallGuest(env, callback, { source, g_interruptData.load() });
     }
 
@@ -389,6 +406,8 @@ namespace gpu
     static uint32_t ExecutePacket(const guest::GuestEnv& env, const Stream& s, uint32_t p, int depth)
     {
         const uint32_t header = s.Read(p);
+        if (g_stallLog)
+            g_trace[g_traceNext++ % 512] = { s.ring ? p : (s.base + p * 4), header, s.Read(p + 1), s.Read(p + 2), s.Read(p + 3), uint32_t(depth) };
         switch (header >> 30)
         {
         case 0: // type 0: write `count` registers starting at `base`
@@ -530,9 +549,20 @@ namespace gpu
             break;
         }
 
-        case PM4_INTERRUPT:
-            DispatchInterrupt(env, 1);
+        case PM4_INTERRUPT: // { cpu mask }: interrupt each selected hardware thread (as Xenia)
+        {
+            const uint32_t cpuMask = data(0);
+            static uint64_t masksSeen = 0;
+            if (g_stallLog && !(masksSeen & (1ull << (cpuMask & 63))))
+            {
+                masksSeen |= 1ull << (cpuMask & 63);
+                std::fprintf(stderr, "[gpu] interrupt cpu mask %02X (swap %llu)\n", cpuMask, (unsigned long long)g_swapCount);
+            }
+            for (uint8_t cpu = 0; cpu < 6; cpu++)
+                if (cpuMask & (1u << cpu))
+                    DispatchInterrupt(env, 1, cpu);
             break;
+        }
 
         case PM4_WAIT_REG_MEM:
             // Waits on values the CPU or this processor produce; everything here completes
@@ -563,6 +593,59 @@ namespace gpu
         }
     }
 
+    static void CheckStall()
+    {
+        const uint32_t dev = g_interruptData.load();
+        if (!dev)
+            return;
+        g_fenceAddr = guest::Load<uint32_t>(dev + 11024);
+        static auto since = std::chrono::steady_clock::now();
+        static uint32_t lastDone = 0;
+        static bool reported = false;
+        const uint32_t done = g_fenceAddr ? guest::Load<uint32_t>(g_fenceAddr) : 0;
+        const uint32_t issued = guest::Load<uint32_t>(dev + 11036);
+        const auto now = std::chrono::steady_clock::now();
+        static auto lastPrint = now;
+        if (now - lastPrint > std::chrono::seconds(2))
+        {
+            lastPrint = now;
+            std::fprintf(stderr, "[gpu] fences: swap %llu done=%08X issued=%08X rptr=%u wptr=%u soft=%u 13600=%08X\n",
+                (unsigned long long)g_swapCount, done, issued, g_rptr, ReadRegister(CP_RB_WPTR), guest::Load<uint32_t>(dev + 11088),
+                guest::Load<uint32_t>(dev + 13600));
+        }
+        if (done != lastDone || done == issued)
+        {
+            lastDone = done;
+            since = now;
+            reported = false;
+            return;
+        }
+        if (reported || now - since < std::chrono::seconds(3))
+            return;
+        reported = true;
+        std::fprintf(stderr, "[gpu] STALL: swap %llu fence %08X done=%08X issued=%08X lastGpuWrite=%08X rptr=%u wptr=%u softwptr=%u\n",
+            (unsigned long long)g_swapCount, g_fenceAddr, done, issued, g_fenceLastValue, g_rptr, ReadRegister(CP_RB_WPTR),
+            guest::Load<uint32_t>(dev + 11088));
+        std::fprintf(stderr, "[gpu]   dev+11024..: %08X %08X %08X %08X  11068: %08X %08X  13600: %08X %08X\n",
+            guest::Load<uint32_t>(g_fenceAddr + 4), guest::Load<uint32_t>(dev + 11028), guest::Load<uint32_t>(dev + 11032),
+            guest::Load<uint32_t>(dev + 11040), guest::Load<uint32_t>(dev + 11068), guest::Load<uint32_t>(dev + 11072),
+            guest::Load<uint32_t>(dev + 13600), guest::Load<uint32_t>(dev + 13604));
+        std::fprintf(stderr, "[gpu]   15300..15340:");
+        for (uint32_t o = 15300; o <= 15340; o += 4)
+            std::fprintf(stderr, " %08X", guest::Load<uint32_t>(dev + o));
+        const uint32_t blk = guest::Load<uint32_t>(dev + 11028);
+        std::fprintf(stderr, "\n[gpu]   intr block %08X:", blk);
+        for (uint32_t o = 0; o < 32; o += 4)
+            std::fprintf(stderr, " %08X", guest::Load<uint32_t>(blk + o));
+        std::fprintf(stderr, "\n[gpu]   last packets:\n");
+        for (uint32_t i = 0; i < 512; i++)
+        {
+            const TraceEntry& e = g_trace[(g_traceNext + i) % 512];
+            if (e.header)
+                std::fprintf(stderr, "[gpu]     %u %08X: %08X | %08X %08X %08X\n", e.depth, e.pos, e.header, e.d0, e.d1, e.d2);
+        }
+    }
+
     static void CommandProcessorThread()
     {
         guest::GuestEnv env = guest::CreateGuestEnv(/*cpu*/ 2);
@@ -583,6 +666,8 @@ namespace gpu
                     continue;
                 }
             }
+            if (g_stallLog)
+                CheckStall();
             std::this_thread::sleep_for(std::chrono::microseconds(200));
         }
     }
@@ -598,7 +683,7 @@ namespace gpu
             std::this_thread::sleep_until(next);
             next += period;
             g_vblanks.fetch_add(1);
-            DispatchInterrupt(env, 0);
+            DispatchInterrupt(env, 0, 2);
         }
     }
 }
