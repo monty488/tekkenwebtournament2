@@ -9,8 +9,11 @@
 #include "input.h"
 #include "../kernel/guest.h"
 
+#include <chrono>
+#include <cstdlib>
 #include <atomic>
 #include <cstring>
+#include <deque>
 #include <mutex>
 
 #if defined(__EMSCRIPTEN__)
@@ -30,6 +33,23 @@ namespace hid
         int16_t lx = 0, ly = 0, rx = 0, ry = 0;
         bool connected = false;
     };
+
+    // Testing aid: TTT2_AUTOPRESS=start|a taps that button for 150 ms every 2 s on player 1.
+    static uint16_t AutoPressButtons()
+    {
+        static const uint16_t button = [] {
+            const char* v = std::getenv("TTT2_AUTOPRESS");
+            if (!v) return uint16_t(0);
+            if (std::strcmp(v, "start") == 0) return uint16_t(XAMINPUT_GAMEPAD_START);
+            if (std::strcmp(v, "a") == 0) return uint16_t(XAMINPUT_GAMEPAD_A);
+            return uint16_t(0);
+        }();
+        if (!button)
+            return 0;
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        return (ms % 2000) < 150 ? button : 0;
+    }
 
 #if defined(__EMSCRIPTEN__)
     // Keyboard state is written by callbacks on the browser main thread and read
@@ -128,19 +148,53 @@ namespace hid
 #elif defined(_WIN32)
     void Init() {}
 
+    // Same layout as the web build. Read only while a window of this process has focus.
+    static uint16_t KeyboardButtons()
+    {
+        DWORD focusPid = 0;
+        GetWindowThreadProcessId(GetForegroundWindow(), &focusPid);
+        if (focusPid != GetCurrentProcessId())
+            return 0;
+
+        struct Mapping { int key; uint16_t button; };
+        static constexpr Mapping kMap[] =
+        {
+            { 'W', XAMINPUT_GAMEPAD_DPAD_UP },  { 'S', XAMINPUT_GAMEPAD_DPAD_DOWN },
+            { 'A', XAMINPUT_GAMEPAD_DPAD_LEFT }, { 'D', XAMINPUT_GAMEPAD_DPAD_RIGHT },
+            { VK_UP, XAMINPUT_GAMEPAD_DPAD_UP }, { VK_DOWN, XAMINPUT_GAMEPAD_DPAD_DOWN },
+            { VK_LEFT, XAMINPUT_GAMEPAD_DPAD_LEFT }, { VK_RIGHT, XAMINPUT_GAMEPAD_DPAD_RIGHT },
+            { 'U', XAMINPUT_GAMEPAD_X }, { 'I', XAMINPUT_GAMEPAD_Y },
+            { 'J', XAMINPUT_GAMEPAD_A }, { 'K', XAMINPUT_GAMEPAD_B },
+            { 'O', XAMINPUT_GAMEPAD_RIGHT_SHOULDER }, { 'L', XAMINPUT_GAMEPAD_LEFT_SHOULDER },
+            { VK_RETURN, XAMINPUT_GAMEPAD_START }, { VK_BACK, XAMINPUT_GAMEPAD_BACK },
+        };
+        uint16_t buttons = 0;
+        for (const auto& m : kMap)
+            if (GetAsyncKeyState(m.key) & 0x8000)
+                buttons |= m.button;
+        return buttons;
+    }
+
     PadState Poll(uint32_t user)
     {
         PadState pad;
         XINPUT_STATE state{};
-        if (user >= XUSER_MAX_COUNT || XInputGetState(user, &state) != ERROR_SUCCESS)
-            return pad;
-        // XInput's button bits match the Xbox 360's.
-        pad.buttons = state.Gamepad.wButtons;
-        pad.leftTrigger = state.Gamepad.bLeftTrigger;
-        pad.rightTrigger = state.Gamepad.bRightTrigger;
-        pad.lx = state.Gamepad.sThumbLX; pad.ly = state.Gamepad.sThumbLY;
-        pad.rx = state.Gamepad.sThumbRX; pad.ry = state.Gamepad.sThumbRY;
-        pad.connected = true;
+        if (user < XUSER_MAX_COUNT && XInputGetState(user, &state) == ERROR_SUCCESS)
+        {
+            // XInput's button bits match the Xbox 360's.
+            pad.buttons = state.Gamepad.wButtons;
+            pad.leftTrigger = state.Gamepad.bLeftTrigger;
+            pad.rightTrigger = state.Gamepad.bRightTrigger;
+            pad.lx = state.Gamepad.sThumbLX; pad.ly = state.Gamepad.sThumbLY;
+            pad.rx = state.Gamepad.sThumbRX; pad.ry = state.Gamepad.sThumbRY;
+            pad.connected = true;
+        }
+        static const bool noKeyboard = [] { const char* v = std::getenv("TTT2_NO_KEYBOARD"); return v && *v == '1'; }();
+        if (user == 0 && !noKeyboard)
+        {
+            pad.buttons |= KeyboardButtons() | AutoPressButtons();
+            pad.connected = true; // the keyboard always counts as player 1
+        }
         return pad;
     }
 #else
@@ -187,6 +241,119 @@ GUEST_IMPORT(XamInputGetCapabilities)
     *ToHost<uint8_t>(caps + 0) = 1; // XINPUT_DEVTYPE_GAMEPAD
     *ToHost<uint8_t>(caps + 1) = 1; // XINPUT_DEVSUBTYPE_GAMEPAD
     ctx.r3.u64 = ERROR_SUCCESS;
+}
+
+// ---- Keystrokes ----------------------------------------------------------------
+// XamInputGetKeystrokeEx reports button transitions as virtual-key events. They are
+// derived here by diffing successive polls per user.
+
+namespace hid
+{
+    struct Keystroke
+    {
+        uint16_t virtualKey;
+        uint16_t flags; // 1 = key down, 2 = key up
+    };
+
+    static std::mutex g_keyMutex;
+    static uint16_t g_lastButtons[4];
+    static std::deque<Keystroke> g_keys[4];
+
+    static uint16_t VirtualKeyFor(uint16_t button)
+    {
+        switch (button)
+        {
+        case XAMINPUT_GAMEPAD_A: return 0x5800;               // VK_PAD_A
+        case XAMINPUT_GAMEPAD_B: return 0x5801;
+        case XAMINPUT_GAMEPAD_X: return 0x5802;
+        case XAMINPUT_GAMEPAD_Y: return 0x5803;
+        case XAMINPUT_GAMEPAD_RIGHT_SHOULDER: return 0x5804;
+        case XAMINPUT_GAMEPAD_LEFT_SHOULDER: return 0x5805;
+        case XAMINPUT_GAMEPAD_DPAD_UP: return 0x5810;
+        case XAMINPUT_GAMEPAD_DPAD_DOWN: return 0x5811;
+        case XAMINPUT_GAMEPAD_DPAD_LEFT: return 0x5812;
+        case XAMINPUT_GAMEPAD_DPAD_RIGHT: return 0x5813;
+        case XAMINPUT_GAMEPAD_START: return 0x5814;
+        case XAMINPUT_GAMEPAD_BACK: return 0x5815;
+        case XAMINPUT_GAMEPAD_LEFT_THUMB: return 0x5816;
+        case XAMINPUT_GAMEPAD_RIGHT_THUMB: return 0x5817;
+        default: return 0;
+        }
+    }
+
+    // Returns the next keystroke for `user`, polling the device first.
+    static bool NextKeystroke(uint32_t user, Keystroke& out, bool& connected)
+    {
+        const PadState pad = Poll(user);
+        connected = pad.connected;
+        std::lock_guard lock(g_keyMutex);
+        const uint16_t changed = uint16_t(pad.buttons ^ g_lastButtons[user]);
+        for (uint16_t bit = 1; bit; bit = uint16_t(bit << 1))
+        {
+            if ((changed & bit) && VirtualKeyFor(bit))
+                g_keys[user].push_back({ VirtualKeyFor(bit), uint16_t((pad.buttons & bit) ? 1 : 2) });
+        }
+        g_lastButtons[user] = pad.buttons;
+        if (g_keys[user].empty())
+            return false;
+        out = g_keys[user].front();
+        g_keys[user].pop_front();
+        return true;
+    }
+}
+
+// u32 XamInputGetKeystrokeEx(u32* userIndex /* in: 0-3 or 0xFF = any; out: user */, u32 flags,
+//                            XINPUT_KEYSTROKE* keystroke)
+GUEST_IMPORT(XamInputGetKeystrokeEx)
+{
+    constexpr uint32_t ERROR_EMPTY_ = 0x10D2;
+    const uint32_t pUser = ctx.r3.u32;
+    const uint32_t requested = pUser ? Load<uint32_t>(pUser) : 0xFF;
+    const uint32_t keystroke = ctx.r5.u32;
+
+    bool anyConnected = false;
+    for (uint32_t user = 0; user < 4; user++)
+    {
+        if (requested != 0xFF && requested != user)
+            continue;
+        hid::Keystroke key;
+        bool connected = false;
+        if (hid::NextKeystroke(user, key, connected))
+        {
+            Store<uint16_t>(keystroke + 0, key.virtualKey);
+            Store<uint16_t>(keystroke + 2, 0);          // Unicode
+            Store<uint16_t>(keystroke + 4, key.flags);
+            *ToHost<uint8_t>(keystroke + 6) = uint8_t(user);
+            *ToHost<uint8_t>(keystroke + 7) = 0;        // HidCode
+            if (pUser)
+                Store<uint32_t>(pUser, user);
+            ctx.r3.u64 = ERROR_SUCCESS;
+            return;
+        }
+        anyConnected = anyConnected || connected;
+    }
+    ctx.r3.u64 = anyConnected ? ERROR_EMPTY_ : ERROR_DEVICE_NOT_CONNECTED;
+}
+
+// u32 XamInputGetKeystroke(u32 userIndex, u32 flags, XINPUT_KEYSTROKE* keystroke)
+GUEST_IMPORT(XamInputGetKeystroke)
+{
+    // Same as the Ex variant with a by-value user index.
+    constexpr uint32_t ERROR_EMPTY_ = 0x10D2;
+    hid::Keystroke key;
+    bool connected = false;
+    const uint32_t user = ctx.r3.u32 == 0xFF ? 0 : ctx.r3.u32;
+    if (user < 4 && hid::NextKeystroke(user, key, connected))
+    {
+        Store<uint16_t>(ctx.r5.u32 + 0, key.virtualKey);
+        Store<uint16_t>(ctx.r5.u32 + 2, 0);
+        Store<uint16_t>(ctx.r5.u32 + 4, key.flags);
+        *ToHost<uint8_t>(ctx.r5.u32 + 6) = uint8_t(user);
+        *ToHost<uint8_t>(ctx.r5.u32 + 7) = 0;
+        ctx.r3.u64 = ERROR_SUCCESS;
+        return;
+    }
+    ctx.r3.u64 = connected ? ERROR_EMPTY_ : ERROR_DEVICE_NOT_CONNECTED;
 }
 
 // u32 XamInputSetState(u32 userIndex, u32 flags, XAMINPUT_VIBRATION* vibration)

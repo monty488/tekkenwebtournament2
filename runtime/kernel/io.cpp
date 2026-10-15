@@ -3,9 +3,12 @@
 
 #include "guest.h"
 #include "objects.h"
+#include "sync.h"
 #include "../vfs/vfs.h"
 
 #include <cctype>
+#include <cstdlib>
+#include <filesystem>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -34,6 +37,7 @@ namespace guest
     struct GuestFile : KernelObject
     {
         std::FILE* file = nullptr;
+        bool directory = false;
         uint64_t size = 0;
         std::string path;
 
@@ -66,24 +70,47 @@ namespace guest
 
     // Shared by NtCreateFile/NtOpenFile. Only read access is supported: the disc is read-only,
     // and save data is expected to go through XContent (not implemented yet).
+    static const bool g_fileLog = [] { const char* v = std::getenv("TTT2_FILE_LOG"); return v && *v == '1'; }();
+
     static uint32_t OpenFile(uint32_t pHandle, uint32_t objectAttributes, uint32_t ioStatusBlock)
     {
-        const std::string guestPath = ReadObjectName(objectAttributes);
-        const auto hostPath = vfs::Resolve(guestPath);
+        std::string guestPath = ReadObjectName(objectAttributes);
 
+        // Paths may be relative to an open directory handle (OBJECT_ATTRIBUTES.RootDirectory).
+        if (auto* attributes = ToHost<XOBJECT_ATTRIBUTES>(objectAttributes))
+        {
+            if (const uint32_t root = attributes->RootDirectory)
+            {
+                if (auto dir = Handles().Get<GuestFile>(root))
+                    guestPath = dir->path + (dir->path.empty() || dir->path.back() == '\\' ? "" : "\\") + guestPath;
+            }
+        }
+
+        const auto hostPath = vfs::Resolve(guestPath);
         auto file = std::make_shared<GuestFile>();
         file->path = guestPath;
-        file->file = std::fopen(hostPath.string().c_str(), "rb");
-        if (!file->file)
-        {
-            TTT2_LOG("open failed: %s", guestPath.c_str());
-            SetIoStatus(ioStatusBlock, STATUS_OBJECT_NAME_NOT_FOUND, 0);
-            return STATUS_OBJECT_NAME_NOT_FOUND;
-        }
-        std::fseek(file->file, 0, SEEK_END);
-        file->size = Tell64(file->file);
-        Seek64(file->file, 0);
 
+        std::error_code ec;
+        if (std::filesystem::is_directory(hostPath, ec))
+        {
+            file->directory = true;
+        }
+        else
+        {
+            file->file = std::fopen(hostPath.string().c_str(), "rb");
+            if (!file->file)
+            {
+                TTT2_LOG("open failed: %s", guestPath.c_str());
+                SetIoStatus(ioStatusBlock, STATUS_OBJECT_NAME_NOT_FOUND, 0);
+                return STATUS_OBJECT_NAME_NOT_FOUND;
+            }
+            std::fseek(file->file, 0, SEEK_END);
+            file->size = Tell64(file->file);
+            Seek64(file->file, 0);
+        }
+
+        if (g_fileLog)
+            TTT2_LOG("open %s %s (%llu bytes)", file->directory ? "dir " : "file", guestPath.c_str(), (unsigned long long)file->size);
         Store<uint32_t>(pHandle, Handles().Insert(file));
         SetIoStatus(ioStatusBlock, STATUS_SUCCESS, 1 /* FILE_OPENED */);
         return STATUS_SUCCESS;
@@ -120,6 +147,11 @@ GUEST_IMPORT(NtReadFile)
         ctx.r3.u64 = STATUS_INVALID_HANDLE;
         return;
     }
+    if (!file->file)
+    {
+        ctx.r3.u64 = STATUS_INVALID_PARAMETER; // a directory
+        return;
+    }
 
     if (pOffset)
     {
@@ -130,10 +162,21 @@ GUEST_IMPORT(NtReadFile)
     }
 
     const size_t read = std::fread(ToHost(buffer), 1, length, file->file);
+    if (g_fileLog)
+        TTT2_LOG("read %s: %u bytes at %llu -> %zu", file->path.c_str(), length,
+            (unsigned long long)(Tell64(file->file) - read), read);
     const uint32_t status = (read == 0 && length != 0) ? STATUS_END_OF_FILE : STATUS_SUCCESS;
     SetIoStatus(ioStatusBlock, status, uint32_t(read));
 
-    // TODO: signal ctx.r4 (event) / queue the APC once events are implemented.
+    // As the NT I/O manager does, signal the caller's event on completion even though the
+    // read finished synchronously: overlapped callers may wait on it later.
+    if (const uint32_t event = ctx.r4.u32)
+    {
+        if (auto e = std::dynamic_pointer_cast<Event>(WaitableFromHandle(event)))
+            SignalObject(e);
+    }
+    if (ctx.r5.u32)
+        TTT2_LOG("NtReadFile: APC completion routine %08X not delivered", ctx.r5.u32);
     ctx.r3.u64 = status;
 }
 
@@ -169,15 +212,22 @@ GUEST_IMPORT(NtQueryInformationFile)
         return;
 
     case FilePositionInformation:
-        Store<uint64_t>(info, Tell64(file->file));
+        Store<uint64_t>(info, file->file ? Tell64(file->file) : 0);
         SetIoStatus(ioStatusBlock, STATUS_SUCCESS, 8);
         ctx.r3.u64 = STATUS_SUCCESS;
         return;
 
     case FileSectorInformation:
     {
-        // Starting DVD sector, used by titles to order reads. There is no disc layout here;
-        // give each file a distinct, stable sector derived from its path.
+        // Starting DVD sector. TTT2's loader uses it to read archives by raw sector through
+        // the disc device when it is available; there is no disc image here, so report the
+        // query as unsupported and the loader falls back to ordinary file reads.
+        static const bool fakeSectors = [] { const char* v = std::getenv("TTT2_FAKE_SECTORS"); return v && *v == '1'; }();
+        if (!fakeSectors)
+        {
+            ctx.r3.u64 = 0xC0000003; // STATUS_INVALID_INFO_CLASS
+            return;
+        }
         uint32_t hash = 2166136261u;
         for (char c : file->path)
             hash = (hash ^ uint8_t(std::tolower((unsigned char)c))) * 16777619u;
@@ -216,7 +266,7 @@ GUEST_IMPORT(NtSetInformationFile)
         return;
     }
 
-    if (ctx.r7.u32 == FilePositionInformation)
+    if (ctx.r7.u32 == FilePositionInformation && file->file)
     {
         Seek64(file->file, Load<uint64_t>(ctx.r5.u32));
         SetIoStatus(ctx.r4.u32, STATUS_SUCCESS, 0);

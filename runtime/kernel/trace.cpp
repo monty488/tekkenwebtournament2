@@ -186,19 +186,29 @@ namespace guest
         // of activity (the watchdog never fires while any thread keeps calling the kernel).
         if (const char* at = std::getenv("TTT2_SAMPLE_AT"))
         {
-            const int ms = std::atoi(at);
-            std::thread([ms] {
+            // TTT2_SAMPLE_AT=<ms>[,<count>[,<interval ms>[,<thread id>]]]
+            int ms = 0, count = 1, interval = 500;
+            unsigned onlyThread = 0;
+            std::sscanf(at, "%d,%d,%d,%u", &ms, &count, &interval, &onlyThread);
+            std::thread([ms, count, interval, onlyThread] {
                 std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-                std::lock_guard lock(g_mutex);
-                std::fprintf(stderr, "[sample] at %d ms:\n", ms);
-                for (auto& [tid, info] : g_threads)
+                for (int sample = 0; sample < count; sample++)
                 {
-                    std::fprintf(stderr, "    T%u: %llu calls, last %s (lr=%08llX)\n", tid,
-                        (unsigned long long)info->calls.load(), info->lastImport.load(), (unsigned long long)info->lastLr.load());
+                    if (sample)
+                        std::this_thread::sleep_for(std::chrono::milliseconds(interval));
+                    std::lock_guard lock(g_mutex);
+                    std::fprintf(stderr, "[sample] at %d ms:\n", ms + sample * interval);
+                    for (auto& [tid, info] : g_threads)
+                    {
+                        if (onlyThread && tid != onlyThread)
+                            continue;
+                        std::fprintf(stderr, "    T%u: %llu calls, last %s (lr=%08llX)\n", tid,
+                            (unsigned long long)info->calls.load(), info->lastImport.load(), (unsigned long long)info->lastLr.load());
 #ifdef _WIN32
-                    if (info->handle)
-                        DumpThreadStack(info->handle);
+                        if (info->handle)
+                            DumpThreadStack(info->handle);
 #endif
+                    }
                 }
             }).detach();
         }

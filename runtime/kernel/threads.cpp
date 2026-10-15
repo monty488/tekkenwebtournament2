@@ -227,8 +227,11 @@ GUEST_IMPORT(NtSuspendThread)
         previous = thread->suspendCount++;
         if (ctx.r4.u32)
             Store<uint32_t>(ctx.r4.u32, uint32_t(previous));
-        if (thread->id == CurrentThreadId())
+        static const bool noSuspend = [] { const char* v = std::getenv("TTT2_NO_SELF_SUSPEND"); return v && *v == '1'; }();
+        if (thread->id == CurrentThreadId() && !noSuspend)
             WaitCondition().wait(lock, [&] { return thread->suspendCount == 0; });
+        else if (noSuspend)
+            --thread->suspendCount;
     }
     ctx.r3.u64 = STATUS_SUCCESS;
 }

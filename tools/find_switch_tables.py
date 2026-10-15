@@ -141,9 +141,31 @@ def analyse(addr, word, base_addr):
                 start, idx_reg, count = a + 4, rd, 256
                 break
 
-    if start is None or count > 4096:
-        return None
+    if start is not None and count <= 4096:
+        return emulate(addr, word, start, idx_reg, aliases, count)
 
+    if start is None:
+        # No bounds check and no byte load: the caller guarantees the range, and the index
+        # may be biased first (e.g. `addi rI,rI,-24`). Try (start, index register) pairs,
+        # nearest the bctr first, and keep the first that dispatches through a table. The
+        # caller truncates the table at the enclosing function.
+        if not any((word(addr - 4 * k) >> 26) == 31 and ((word(addr - 4 * k) >> 1) & 0x3FF) in (23, 87, 279)
+                   for k in range(2, 12)):
+            return None
+        for k in range(2, WINDOW):
+            s = addr - 4 * k
+            i = word(s)
+            if (i >> 26) in (16, 18, 19) or i == BCTR:
+                break
+            for reg in range(32):
+                res = emulate(addr, word, s + 4, reg, set(), 256)
+                if res:
+                    return res
+    return None
+
+
+def emulate(addr, word, start, idx_reg, aliases, count):
+    """Symbolically executes start..bctr with idx_reg holding the switch index."""
     regs = {r: ("idx", 0) for r in aliases | {idx_reg}}
     for a in range(start, addr - 4, 4):
         i = word(a)
@@ -470,8 +492,8 @@ def main():
                 lo, hi = (pdata[k][0], pdata[k][0] + pdata[k][1]) if k >= 0 and a < pdata[k][0] + pdata[k][1] else (a - 0x8000, a + 0x8000)
                 labels = []
                 for label in res[1]:
-                    if not (lo <= label < hi):
-                        break
+                    if not (lo <= label < hi) or label & 3:
+                        break  # past the real table: out of the function or not an instruction
                     labels.append(label)
                 res = (res[0], labels) if labels else None
             if res:
