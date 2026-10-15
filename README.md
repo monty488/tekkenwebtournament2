@@ -77,7 +77,13 @@ The native build has switches for chasing startup problems:
 | --- | --- |
 | `TTT2_TRACE=1` | Logs every kernel/XAM call: thread, name, `r3`–`r6`, return address |
 | `TTT2_WATCHDOG=<seconds>` | If no kernel call happens for that long (default 5), prints each guest thread's last call and the recompiled functions it is running (`0` disables) |
-| `TTT2_SAMPLE_AT=<ms>` | Dumps every guest thread's stack once at that time, even while some threads keep calling the kernel |
+| `TTT2_SAMPLE_AT=<ms>[,<count>,<interval ms>,<thread>]` | Dumps guest thread stacks at that time (optionally `count` times, `interval` apart, one thread only), even while some threads keep calling the kernel |
+| `TTT2_GPU_LOG=1` | Logs swaps, packet counts and the first draws (with a full state dump of the first) |
+| `TTT2_GPU_LOG_FRAME=<n>` | Logs every draw of swap `n`, with its textures |
+| `TTT2_GPU_STATS=1` | Every 10 swaps, prints software-renderer time per stage (vertex, raster, texture decode, resolve) |
+| `TTT2_DUMP_FRAMES=<n,...>` | Writes the presented image of those swaps to `frame_<n>.bmp` in the working directory |
+| `TTT2_SOFT_GPU=0` | Skips rendering (draws are only tracked); frames are then black but run at full speed |
+| `TTT2_FILE_LOG=1` | Logs every file open and read |
 
 Bad indirect calls (a function pointer or `bctr` to an address that isn't a
 recompiled function) and access violations print a symbolised host backtrace

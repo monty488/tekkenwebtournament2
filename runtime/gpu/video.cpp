@@ -7,16 +7,24 @@
 //   * an interrupt callback (VdSetGraphicsInterruptCallback) called on every vblank
 //     (source 0) and when the command stream asks for an interrupt (source 1).
 //
-// Rendering is not implemented yet. The command processor here only executes what the
-// CPU side synchronises on (memory writes, fence events, conditional writes, interrupts,
-// indirect buffers) and skips everything else, so frames "complete" immediately. That is
-// enough for the game's frame loop to run and reach VdSwap; draw packets are where the
-// WebGPU backend will hook in (docs/ARCHITECTURE.md, "Graphics").
+// The command processor executes what the CPU side synchronises on (memory writes, fence
+// events, conditional writes, interrupts, indirect buffers), tracks register/constant/
+// shader state, and hands draw packets to the software renderer (soft_gpu.cpp), which
+// rasterises into an emulated EDRAM and resolves into memory. VdSwap then presents the
+// front buffer. The WebGPU backend will replace the software renderer
+// (docs/ARCHITECTURE.md, "Graphics").
 
 #include "video.h"
+#include "presenter.h"
+#include "soft_gpu.h"
+#include "texture.h"
 #include "../kernel/guest.h"
 #include "../kernel/threads.h"
 
+#include <array>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -107,7 +115,223 @@ namespace gpu
         PM4_INTERRUPT = 0x54,
         PM4_EVENT_WRITE_SHD = 0x58,
         PM4_EVENT_WRITE_EXT = 0x59,
+        PM4_DRAW_INDX = 0x22,
+        PM4_DRAW_INDX_2 = 0x36,
+        PM4_IM_LOAD = 0x27,
+        PM4_IM_LOAD_IMMEDIATE = 0x2B,
+        PM4_SET_CONSTANT = 0x2D,
+        PM4_LOAD_ALU_CONSTANT = 0x2F,
+        PM4_SET_CONSTANT2 = 0x55,
+        PM4_SET_SHADER_CONSTANTS = 0x56,
+        PM4_XE_SWAP = 0x64, // private: written by our VdSwap (as in Xenia)
     };
+
+    // ---- State the renderer will consume -------------------------------------
+
+    // Shader microcode most recently loaded for each stage (IM_LOAD*): guest address
+    // (0 for immediate loads, which are copied into `immediate`) and size in dwords.
+    struct ShaderSlot
+    {
+        uint32_t address = 0;
+        uint32_t dwords = 0;
+        std::vector<uint32_t> immediate;
+    };
+    static ShaderSlot g_shaders[2]; // 0 = vertex, 1 = pixel (CP thread only)
+
+    // Register bases for SET_CONSTANT's type field.
+    static uint32_t ConstantBase(uint32_t type)
+    {
+        switch (type)
+        {
+        case 0: return 0x4000; // ALU constants (float4)
+        case 1: return 0x4800; // fetch constants (textures / vertex buffers)
+        case 2: return 0x4900; // boolean constants
+        case 3: return 0x4908; // loop constants
+        default: return 0x2000; // context registers
+        }
+    }
+
+    // ---- Diagnostics: TTT2_GPU_LOG=1 ---------------------------------------------
+
+    static const bool g_gpuLog = [] { const char* v = std::getenv("TTT2_GPU_LOG"); return v && *v == '1'; }();
+    // TTT2_GPU_LOG_FRAME=N: log every draw (with textures) of swap N.
+    static const uint64_t g_logFrame = [] { const char* v = std::getenv("TTT2_GPU_LOG_FRAME"); return v ? std::strtoull(v, nullptr, 10) : 0ull; }();
+    static uint64_t g_swapCount = 0;
+    static uint64_t g_opcodeCounts[128];
+    static uint64_t g_drawsThisFrame = 0;
+    static int g_drawsLogged = 0;
+
+    // TTT2_DUMP_FRAMES=a,b,...: write the presented image of those swaps to frame_<n>.bmp.
+    static bool ShouldDumpFrame(uint64_t swap)
+    {
+        static const char* list = std::getenv("TTT2_DUMP_FRAMES");
+        if (!list)
+            return false;
+        for (const char* p = list; *p;)
+        {
+            char* end;
+            const unsigned long long n = std::strtoull(p, &end, 10);
+            if (end == p)
+                break;
+            if (n == swap)
+                return true;
+            p = *end ? end + 1 : end;
+        }
+        return false;
+    }
+
+    static void DumpBmp(uint64_t swap, const uint32_t* bgra, uint32_t width, uint32_t height)
+    {
+        char name[64];
+        std::snprintf(name, sizeof(name), "frame_%llu.bmp", (unsigned long long)swap);
+        std::FILE* f = std::fopen(name, "wb");
+        if (!f)
+            return;
+        const uint32_t imageBytes = width * height * 4;
+        uint8_t header[54] = { 'B', 'M' };
+        auto put32 = [&](int at, uint32_t v) { for (int i = 0; i < 4; i++) header[at + i] = uint8_t(v >> (8 * i)); };
+        put32(2, 54 + imageBytes);
+        put32(10, 54);
+        put32(14, 40);
+        put32(18, width);
+        put32(22, uint32_t(-int32_t(height))); // top-down
+        header[26] = 1;
+        header[28] = 32;
+        put32(34, imageBytes);
+        std::fwrite(header, 1, sizeof(header), f);
+        std::fwrite(bgra, 4, size_t(width) * height, f);
+        std::fclose(f);
+        std::fprintf(stderr, "[gpu] wrote %s\n", name);
+    }
+
+    static void OnSwap(uint32_t frontBuffer, uint32_t width, uint32_t height, const std::array<uint32_t, 6>& fetch)
+    {
+        const uint64_t swaps = ++g_swapCount;
+        if (g_gpuLog && (swaps <= 3 || (swaps & (swaps - 1)) == 0))
+        {
+            std::fprintf(stderr, "[gpu] swap %llu: front buffer %08X %ux%u, fetch %08X %08X %08X %08X %08X %08X, %llu draws\n",
+                (unsigned long long)swaps, frontBuffer, width, height, fetch[0], fetch[1], fetch[2], fetch[3], fetch[4], fetch[5],
+                (unsigned long long)g_drawsThisFrame);
+            std::fprintf(stderr, "[gpu]   packets so far:");
+            for (uint32_t op = 0; op < 128; op++)
+                if (g_opcodeCounts[op])
+                    std::fprintf(stderr, " %02X:%llu", op, (unsigned long long)g_opcodeCounts[op]);
+            std::fprintf(stderr, "\n");
+        }
+        g_drawsThisFrame = 0;
+        SoftEndFrame();
+        if (g_gpuLog && (swaps <= 3 || (swaps & (swaps - 1)) == 0))
+            std::fprintf(stderr, "[gpu]   soft renderer: %llu pixels, %llu resolves so far\n",
+                (unsigned long long)SoftPixelsWritten(), (unsigned long long)SoftResolves());
+        static const bool softStats = [] { const char* v = std::getenv("TTT2_GPU_STATS"); return v && *v == '1'; }();
+        if (softStats && swaps % 10 == 0)
+            SoftPrintStats();
+
+        // Show the front buffer the game just swapped to.
+        const TextureInfo info = DecodeTextureFetch(fetch.data());
+        static std::vector<uint32_t> pixels;
+        if (info.width > 1 && info.width <= 4096 && info.height <= 4096 && ConvertToBgra(info, pixels))
+        {
+            for (uint32_t& p : pixels)
+                p |= 0xFF000000u; // the window shows colour only
+            Present(pixels.data(), info.width, info.height);
+            if (ShouldDumpFrame(swaps))
+                DumpBmp(swaps, pixels.data(), info.width, info.height);
+        }
+        else if (g_gpuLog && swaps <= 3)
+        {
+            std::fprintf(stderr, "[gpu] cannot present front buffer: format %u (%s) %ux%u\n", info.format,
+                FormatName(info.format), info.width, info.height);
+        }
+    }
+
+    // TTT2_SOFT_GPU=0 skips rendering (draws are only logged); the software renderer is
+    // the default until the WebGPU backend exists.
+    static const bool g_softGpu = [] { const char* v = std::getenv("TTT2_SOFT_GPU"); return !v || *v != '0'; }();
+
+    static ShaderCode StageCode(int stage, std::vector<uint32_t>& storage)
+    {
+        const ShaderSlot& slot = g_shaders[stage];
+        if (!slot.address)
+            return { slot.immediate.data(), uint32_t(slot.immediate.size()) };
+        storage.resize(slot.dwords);
+        for (uint32_t i = 0; i < slot.dwords; i++)
+            storage[i] = guest::Load<uint32_t>(slot.address + i * 4);
+        return { storage.data(), slot.dwords };
+    }
+
+    static void Draw(uint32_t initiator, uint32_t indexBase, uint32_t indexSize, std::vector<uint32_t> immediate)
+    {
+        if (!g_softGpu)
+            return;
+        static std::vector<uint32_t> vsStorage, psStorage;
+        DrawCall call;
+        call.primitive = initiator & 0x3F;
+        call.indexSource = (initiator >> 6) & 3;
+        call.index32 = (initiator >> 11) & 1;
+        call.indexCount = initiator >> 16;
+        call.indexBase = indexBase ? PhysicalToGuest(indexBase) : 0;
+        call.indexEndian = indexSize >> 30;
+        call.immediateIndices = std::move(immediate);
+        call.vertexShader = StageCode(0, vsStorage);
+        call.pixelShader = StageCode(1, psStorage);
+        SoftDraw(call);
+    }
+
+    static void LogDraw(uint32_t initiator, uint32_t indexBase, uint32_t indexBytes)
+    {
+        ++g_drawsThisFrame;
+        const bool frameLog = g_logFrame && g_swapCount + 1 == g_logFrame;
+        if (!frameLog && (!g_gpuLog || g_drawsLogged >= 24))
+            return;
+        if (!frameLog)
+            ++g_drawsLogged;
+        static constexpr const char* kSource[] = { "dma", "immediate", "auto", "?" };
+        std::fprintf(stderr,
+            "[gpu] draw prim=%u count=%u src=%s idx32=%u ib=%08X/%u | modectl=%08X surface=%08X color0=%08X depth=%08X | vs=%08X(%u) ps=%08X(%u)\n",
+            initiator & 0x3F, initiator >> 16, kSource[(initiator >> 6) & 3], (initiator >> 11) & 1, indexBase, indexBytes,
+            ReadRegister(0x2208), ReadRegister(0x2000), ReadRegister(0x2001), ReadRegister(0x2002),
+            g_shaders[0].address, g_shaders[0].dwords, g_shaders[1].address, g_shaders[1].dwords);
+        if (g_drawsLogged == 1)
+        {
+            // Full dump of the first draw: shaders, non-zero context registers, constants.
+            for (int stage = 0; stage < 2; stage++)
+            {
+                const ShaderSlot& sh = g_shaders[stage];
+                std::fprintf(stderr, "[gpu]   %s shader (%u dwords):", stage ? "pixel" : "vertex", sh.dwords);
+                for (uint32_t i = 0; i < sh.dwords; i++)
+                    std::fprintf(stderr, "%s%08X", i % 6 == 0 ? "\n[gpu]     " : " ",
+                        sh.address ? guest::Load<uint32_t>(sh.address + i * 4) : (i < sh.immediate.size() ? sh.immediate[i] : 0));
+                std::fprintf(stderr, "\n");
+            }
+            std::fprintf(stderr, "[gpu]   context registers:");
+            int n = 0;
+            for (uint32_t r = 0x2000; r < 0x2400; r++)
+                if (const uint32_t v = ReadRegister(r))
+                    std::fprintf(stderr, "%s%04X=%08X", n++ % 6 == 0 ? "\n[gpu]     " : "  ", r, v);
+            std::fprintf(stderr, "\n[gpu]   ALU constants (non-zero):");
+            n = 0;
+            for (uint32_t r = 0x4000; r < 0x4800; r++)
+                if (const uint32_t v = ReadRegister(r))
+                    std::fprintf(stderr, "%s c%u.%c=%08X", n++ % 6 == 0 ? "\n[gpu]    " : " ", (r - 0x4000) / 4, "xyzw"[r & 3], v);
+            std::fprintf(stderr, "\n[gpu]   fetch constants (non-zero):");
+            n = 0;
+            for (uint32_t r = 0x4800; r < 0x4900; r++)
+                if (const uint32_t v = ReadRegister(r))
+                    std::fprintf(stderr, "%s%04X=%08X", n++ % 6 == 0 ? "\n[gpu]     " : "  ", r, v);
+            std::fprintf(stderr, "\n");
+        }
+        for (uint32_t slot = 0; slot < 32; slot++)
+        {
+            const uint32_t d0 = ReadRegister(0x4800 + slot * 6);
+            const uint32_t d1 = ReadRegister(0x4800 + slot * 6 + 1);
+            const uint32_t d2 = ReadRegister(0x4800 + slot * 6 + 2);
+            if ((d0 & 3) == 2) // texture fetch constant
+                std::fprintf(stderr, "[gpu]     tex%-2u fmt=%2u base=%08X size=%ux%u pitch=%u tiled=%u\n", slot,
+                    d1 & 0x3F, d1 & ~0xFFFu, (d2 & 0x1FFF) + 1, ((d2 >> 13) & 0x1FFF) + 1, ((d0 >> 22) & 0x1FF) * 32,
+                    (d0 >> 31) & 1);
+        }
+    }
 
     struct Stream
     {
@@ -163,9 +387,83 @@ namespace gpu
         const uint32_t opcode = (header >> 8) & 0x7F;
         const uint32_t count = ((header >> 16) & 0x3FFF) + 1;
         auto data = [&](uint32_t i) { return s.Read(p + 1 + i); };
+        ++g_opcodeCounts[opcode];
 
         switch (opcode)
         {
+        case PM4_SET_CONSTANT: // { type << 16 | index, values... }
+        {
+            const uint32_t offsetType = data(0);
+            const uint32_t base = ConstantBase((offsetType >> 16) & 0xFF) + (offsetType & 0x7FF);
+            for (uint32_t i = 1; i < count; i++)
+                WriteRegister(base + i - 1, data(i));
+            break;
+        }
+
+        case PM4_SET_CONSTANT2: // { register index, values... }
+        case PM4_SET_SHADER_CONSTANTS:
+        {
+            const uint32_t base = data(0) & 0xFFFF;
+            for (uint32_t i = 1; i < count; i++)
+                WriteRegister(base + i - 1, data(i));
+            break;
+        }
+
+        case PM4_LOAD_ALU_CONSTANT: // { address, type << 16 | index, dwords }
+        {
+            const uint32_t source = PhysicalToGuest(data(0) & 0x3FFFFFFF);
+            const uint32_t offsetType = data(1);
+            const uint32_t base = ConstantBase((offsetType >> 16) & 0xFF) + (offsetType & 0x7FF);
+            const uint32_t dwords = data(2);
+            for (uint32_t i = 0; i < dwords; i++)
+                WriteRegister(base + i, guest::Load<uint32_t>(source + i * 4));
+            break;
+        }
+
+        case PM4_IM_LOAD: // { address | type, start << 16 | dwords }
+        {
+            ShaderSlot& slot = g_shaders[data(0) & 1];
+            slot.address = PhysicalToGuest(data(0) & ~3u);
+            slot.dwords = data(1) & 0xFFFF;
+            slot.immediate.clear();
+            break;
+        }
+
+        case PM4_IM_LOAD_IMMEDIATE: // { type, start << 16 | dwords, microcode... }
+        {
+            ShaderSlot& slot = g_shaders[data(0) & 1];
+            slot.address = 0;
+            slot.dwords = data(1) & 0xFFFF;
+            slot.immediate.resize(slot.dwords);
+            for (uint32_t i = 0; i < slot.dwords && i + 2 < count; i++)
+                slot.immediate[i] = data(2 + i);
+            break;
+        }
+
+        case PM4_DRAW_INDX: // { viz query, initiator, [index base, index size] }
+            LogDraw(data(1), count > 2 ? data(2) : 0, count > 3 ? data(3) : 0);
+            Draw(data(1), count > 2 ? data(2) : 0, count > 3 ? data(3) : 0, {});
+            break;
+
+        case PM4_DRAW_INDX_2: // { initiator, [immediate indices] }
+        {
+            LogDraw(data(0), 0, 0);
+            std::vector<uint32_t> immediate;
+            for (uint32_t i = 1; i < count; i++)
+                immediate.push_back(data(i));
+            Draw(data(0), 0, 0, std::move(immediate));
+            break;
+        }
+
+        case PM4_XE_SWAP:
+            OnSwap(data(1), data(2), data(3), [&] {
+                std::array<uint32_t, 6> fetch{};
+                for (uint32_t i = 0; i < 6; i++)
+                    fetch[i] = data(4 + i);
+                return fetch;
+            }());
+            break;
+
         case PM4_INDIRECT_BUFFER:
         case PM4_INDIRECT_BUFFER_PFD:
             if (depth < 4)
@@ -411,17 +709,27 @@ GUEST_IMPORT(VdInitializeScalerCommandBuffer)
     ctx.r3.u64 = count;
 }
 
-// void VdSwap(u32* buffer, u32 fetch, u32 unk2, u32 unk3, u32 unk4, u32 frontBuffer, ...)
-// The caller reserves 64 dwords of its command stream for the swap; fill them with a NOP
-// packet so the stream stays well formed.
+// void VdSwap(u32* buffer, u32* frontBufferFetch, u32 unk2, u32 unk3, u32 unk4,
+//             u32 frontBuffer, u32 format, u32 colorSpace, u32 width, u32 height)
+// The caller reserves 64 dwords of its command stream for the swap. Like Xenia, write a
+// private XE_SWAP packet there so the command processor sees the frame boundary at the
+// right point in the stream, with everything it needs to present the front buffer:
+//   { 'SWAP', frontBuffer (physical), width, height, fetch constant[6] }, then zeros.
 GUEST_IMPORT(VdSwap)
 {
     const uint32_t buffer = ctx.r3.u32;
     if (buffer)
     {
-        Store<uint32_t>(buffer, 0xC0000000u | ((63u - 1) << 16) | (PM4_NOP << 8));
+        Store<uint32_t>(buffer, 0xC0000000u | ((63u - 1) << 16) | (PM4_XE_SWAP << 8));
         for (uint32_t i = 1; i < 64; i++)
             Store<uint32_t>(buffer + i * 4, 0);
+        Store<uint32_t>(buffer + 4, 0x53574150); // 'SWAP'
+        Store<uint32_t>(buffer + 8, ctx.r8.u32 & 0x1FFFFFFF);
+        Store<uint32_t>(buffer + 12, Load<uint32_t>(ctx.r1.u32 + 0x54)); // width
+        Store<uint32_t>(buffer + 16, Load<uint32_t>(ctx.r1.u32 + 0x5C)); // height
+        if (ctx.r4.u32)
+            for (uint32_t i = 0; i < 6; i++)
+                Store<uint32_t>(buffer + 20 + i * 4, Load<uint32_t>(ctx.r4.u32 + i * 4));
     }
 
     const uint64_t frame = g_frames.fetch_add(1) + 1;

@@ -1,4 +1,4 @@
-﻿if (TTT2_HAVE_RECOMP)
+if (TTT2_HAVE_RECOMP)
     add_executable(ttt2
         main.cpp
         kernel/memory.cpp
@@ -14,6 +14,9 @@
         vfs/vfs.cpp
         hid/input.cpp
         gpu/video.cpp
+        gpu/texture.cpp
+        gpu/soft_gpu.cpp
+        gpu/presenter_win.cpp
         apu/audio.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../recomp/generated/import_stubs.cpp
     )

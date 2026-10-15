@@ -140,6 +140,15 @@ one likely to hit frame rate. Plan:
    the page (`-sOFFSCREENCANVAS_SUPPORT`). Otherwise, proxy presentation to the main
    thread.
 
+**Current state: a low-level software reference.** Before the D3D hooks exist, the
+command processor (`runtime/gpu/video.cpp`) executes the PM4 stream itself and hands
+each draw to `runtime/gpu/soft_gpu.cpp`. That renderer interprets the Xenos shader
+microcode (semantics follow XenosRecomp), rasterises into an emulated 10 MiB EDRAM
+and performs resolves into guest memory, so `VdSwap` can present the real front
+buffer. It is slow (row bands on all cores; tens of ms per frame) and incomplete,
+but it is exact enough to check the WebGPU backend against, frame by frame
+(`TTT2_DUMP_FRAMES`).
+
 ## 7. Audio
 
 The game's XAudio2 is statically linked. It mixes in software and hands 256-sample,

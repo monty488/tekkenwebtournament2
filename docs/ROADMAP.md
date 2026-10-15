@@ -43,12 +43,20 @@ Rough milestones, in order. Each depends on the previous one.
 - [ ] Content/save APIs (XContent*), profile/sign-in (currently: nobody signed in)
 
 ## M3: Pictures
-- [ ] Decode the draw/state PM4 packets the command processor currently skips
-      (`runtime/gpu/video.cpp`), or hook the game's D3D functions above them
+- [x] Decode draw/state PM4 packets: register, constant, fetch and shader state reach a
+      software reference renderer (`runtime/gpu/soft_gpu.cpp`): Xenos microcode
+      interpreter, triangle/rect/quad rasteriser with depth, blending and alpha test,
+      EDRAM model, resolves (tiled, endian-swapped) with clears. The loading screen
+      and the Bandai Namco splash render correctly in the native window
+- [ ] Software renderer speed: ~65 ms/frame on 16 threads (shader interpretation
+      dominates); points, lines, stencil, culling, MSAA resolve and several texture
+      formats (e.g. depth textures, format 23) are missing
+- [ ] The game stops submitting frames after a timing-dependent point (frame 8 to
+      ~600; happens with rendering off too): a guest-side race to find
 - [ ] Identify the game's statically linked D3D functions
 - [ ] WebGPU backend: device, swap chain, render targets, depth
 - [ ] XenosRecomp → HLSL → SPIR-V → WGSL shader cache
-- [ ] Texture untiling and format conversion
+- [ ] Texture untiling and format conversion (CPU version done for the common formats)
 - [ ] Menus render, then a stage plus characters
 
 ## M4: Sound
