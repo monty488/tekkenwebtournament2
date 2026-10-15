@@ -2,8 +2,9 @@
 
 // Kernel dispatcher objects: events, mutants, semaphores and threads, waitable
 // through handles (Nt* APIs) or through dispatcher headers embedded in guest
-// memory (Ke* APIs). One global lock/condition variable guards all object state,
-// which keeps multi-object waits simple and correct.
+// memory (Ke* APIs). One global lock guards all object state, which keeps
+// multi-object waits simple and correct; blocked threads sleep on their own
+// condition variable (see Waiter). WaitCondition() is only for suspended threads.
 
 #include "guest.h"
 #include "objects.h"
@@ -23,15 +24,21 @@ namespace guest
 
     struct Waitable;
 
-    // A thread blocked in WaitForObjects (wait-any). Signals are handed to the oldest
-    // eligible waiter directly, as the NT kernel does: an auto-reset event set while a
-    // thread waits on it wakes that thread and stays unsignalled, so the setter cannot
-    // take it back by waiting on it right away.
+    // A thread blocked in WaitForObjects, queued on each object it waits for. Signals are
+    // handed to the oldest eligible wait-any waiter directly, as the NT kernel does: an
+    // auto-reset event set while a thread waits on it wakes that thread and stays
+    // unsignalled, so the setter cannot take it back by waiting on it right away.
+    // Wait-all waiters are only woken to re-check. Each waiter has its own condition
+    // variable, so a signal wakes just the threads queued on that object rather than
+    // every blocked guest thread (games that spin on Set/WaitForSingleObject would
+    // otherwise keep the whole process churning through wakeups).
     struct Waiter
     {
         uint32_t threadId = 0;
         const std::vector<std::shared_ptr<Waitable>>* objects = nullptr;
+        bool waitAll = false;
         int satisfiedIndex = -1;
+        std::condition_variable cv;
     };
 
     struct Waitable : KernelObject
@@ -46,8 +53,8 @@ namespace guest
         uint32_t guestObject = 0;
     };
 
-    // Hands the object's available state to queued waiters (call with WaitMutex() held,
-    // after changing the state), then updates the guest header.
+    // Hands the object's available state to queued waiters and wakes them (call with
+    // WaitMutex() held, after changing the state), then updates the guest header.
     void DeliverSignals(Waitable& object);
 
     struct Event : Waitable

@@ -139,6 +139,14 @@ namespace guest
                 ++it; // already woken by another object; it unregisters itself
                 continue;
             }
+            if (w->waitAll)
+            {
+                // Takes nothing until all its objects are signalled; let it re-check.
+                if (object.IsSignaled(w->threadId))
+                    w->cv.notify_one();
+                ++it;
+                continue;
+            }
             if (!object.IsSignaled(w->threadId))
                 break; // FIFO: later waiters cannot jump the queue
             object.Acquire(w->threadId);
@@ -151,6 +159,7 @@ namespace guest
                 }
             }
             it = object.waiters.erase(it);
+            w->cv.notify_one();
         }
         SyncGuestHeader(object);
     }
@@ -166,6 +175,7 @@ namespace guest
         Waiter waiter;
         waiter.threadId = tid;
         waiter.objects = &objects;
+        waiter.waitAll = waitAll;
         bool queued = false;
         auto unqueue = [&] {
             if (!queued)
@@ -191,6 +201,7 @@ namespace guest
                     all = all && o && o->IsSignaled(tid);
                 if (all)
                 {
+                    unqueue();
                     for (auto& o : objects)
                     {
                         o->Acquire(tid);
@@ -209,7 +220,7 @@ namespace guest
                         {
                             if (w == &waiter)
                                 return false;
-                            if (w->satisfiedIndex < 0)
+                            if (w->satisfiedIndex < 0 && !w->waitAll)
                                 return true;
                         }
                         return false;
@@ -222,13 +233,14 @@ namespace guest
                         return STATUS_SUCCESS + uint32_t(i);
                     }
                 }
-                if (!queued)
-                {
-                    for (auto& o : objects)
-                        if (o)
-                            o->waiters.push_back(&waiter);
-                    queued = true;
-                }
+            }
+
+            if (!queued)
+            {
+                for (auto& o : objects)
+                    if (o)
+                        o->waiters.push_back(&waiter);
+                queued = true;
             }
 
             if (deadline)
@@ -240,11 +252,11 @@ namespace guest
                     unqueue();
                     return STATUS_TIMEOUT;
                 }
-                g_waitCv.wait_until(lock, *deadline);
+                waiter.cv.wait_until(lock, *deadline);
             }
             else
             {
-                g_waitCv.wait(lock);
+                waiter.cv.wait(lock);
             }
         }
     }
@@ -270,7 +282,6 @@ namespace guest
             ++s->count;
         }
         DeliverSignals(*object);
-        g_waitCv.notify_all();
         return STATUS_SUCCESS;
     }
 
@@ -357,7 +368,6 @@ GUEST_IMPORT(NtPulseEvent)
         e->signaled = false;
         if (e->guestObject) Store<int32_t>(e->guestObject + 4, 0);
     }
-    NotifyWaiters();
     ctx.r3.u64 = STATUS_SUCCESS;
 }
 
@@ -442,7 +452,6 @@ GUEST_IMPORT(NtReleaseSemaphore)
         s->count += release;
         DeliverSignals(*s);
     }
-    NotifyWaiters();
     ctx.r3.u64 = STATUS_SUCCESS;
 }
 

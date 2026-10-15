@@ -8,6 +8,7 @@
 // see docs/ARCHITECTURE.md, "Audio").
 
 #include "../kernel/guest.h"
+#include "../kernel/memory.h"
 #include "../kernel/threads.h"
 
 #include <atomic>
@@ -21,7 +22,10 @@ namespace apu
     constexpr uint32_t kFrameSamples = 256;
 
     static std::atomic<uint32_t> g_clientCallback{ 0 };
-    static std::atomic<uint32_t> g_clientParam{ 0 };
+    // The client callback receives a pointer to a guest dword holding the registered
+    // parameter, not the parameter itself (as on the console and in Xenia); TTT2's
+    // XAudio2 callback dereferences it to find its engine object.
+    static std::atomic<uint32_t> g_clientParamPtr{ 0 };
     static std::atomic<uint64_t> g_framesSubmitted{ 0 };
 
     static void RenderDriverThread()
@@ -37,7 +41,7 @@ namespace apu
             if (clock::now() > next + period * 8)
                 next = clock::now() + period; // fell far behind (debugger, load spike): resync
             if (const uint32_t callback = g_clientCallback.load())
-                guest::CallGuest(env, callback, { g_clientParam.load() });
+                guest::CallGuest(env, callback, { g_clientParamPtr.load() });
         }
     }
 }
@@ -47,8 +51,10 @@ using namespace guest;
 // u32 XAudioRegisterRenderDriverClient(u32* callbackInfo /* {func, param} */, u32* driver)
 GUEST_IMPORT(XAudioRegisterRenderDriverClient)
 {
+    static const uint32_t paramPtr = AllocVirtual(4);
+    Store<uint32_t>(paramPtr, Load<uint32_t>(ctx.r3.u32 + 4));
+    apu::g_clientParamPtr = paramPtr;
     apu::g_clientCallback = Load<uint32_t>(ctx.r3.u32 + 0);
-    apu::g_clientParam = Load<uint32_t>(ctx.r3.u32 + 4);
     Store<uint32_t>(ctx.r4.u32, apu::kDriverHandle);
     TTT2_LOG("audio client registered: callback 0x%08X", apu::g_clientCallback.load());
     static std::once_flag started;

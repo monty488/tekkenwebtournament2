@@ -15,6 +15,11 @@
 #include <mutex>
 #include <thread>
 
+#ifdef _WIN32
+#include <windows.h>
+#pragma comment(lib, "synchronization.lib")
+#endif
+
 namespace guest
 {
     // Per-thread guest environment. Layout matches what Xbox 360 titles read via
@@ -174,7 +179,6 @@ GUEST_IMPORT(ExCreateThread)
             thread->finished = true;
             DeliverSignals(*thread);
         }
-        NotifyWaiters();
     }).detach();
 
     if (pHandle)
@@ -332,6 +336,28 @@ static bool TryEnter(XRTL_CRITICAL_SECTION* cs, uint32_t self)
     return false;
 }
 
+// A contended section blocks on the owner field (WaitOnAddress / atomic wait) after a
+// short spin, so idle workers parked on a held section cost no CPU. Spin-yielding there
+// kept many host threads runnable at once, and preemption then opened races the game's
+// lock-free handshakes only survive on dedicated hardware threads (see sub_824E1670).
+static void WaitForOwnerChange(uint32_t& field, uint32_t owner, std::chrono::milliseconds timeout)
+{
+#ifdef _WIN32
+    WaitOnAddress(&field, &owner, sizeof(owner), DWORD(timeout.count()));
+#else
+    std::atomic_ref<uint32_t>(field).wait(owner);
+#endif
+}
+
+static void WakeOwnerWaiters(uint32_t& field)
+{
+#ifdef _WIN32
+    WakeByAddressAll(&field);
+#else
+    std::atomic_ref<uint32_t>(field).notify_all();
+#endif
+}
+
 GUEST_IMPORT(RtlEnterCriticalSection)
 {
     auto* cs = ToHost<XRTL_CRITICAL_SECTION>(ctx.r3.u32);
@@ -340,9 +366,12 @@ GUEST_IMPORT(RtlEnterCriticalSection)
     bool reported = false;
     for (uint32_t spins = 0; !TryEnter(cs, self); ++spins)
     {
-        if (spins > 64)
-            std::this_thread::yield();
-        if (!reported && (spins & 0xFFF) == 0 && std::chrono::steady_clock::now() - start > std::chrono::seconds(2))
+        if (spins < 64)
+            continue;
+        const uint32_t owner = std::atomic_ref<uint32_t>(cs->OwningThread).load(std::memory_order_relaxed);
+        if (owner)
+            WaitForOwnerChange(cs->OwningThread, owner, std::chrono::seconds(1));
+        if (!reported && std::chrono::steady_clock::now() - start > std::chrono::seconds(2))
         {
             reported = true;
             TTT2_LOG("T%u waiting >2s for critical section %08X owned by T%u (recursion %d)", self,
@@ -360,7 +389,10 @@ GUEST_IMPORT(RtlLeaveCriticalSection)
 {
     auto* cs = ToHost<XRTL_CRITICAL_SECTION>(ctx.r3.u32);
     if (--cs->RecursionCount == 0)
+    {
         std::atomic_ref<uint32_t>(cs->OwningThread).store(0, std::memory_order_release);
+        WakeOwnerWaiters(cs->OwningThread);
+    }
 }
 
 // ---- Time ------------------------------------------------------------------
