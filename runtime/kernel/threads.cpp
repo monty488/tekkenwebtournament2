@@ -3,11 +3,15 @@
 #include "threads.h"
 #include "memory.h"
 #include "objects.h"
+#include "module.h"
+#include "sync.h"
 
+#include <algorithm>
 #include <atomic>
 #include <bit>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <mutex>
 #include <thread>
 
@@ -19,7 +23,6 @@ namespace guest
     constexpr uint32_t TLS_SIZE   = 0x100;
     constexpr uint32_t TEB_SIZE   = 0x2E0;
     constexpr uint32_t STACK_SIZE = 0x40000;
-    constexpr uint32_t BLOCK_SIZE = PCR_SIZE + TLS_SIZE + TEB_SIZE + STACK_SIZE;
 
     static std::atomic<uint32_t> g_nextThreadId{ 1 };
     static thread_local uint32_t t_threadId = 0;
@@ -33,7 +36,12 @@ namespace guest
 
     uint32_t RunGuestThread(uint32_t startAddress, uint32_t arg0, uint32_t arg1)
     {
-        const uint32_t block = AllocVirtual(BLOCK_SIZE);
+        // Static TLS comes from the XEX's TLS directory; keep at least TLS_SIZE so titles
+        // without one still get a valid block.
+        const TlsInfo& tlsInfo = GetTlsInfo();
+        const uint32_t tlsSize = (std::max(tlsInfo.dataSize, TLS_SIZE) + 0xF) & ~0xFu;
+
+        const uint32_t block = AllocVirtual(PCR_SIZE + tlsSize + TEB_SIZE + STACK_SIZE);
         if (!block)
         {
             TTT2_LOG("RunGuestThread: could not allocate thread block");
@@ -42,13 +50,15 @@ namespace guest
 
         const uint32_t pcr = block;
         const uint32_t tls = pcr + PCR_SIZE;
-        const uint32_t teb = tls + TLS_SIZE;
+        const uint32_t teb = tls + tlsSize;
         const uint32_t stackTop = teb + TEB_SIZE + STACK_SIZE;
+
+        if (tlsInfo.rawAddress && tlsInfo.rawSize)
+            std::memcpy(ToHost(tls), ToHost(tlsInfo.rawAddress), std::min(tlsInfo.rawSize, tlsSize));
 
         Store<uint32_t>(pcr + 0x000, tls);                // PCR->TlsData
         Store<uint32_t>(pcr + 0x100, teb);                // PCR->CurrentThread
         *ToHost<uint8_t>(pcr + 0x10C) = 0;                // PCR->CurrentCpu
-        Store<uint32_t>(tls + 0x10, 0xFFFFFFFF);
         Store<uint32_t>(teb + 0x14C, CurrentThreadId());  // KTHREAD->ThreadId
 
         PPCContext ctx{};
@@ -58,7 +68,9 @@ namespace guest
         ctx.r13.u64 = pcr;
         ctx.fpscr.loadFromHost();
 
+        RegisterGuestThread();
         Call(ctx, startAddress);
+        UnregisterGuestThread();
 
         Free(block);
         return ctx.r3.u32;
@@ -84,15 +96,6 @@ namespace guest
 #endif
     }
 
-    struct GuestThread : KernelObject
-    {
-        uint32_t id = 0;
-        std::mutex mutex;
-        std::condition_variable resumed;
-        int suspendCount = 0;
-        std::atomic<bool> finished{ false };
-        uint32_t exitCode = 0;
-    };
 }
 
 using namespace guest;
@@ -117,16 +120,22 @@ GUEST_IMPORT(ExCreateThread)
     std::thread([thread, xapiStartup, startAddress, parameter]
     {
         t_threadId = thread->id;
+        SetCurrentGuestThread(thread);
         {
-            std::unique_lock lock(thread->mutex);
-            thread->resumed.wait(lock, [&] { return thread->suspendCount == 0; });
+            std::unique_lock lock(WaitMutex());
+            WaitCondition().wait(lock, [&] { return thread->suspendCount == 0; });
         }
 
         // XapiThreadStartup(startAddress, parameter) wraps the real entry point when present.
-        thread->exitCode = xapiStartup
+        const uint32_t exitCode = xapiStartup
             ? RunGuestThread(xapiStartup, startAddress, parameter)
             : RunGuestThread(startAddress, parameter);
-        thread->finished = true;
+        {
+            std::lock_guard lock(WaitMutex());
+            thread->exitCode = exitCode;
+            thread->finished = true;
+        }
+        NotifyWaiters();
     }).detach();
 
     if (pHandle)
@@ -148,12 +157,12 @@ GUEST_IMPORT(NtResumeThread)
 
     int previous;
     {
-        std::lock_guard lock(thread->mutex);
+        std::lock_guard lock(WaitMutex());
         previous = thread->suspendCount;
         if (thread->suspendCount > 0)
             --thread->suspendCount;
     }
-    thread->resumed.notify_all();
+    NotifyWaiters();
 
     if (ctx.r4.u32)
         Store<uint32_t>(ctx.r4.u32, uint32_t(previous));

@@ -38,6 +38,15 @@ if (EMSCRIPTEN)
 endif()
 
 if (TTT2_HAVE_RECOMP)
+    # Checked indirect calls for every TU (recompiled code and runtime alike); see
+    # runtime/kernel/indirect_call.h.
+    set(TTT2_INDIRECT_CALL_HEADER ${CMAKE_CURRENT_SOURCE_DIR}/runtime/kernel/indirect_call.h)
+    if (MSVC)
+        add_compile_options("/FI${TTT2_INDIRECT_CALL_HEADER}")
+    else()
+        add_compile_options(-include ${TTT2_INDIRECT_CALL_HEADER})
+    endif()
+
     add_subdirectory(recomp)
 endif()
 add_subdirectory(runtime)

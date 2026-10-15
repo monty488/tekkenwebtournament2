@@ -100,10 +100,13 @@ def analyse(addr, word, base_addr):
         is_bclr_cond = (i >> 26) == 19 and ((i >> 1) & 0x3FF) == 16 and i != 0x4E800020
         if is_bc or is_bclr_cond:
             crf = (i >> 18) & 7
-            for j in range(1, 8):
+            for j in range(1, 33):
                 c = a - 4 * j
                 f = fields(word(c))
                 if f["op"] == 10 and (f["rd"] & 1) == 0 and (f["rd"] >> 2) == crf:  # cmplwi (L=0)
+                    # The index must survive unchanged from the compare to the branch.
+                    if any(dest_reg(word(x)) == f["ra"] for x in range(c + 4, a, 4)):
+                        return None
                     start, idx_reg, count = a + 4, f["ra"], f["uimm"] + 1
                     # mr rX, rIdx shortly before the compare
                     for m in range(1, 7):
@@ -114,11 +117,30 @@ def analyse(addr, word, base_addr):
                     break
                 if (word(c) >> 26) in (16, 18, 19):
                     break
-            if start is None:
-                return None
+                # Another compare into the same CR field means the branch tests that one.
+                if f["op"] in (10, 11) and (f["rd"] >> 2) == crf:
+                    break
+                if f["op"] == 31 and f["xo"] in (0, 32) and (f["rd"] >> 2) == crf:
+                    break
             break
         if (i >> 26) in (18, 19) or i == BCTR:
-            return None  # other control flow first: not a simple switch
+            break  # other control flow first: no bounds check in this block
+
+    if start is None:
+        # Unbounded byte switch: `lbz rI` feeds the dispatch and the table has all 256
+        # entries, so the compiler emits no bounds check.
+        for k in range(2, WINDOW):
+            a = addr - 4 * k
+            i = word(a)
+            if (i >> 26) in (16, 18, 19) or i == BCTR:
+                break
+            if (i >> 26) == 34:  # lbz
+                rd = (i >> 21) & 31
+                if any(dest_reg(word(x)) == rd for x in range(a + 4, addr, 4)):
+                    break  # index clobbered before the bctr
+                start, idx_reg, count = a + 4, rd, 256
+                break
+
     if start is None or count > 4096:
         return None
 
@@ -135,8 +157,12 @@ def analyse(addr, word, base_addr):
                 val = ("const", f["simm"] & 0xFFFFFFFF)
             elif regs.get(f["ra"], ("?",))[0] == "const":
                 val = ("const", (regs[f["ra"]][1] + f["simm"]) & 0xFFFFFFFF)
+        elif op == 24 and f["uimm"] == 0:                              # ori rA,rS,0: copy (nop when rA == rS)
+            val = regs.get(f["rd"])
         elif op == 24 and regs.get(f["rd"], ("?",))[0] == "const":     # ori
             val = ("const", regs[f["rd"]][1] | f["uimm"])
+        elif op == 31 and f["xo"] == 444 and f["rd"] == f["rb"]:     # mr rA,rS (or rA,rS,rS)
+            val = regs.get(f["rd"])
         elif op == 21:                                                  # rlwinm as slwi
             src = regs.get(f["rd"])
             if src and f["mb"] == 0 and f["me"] == 31 - f["sh"]:
@@ -229,11 +255,22 @@ def fix_function_bounds(found, word, sections, code, helpers=()):
     def in_code(a):
         return any(lo <= a < hi for lo, hi in code_ranges)
 
+    # Import thunks (nop, nop, nop, blr after XenonUtils patches them) are XenonRecomp's
+    # __imp__ symbols. Giving them explicit bounds would turn them into empty sub_
+    # functions and silently break every kernel call, so treat them like the helpers.
+    thunk = (0x60000000, 0x60000000, 0x60000000, 0x4E800020)
+    regions = list(helpers)
+    for sec_base, sec_size in code:
+        for a in range(sec_base, sec_base + sec_size - 12, 4):
+            if (word(a), word(a + 4), word(a + 8), word(a + 12)) == thunk:
+                regions.append((a, a + 16))
+    covered = {}
+    for lo, hi in regions:
+        for a in range(lo, hi, 4):
+            covered[a] = hi
+
     def helper_end(a):
-        for lo, hi in helpers:
-            if lo <= a < hi:
-                return hi
-        return None
+        return covered.get(a)
 
     def branch_target(a, i):
         disp = (i & 0x03FFFFFC) if (i >> 26) == 18 else (i & 0xFFFC)
@@ -251,9 +288,37 @@ def fix_function_bounds(found, word, sections, code, helpers=()):
             if (i >> 26) in (16, 18):
                 branches.append((a, branch_target(a, i), bool(i & 1)))
 
-    # Function entry points: .pdata, bl targets, then (iteratively) any address another
-    # function branches into.
+    # Function entry points: .pdata, bl targets, code addresses stored in data (vtables,
+    # callbacks), then (iteratively) any address another function branches into.
     starts = set(pdata_size) | {t for _, t, link in branches if link}
+
+    def no_fallthrough_into(t):
+        # Only split where the previous instruction cannot fall through into `t`.
+        p = word(t - 4)
+        return (p in (0, 0x4E800020, BCTR) or (p >> 26) == 3          # padding, blr, bctr, twi
+                or ((p >> 26) == 18 and not (p & 1))                    # b
+                or ((p >> 26) == 31 and ((p >> 1) & 0x3FF) == 4))       # tw
+
+    # Data also points *into* functions: SEH scope tables reference __except handler
+    # labels inside framed functions. Every function with a frame has a .pdata entry, so
+    # only accept references that fall outside .pdata ranges (leaf code, vtable thunks).
+    pdata_starts = [b for b, _ in pdata]
+
+    def inside_pdata_function(t):
+        k = bisect.bisect_right(pdata_starts, t) - 1
+        return k >= 0 and pdata[k][0] < t < pdata[k][0] + pdata[k][1]
+
+    switch_labels = {l for labels in switches.values() for l in labels}
+    for name, (sec_base, sec_size) in sections.items():
+        if name in (".pdata", ".reloc") or any(lo == sec_base for lo, _ in code_ranges):
+            continue
+        for a in range(sec_base, sec_base + sec_size - 3, 4):
+            t = word(a)
+            if t & 3 or not in_code(t) or t in switch_labels or inside_pdata_function(t):
+                continue
+            if no_fallthrough_into(t):
+                starts.add(t)
+
     starts = {s for s in starts if in_code(s) and helper_end(s) is None}
 
     def compute(starts):
@@ -385,12 +450,30 @@ def main():
     def word(a):
         return struct.unpack_from(">I", data, a - base)[0]
 
+    import bisect
+    sections = load_sections(scan_dir)
+    pbase, psize = sections[".pdata"]
+    pdata = sorted((word(pbase + o), ((word(pbase + o + 4) >> 8) & 0x3FFFFF) * 4)
+                   for o in range(0, psize, 8) if word(pbase + o))
+    pdata_starts = [b for b, _ in pdata]
+
     found, unresolved = [], []
     for sec_base, sec_size in code:
         for a in range(sec_base, sec_base + sec_size, 4):
             if word(a) != BCTR:
                 continue
             res = analyse(a, word, base)
+            if res and len(res[1]) == 256:
+                # Unbounded byte switch: the real table is usually shorter. Keep entries
+                # up to the first label outside the enclosing .pdata function.
+                k = bisect.bisect_right(pdata_starts, a) - 1
+                lo, hi = (pdata[k][0], pdata[k][0] + pdata[k][1]) if k >= 0 and a < pdata[k][0] + pdata[k][1] else (a - 0x8000, a + 0x8000)
+                labels = []
+                for label in res[1]:
+                    if not (lo <= label < hi):
+                        break
+                    labels.append(label)
+                res = (res[0], labels) if labels else None
             if res:
                 found.append((a, *res))
             elif any(fields(word(a - 4 * k))["op"] == 10 for k in range(2, 10)):

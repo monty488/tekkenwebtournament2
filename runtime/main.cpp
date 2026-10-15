@@ -6,6 +6,7 @@
 
 #include "kernel/guest.h"
 #include "kernel/memory.h"
+#include "kernel/module.h"
 #include "kernel/threads.h"
 #include "hid/input.h"
 #include "vfs/vfs.h"
@@ -80,12 +81,17 @@ int main(int argc, char** argv)
 
     vfs::SetGameRoot(dataRoot / "files");
 
+    guest::InstallCrashHandler();
+
     if (!guest::InitMemory())
         return 1;
     if (!LoadImage(dataRoot / "scan" / "image.bin"))
         return 1;
     InstallFunctionTable();
+    if (!guest::InitModule(dataRoot / "scan"))
+        return 1;
     hid::Init();
+    guest::StartWatchdog();
 
     const uint32_t entry = ReadEntryPoint(dataRoot / "scan" / "image_info.toml");
     if (!entry)

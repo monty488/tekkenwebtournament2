@@ -56,9 +56,22 @@ namespace guest
 // Logging. Kept printf-style so it works identically on native and Emscripten.
 #define TTT2_LOG(fmt, ...) std::fprintf(stderr, "[ttt2] " fmt "\n", ##__VA_ARGS__)
 
+namespace guest
+{
+    // Records the call for the stall watchdog and, with TTT2_TRACE=1, logs it.
+    void TraceImport(const char* name, const PPCContext& ctx);
+}
+
 // Defines the host implementation of a kernel/XAM export.
 //   GUEST_IMPORT(NtClose) { ... ctx.r3.u64 = STATUS_SUCCESS; }
-#define GUEST_IMPORT(name) PPC_FUNC(__imp__##name)
+#define GUEST_IMPORT(name)                                              \
+    static void name##_Impl(PPCContext& __restrict ctx, uint8_t* base); \
+    PPC_FUNC(__imp__##name)                                             \
+    {                                                                   \
+        guest::TraceImport(#name, ctx);                                 \
+        name##_Impl(ctx, base);                                         \
+    }                                                                   \
+    static void name##_Impl([[maybe_unused]] PPCContext& __restrict ctx, [[maybe_unused]] uint8_t* base)
 
 // Placeholder used by the generated stub file: logs once, returns 0.
 #define GUEST_IMPORT_STUB(name)                         \

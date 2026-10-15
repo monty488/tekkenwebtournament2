@@ -69,6 +69,19 @@ You can build and serve the web target **before** you have the game: it then
 builds a placeholder runtime, which is a quick way to check the toolchain and
 browser support.
 
+## Debugging the bring-up
+
+The native build has switches for chasing startup problems:
+
+| Variable | Effect |
+| --- | --- |
+| `TTT2_TRACE=1` | Logs every kernel/XAM call: thread, name, `r3`–`r6`, return address |
+| `TTT2_WATCHDOG=<seconds>` | If no kernel call happens for that long (default 5), prints each guest thread's last call and the recompiled functions it is running (`0` disables) |
+
+Bad indirect calls (a function pointer or `bctr` to an address that isn't a
+recompiled function) and access violations print a symbolised host backtrace
+instead of crashing silently.
+
 ## Browser requirements
 
 | Feature | Why | Support (late 2025) |

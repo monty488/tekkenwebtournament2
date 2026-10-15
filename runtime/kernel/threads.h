@@ -11,6 +11,13 @@ namespace guest
 
     uint32_t CurrentThreadId();
 
+    // Diagnostics (kernel/trace.cpp): guest threads register so the stall watchdog can
+    // sample them.
+    void RegisterGuestThread();
+    void UnregisterGuestThread();
+    void StartWatchdog();
+    void InstallCrashHandler();
+
     // Host ticks per second as seen by the guest's mftb / KeQueryPerformanceCounter.
     uint64_t TimebaseFrequency();
 }

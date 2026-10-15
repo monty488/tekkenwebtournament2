@@ -25,10 +25,17 @@ Rough milestones, in order. Each depends on the previous one.
 - [ ] Unit-test the new instruction implementations against Xenia's PPC tests (XenonTests)
 
 ## M2: Boots to the render loop (native first)
-- [ ] Dispatcher objects: events, semaphores, mutants, waits, timers
-- [ ] Remaining memory, I/O and XAM calls from the stub log
-- [ ] Content/save APIs (XContent*), user/profile stubs (signed-in local user)
-- [ ] `VdSwap` reached repeatedly (shown in the log)
+- [x] `ttt2.exe` links and runs: CRT and engine init complete, ~20 game threads start
+      (`nuscMain`, `nuscFileAsyncRequest`, ...), audio client registers, GPU init begins
+- [x] Kernel variable imports (KeTimeStampBundle, XboxHardwareInfo, module handle, ...)
+- [x] Static TLS sized and initialised from the XEX TLS directory
+- [x] Dispatcher objects: events, mutants, semaphores, thread objects; waits by handle
+      and by guest dispatcher header (timers still to do)
+- [ ] Graphics interrupt / vblank: call the callback from `VdSetGraphicsInterruptCallback`
+      every frame (the game is waiting on this now)
+- [ ] Vd* ring buffer / command buffer APIs, then `VdSwap` reached repeatedly
+- [ ] Remaining memory, I/O and XAM calls from the stub log (~208 still stubbed)
+- [ ] Content/save APIs (XContent*), profile/sign-in (currently: nobody signed in)
 
 ## M3: Pictures
 - [ ] Identify the game's statically linked D3D functions
