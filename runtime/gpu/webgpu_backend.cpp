@@ -14,7 +14,11 @@
 #include "webgpu_backend.h"
 #include "xenos_wgsl.h"
 #include "texture.h"
+#include "presenter.h"
 #include "../kernel/guest.h"
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #include <webgpu/webgpu.h>
 #ifndef __EMSCRIPTEN__
@@ -268,7 +272,8 @@ namespace gpu
         struct Stats
         {
             uint64_t draws = 0, triangles = 0, pipelinesCreated = 0, shadersCreated = 0, readbacks = 0, clears = 0,
-                     textureUploads = 0, submits = 0, readbackNs = 0, encodeNs = 0, gpuResolves = 0, gpuResolveBinds = 0, flushes = 0;
+                     textureUploads = 0, submits = 0, readbackNs = 0, encodeNs = 0, gpuResolves = 0, gpuResolveBinds = 0, flushes = 0,
+                     setupNs = 0, pipelineNs = 0, dataNs = 0, bindNs = 0, vertexBytes = 0, indexBytes = 0, drawDataBytes = 0;
         };
 
         class WebGpuBackend final : public CaptureSink
@@ -290,6 +295,7 @@ namespace gpu
             void EndFrame();
             void PrintStats();
             bool ReadFrontBuffer(const uint32_t fetch[6], std::vector<uint32_t>& bgra, uint32_t& width, uint32_t& height);
+            bool PresentFrontBuffer(const uint32_t fetch[6]);
             void FlushAllResolves();
 
         private:
@@ -333,6 +339,15 @@ namespace gpu
             WGPURenderPipeline resolvePipeline_ = nullptr;
             WGPUBindGroupLayout resolveDepthLayout_ = nullptr;
             WGPURenderPipeline resolveDepthPipeline_ = nullptr;
+            // Presentation straight to the window (no readback).
+            WGPUSurface surface_ = nullptr;
+            WGPUTextureFormat surfaceFormat_ = WGPUTextureFormat_Undefined;
+            WGPUPresentMode presentMode_ = WGPUPresentMode_Fifo;
+            uint32_t surfaceWidth_ = 0, surfaceHeight_ = 0;
+            bool surfaceFailed_ = false;
+            WGPUBindGroupLayout blitLayout_ = nullptr;
+            WGPURenderPipeline blitPipeline_ = nullptr;
+            WGPUSampler blitSampler_ = nullptr;
             std::unordered_map<uint32_t, ResolvedImage> resolved_; // by guest address
             uint64_t frame_ = 1;
 
@@ -1020,6 +1035,7 @@ fn to20e4(f: f32) -> u32 {
             if (vertexFetch)
                 std::memcpy(image.data() + 64 + 512 * 16, vertexFetch, 96 * 16);
             wgpuQueueWriteBuffer(queue_, drawRing_, offset, image.data(), image.size());
+            stats_.drawDataBytes += image.size();
             drawOffset_ += kDrawDataStride;
             return offset;
         }
@@ -1039,6 +1055,7 @@ fn to20e4(f: f32) -> u32 {
                 Submit();
             const uint32_t wordOffset = uint32_t(vertexMemoryOffset_ / 4);
             wgpuQueueWriteBuffer(queue_, vertexMemory_, vertexMemoryOffset_, guest::ToHost<const uint8_t>(address), bytes);
+            stats_.vertexBytes += bytes;
             vertexMemoryOffset_ = (vertexMemoryOffset_ + bytes + 255) & ~255ull;
             vertexUploads_[key] = wordOffset;
             return wordOffset;
@@ -1089,6 +1106,7 @@ fn to20e4(f: f32) -> u32 {
                 Submit();
             const uint64_t offset = indexOffset_;
             wgpuQueueWriteBuffer(queue_, indexRing_, offset, request.indices->data(), bytes);
+            stats_.indexBytes += bytes;
             indexOffset_ = (indexOffset_ + bytes + 255) & ~255ull;
 
             BeginPass(drawColor_, drawDepth_);
@@ -1192,6 +1210,8 @@ fn to20e4(f: f32) -> u32 {
             for (uint32_t k = 0; k < 32; k += 4)
                 translationKey = Mix(translationKey, options.slotSwizzle[k] | (uint64_t(options.slotSwizzle[k + 1]) << 16) |
                     (uint64_t(options.slotSwizzle[k + 2]) << 32) | (uint64_t(options.slotSwizzle[k + 3]) << 48));
+            const auto tSetup = std::chrono::steady_clock::now();
+            stats_.setupNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(tSetup - start).count());
             Translation& translation = translations_[translationKey];
             if (!translation.key)
             {
@@ -1362,6 +1382,8 @@ fn to20e4(f: f32) -> u32 {
             }
             drawPipeline_ = pipeline;
 
+            const auto tPipeline = std::chrono::steady_clock::now();
+            stats_.pipelineNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(tPipeline - tSetup).count());
             // ---- constants, vertex memory and textures
             const float misc[4] = { rs.alphaRef, 0, 0, 0 };
             if (gpuVertex_)
@@ -1409,6 +1431,8 @@ fn to20e4(f: f32) -> u32 {
                 drawDataOffset_ = WriteDrawData(misc, nullptr, hasFragment ? args.constants : nullptr, 256, hasFragment ? 256 : 0);
             }
 
+            const auto tData = std::chrono::steady_clock::now();
+            stats_.dataNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(tData - tPipeline).count());
             if (drawTextures_)
             {
                 wgpuBindGroupRelease(drawTextures_);
@@ -1444,6 +1468,7 @@ fn to20e4(f: f32) -> u32 {
             bgd.entryCount = entries.size();
             bgd.entries = entries.data();
             drawTextures_ = wgpuDeviceCreateBindGroup(device_, &bgd);
+            stats_.bindNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tData).count());
             stats_.encodeNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
             return true;
         }
@@ -2025,6 +2050,170 @@ fn to20e4(f: f32) -> u32 {
             ++stats_.flushes;
         }
 
+        bool WebGpuBackend::PresentFrontBuffer(const uint32_t fetch[6])
+        {
+            static const bool disabled = [] { const char* v = std::getenv("TTT2_GPU_PRESENT_CPU"); return v && *v == '1'; }();
+            ResolvedImage* image = ResolvedFor(fetch);
+            if (!image || disabled || surfaceFailed_)
+                return false;
+#ifdef _WIN32
+            HWND hwnd = static_cast<HWND>(PresenterWindow());
+            if (!surface_)
+            {
+                WGPUSurfaceSourceWindowsHWND source = WGPU_SURFACE_SOURCE_WINDOWS_HWND_INIT;
+                source.hinstance = GetModuleHandleW(nullptr);
+                source.hwnd = hwnd;
+                WGPUSurfaceDescriptor sd = WGPU_SURFACE_DESCRIPTOR_INIT;
+                sd.nextInChain = &source.chain;
+                surface_ = wgpuInstanceCreateSurface(instance_, &sd);
+                WGPUSurfaceCapabilities caps = WGPU_SURFACE_CAPABILITIES_INIT;
+                if (!surface_ || wgpuSurfaceGetCapabilities(surface_, adapter_, &caps) != WGPUStatus_Success || !caps.formatCount)
+                {
+                    surfaceFailed_ = true;
+                    std::fprintf(stderr, "[gpu] webgpu: no window surface, presenting through the CPU\n");
+                    return false;
+                }
+                surfaceFormat_ = caps.formats[0];
+                for (size_t i = 0; i < caps.formatCount; i++)
+                    if (caps.formats[i] == WGPUTextureFormat_BGRA8Unorm)
+                        surfaceFormat_ = caps.formats[i];
+                // Mailbox/immediate: the command processor must not block on vsync (the
+                // game paces itself on the vblank interrupt).
+                for (size_t i = 0; i < caps.presentModeCount; i++)
+                    if (caps.presentModes[i] == WGPUPresentMode_Mailbox)
+                        presentMode_ = WGPUPresentMode_Mailbox;
+                if (presentMode_ != WGPUPresentMode_Mailbox)
+                    for (size_t i = 0; i < caps.presentModeCount; i++)
+                        if (caps.presentModes[i] == WGPUPresentMode_Immediate)
+                            presentMode_ = WGPUPresentMode_Immediate;
+                wgpuSurfaceCapabilitiesFreeMembers(caps);
+
+                WGPUBindGroupLayoutEntry e[2] = { WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT };
+                e[0].binding = 0;
+                e[0].visibility = WGPUShaderStage_Fragment;
+                e[0].texture.sampleType = WGPUTextureSampleType_Float;
+                e[0].texture.viewDimension = WGPUTextureViewDimension_2D;
+                e[1].binding = 1;
+                e[1].visibility = WGPUShaderStage_Fragment;
+                e[1].sampler.type = WGPUSamplerBindingType_Filtering;
+                WGPUBindGroupLayoutDescriptor ld = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+                ld.entryCount = 2;
+                ld.entries = e;
+                blitLayout_ = wgpuDeviceCreateBindGroupLayout(device_, &ld);
+                WGPUPipelineLayoutDescriptor pld = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+                pld.bindGroupLayoutCount = 1;
+                pld.bindGroupLayouts = &blitLayout_;
+                WGPUPipelineLayout layout = wgpuDeviceCreatePipelineLayout(device_, &pld);
+                // The front buffer holds 8_8_8_8 components; the display shows component 0
+                // as blue and 2 as red (D3D's ARGB), as the CPU presenter does.
+                WGPUShaderModule module = Module(R"(
+@group(0) @binding(0) var image: texture_2d<f32>;
+@group(0) @binding(1) var linearSampler: sampler;
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f, }
+@vertex fn vs(@builtin(vertex_index) i: u32) -> VsOut {
+    let uv = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
+    var o: VsOut;
+    o.pos = vec4f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+    o.uv = uv;
+    return o;
+}
+@fragment fn fs(input: VsOut) -> @location(0) vec4f {
+    let c = textureSampleLevel(image, linearSampler, input.uv, 0.0);
+    return vec4f(clamp(c.zyx, vec3f(0.0), vec3f(1.0)), 1.0);
+}
+)");
+                WGPUColorTargetState target = WGPU_COLOR_TARGET_STATE_INIT;
+                target.format = surfaceFormat_;
+                WGPUFragmentState fs = WGPU_FRAGMENT_STATE_INIT;
+                fs.module = module;
+                fs.entryPoint = Str("fs");
+                fs.targetCount = 1;
+                fs.targets = &target;
+                WGPURenderPipelineDescriptor pd = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+                pd.layout = layout;
+                pd.vertex.module = module;
+                pd.vertex.entryPoint = Str("vs");
+                pd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+                pd.multisample.count = 1;
+                pd.multisample.mask = 0xFFFFFFFF;
+                pd.fragment = &fs;
+                blitPipeline_ = wgpuDeviceCreateRenderPipeline(device_, &pd);
+                WGPUSamplerDescriptor sdesc = WGPU_SAMPLER_DESCRIPTOR_INIT;
+                sdesc.magFilter = sdesc.minFilter = WGPUFilterMode_Linear;
+                blitSampler_ = wgpuDeviceCreateSampler(device_, &sdesc);
+                PresenterSetGpu(true);
+            }
+
+            RECT client{};
+            GetClientRect(hwnd, &client);
+            const uint32_t w = uint32_t(client.right - client.left), h = uint32_t(client.bottom - client.top);
+            if (!w || !h)
+                return true; // minimised: nothing to show
+            if (w != surfaceWidth_ || h != surfaceHeight_)
+            {
+                WGPUSurfaceConfiguration config = WGPU_SURFACE_CONFIGURATION_INIT;
+                config.device = device_;
+                config.format = surfaceFormat_;
+                config.usage = WGPUTextureUsage_RenderAttachment;
+                config.width = w;
+                config.height = h;
+                config.presentMode = presentMode_;
+                config.alphaMode = WGPUCompositeAlphaMode_Auto;
+                wgpuSurfaceConfigure(surface_, &config);
+                surfaceWidth_ = w;
+                surfaceHeight_ = h;
+            }
+            WGPUSurfaceTexture st = WGPU_SURFACE_TEXTURE_INIT;
+            wgpuSurfaceGetCurrentTexture(surface_, &st);
+            if (st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal &&
+                st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal)
+            {
+                if (st.texture)
+                    wgpuTextureRelease(st.texture);
+                surfaceWidth_ = surfaceHeight_ = 0; // reconfigure next time
+                return true;
+            }
+            WGPUTextureView target = wgpuTextureCreateView(st.texture, nullptr);
+            const uint32_t width = (fetch[2] & 0x1FFF) + 1, height = ((fetch[2] >> 13) & 0x1FFF) + 1;
+            WGPUBindGroupEntry be[2] = { WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT };
+            be[0].binding = 0;
+            be[0].textureView = ResolvedView(*image, width, height);
+            be[1].binding = 1;
+            be[1].sampler = blitSampler_;
+            WGPUBindGroupDescriptor bgd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+            bgd.layout = blitLayout_;
+            bgd.entryCount = 2;
+            bgd.entries = be;
+            WGPUBindGroup bind = wgpuDeviceCreateBindGroup(device_, &bgd);
+
+            EndPass();
+            EnsureEncoder();
+            WGPURenderPassColorAttachment ca = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+            ca.view = target;
+            ca.loadOp = WGPULoadOp_Clear;
+            ca.storeOp = WGPUStoreOp_Store;
+            ca.clearValue = { 0, 0, 0, 1 };
+            WGPURenderPassDescriptor rpd = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+            rpd.colorAttachmentCount = 1;
+            rpd.colorAttachments = &ca;
+            WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(encoder_, &rpd);
+            wgpuRenderPassEncoderSetPipeline(pass, blitPipeline_);
+            wgpuRenderPassEncoderSetBindGroup(pass, 0, bind, 0, nullptr);
+            wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
+            wgpuRenderPassEncoderEnd(pass);
+            wgpuRenderPassEncoderRelease(pass);
+            Submit();
+            wgpuSurfacePresent(surface_);
+            wgpuBindGroupRelease(bind);
+            wgpuTextureViewRelease(target);
+            wgpuTextureRelease(st.texture);
+            PresenterCountFrame();
+            return true;
+#else
+            return false;
+#endif
+        }
+
         bool WebGpuBackend::ReadFrontBuffer(const uint32_t fetch[6], std::vector<uint32_t>& bgra, uint32_t& width, uint32_t& height)
         {
             ResolvedImage* image = g_softKeepTexels ? nullptr : ResolvedFor(fetch);
@@ -2116,6 +2305,9 @@ fn to20e4(f: f32) -> u32 {
                 (unsigned long long)stats_.draws, (unsigned long long)stats_.triangles, (unsigned long long)stats_.clears,
                 (unsigned long long)stats_.readbacks, stats_.readbackNs / 1e6, stats_.encodeNs / 1e6, (unsigned long long)stats_.textureUploads,
                 (unsigned long long)stats_.submits, (unsigned long long)stats_.pipelinesCreated, (unsigned long long)stats_.shadersCreated);
+            std::fprintf(stderr, "[gpu]   webgpu: prepare = setup %.1f + pipeline %.1f + data/vertices %.1f + textures %.1f ms; uploads: vertices %.1f MB, indices %.1f MB, draw data %.1f MB\n",
+                stats_.setupNs / 1e6, stats_.pipelineNs / 1e6, stats_.dataNs / 1e6, stats_.bindNs / 1e6,
+                stats_.vertexBytes / 1e6, stats_.indexBytes / 1e6, stats_.drawDataBytes / 1e6);
             std::fprintf(stderr, "[gpu]   webgpu: %llu GPU resolves, %llu resolved-image binds, %llu flushed to memory\n",
                 (unsigned long long)stats_.gpuResolves, (unsigned long long)stats_.gpuResolveBinds, (unsigned long long)stats_.flushes);
             stats_ = {};
@@ -2138,6 +2330,11 @@ fn to20e4(f: f32) -> u32 {
     {
         if (g_backend)
             g_backend->EndFrame();
+    }
+
+    bool WebGpuPresentFrontBuffer(const uint32_t fetch[6])
+    {
+        return g_backend && g_backend->PresentFrontBuffer(fetch);
     }
 
     bool WebGpuReadFrontBuffer(const uint32_t fetch[6], std::vector<uint32_t>& bgra, uint32_t& width, uint32_t& height)

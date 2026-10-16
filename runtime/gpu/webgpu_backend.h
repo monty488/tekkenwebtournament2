@@ -19,6 +19,9 @@ namespace gpu
     // The front buffer as BGRA if the backend holds it as a GPU-resolved image (guest
     // memory then is stale). False: present from memory as usual.
     bool WebGpuReadFrontBuffer(const uint32_t fetch[6], std::vector<uint32_t>& bgra, uint32_t& width, uint32_t& height);
+    // Presents the front buffer straight from the GPU to the window. False: present from
+    // memory (or a readback) as usual.
+    bool WebGpuPresentFrontBuffer(const uint32_t fetch[6]);
 
     bool WebGpuActive();
     // Writes every GPU-kept resolve to guest memory and forgets them (before verification).

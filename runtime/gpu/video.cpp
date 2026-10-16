@@ -269,7 +269,13 @@ namespace gpu
         // Show the front buffer the game just swapped to.
         TextureInfo info = DecodeTextureFetch(fetch.data());
         static std::vector<uint32_t> pixels;
-        if (WebGpuReadFrontBuffer(fetch.data(), pixels, info.width, info.height) ||
+        if (WebGpuPresentFrontBuffer(fetch.data()))
+        {
+            // Shown by the GPU; dumps still need the pixels.
+            if (ShouldDumpFrame(swaps) && WebGpuReadFrontBuffer(fetch.data(), pixels, info.width, info.height))
+                DumpBmp(swaps, pixels.data(), info.width, info.height);
+        }
+        else if (WebGpuReadFrontBuffer(fetch.data(), pixels, info.width, info.height) ||
             (info.width > 1 && info.width <= 4096 && info.height <= 4096 && ConvertToBgra(info, pixels, SoftParallelFor)))
         {
             for (uint32_t& p : pixels)

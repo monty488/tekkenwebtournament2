@@ -10,4 +10,11 @@ namespace gpu
 
     // Number of frames shown so far.
     uint64_t PresentedToScreen();
+
+    // The output window (HWND on Windows), created on first use; null where there is none.
+    void* PresenterWindow();
+    // While set, a GPU swap chain draws the window and the GDI path stays out of the way.
+    void PresenterSetGpu(bool gpu);
+    // Counts a frame the GPU presented (for PresentedToScreen).
+    void PresenterCountFrame();
 }

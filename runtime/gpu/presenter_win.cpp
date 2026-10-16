@@ -10,6 +10,7 @@
 #include <windows.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <mutex>
 #include <thread>
@@ -22,6 +23,7 @@ namespace gpu
     static uint32_t g_frameWidth = 0, g_frameHeight = 0;
     static std::atomic<uint64_t> g_shown{ 0 };
     static std::atomic<HWND> g_window{ nullptr };
+    static std::atomic<bool> g_gpu{ false };
 
     static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
     {
@@ -31,6 +33,11 @@ namespace gpu
         {
             PAINTSTRUCT ps;
             HDC dc = BeginPaint(hwnd, &ps);
+            if (g_gpu.load())
+            {
+                EndPaint(hwnd, &ps);
+                return 0;
+            }
             RECT client;
             GetClientRect(hwnd, &client);
             {
@@ -89,10 +96,26 @@ namespace gpu
         }
     }
 
-    void Present(const uint32_t* bgra, uint32_t width, uint32_t height)
+    static void EnsureWindow()
     {
         static std::once_flag started;
         std::call_once(started, [] { std::thread(WindowThread).detach(); });
+    }
+
+    void* PresenterWindow()
+    {
+        EnsureWindow();
+        while (!g_window.load())
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return g_window.load();
+    }
+
+    void PresenterSetGpu(bool gpu) { g_gpu = gpu; }
+    void PresenterCountFrame() { ++g_shown; }
+
+    void Present(const uint32_t* bgra, uint32_t width, uint32_t height)
+    {
+        EnsureWindow();
 
         {
             std::lock_guard lock(g_frameMutex);
@@ -115,6 +138,9 @@ namespace gpu
     // Web: presentation goes through the WebGPU canvas (not implemented yet).
     void Present(const uint32_t*, uint32_t, uint32_t) {}
     uint64_t PresentedToScreen() { return 0; }
+    void* PresenterWindow() { return nullptr; }
+    void PresenterSetGpu(bool) {}
+    void PresenterCountFrame() {}
 }
 
 #endif
