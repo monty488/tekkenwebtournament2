@@ -5,6 +5,8 @@
 #include <atomic>
 #include <chrono>
 #include <thread>
+#include <cstdio>
+#include <string>
 #include <unordered_map>
 
 namespace guest
@@ -164,6 +166,35 @@ namespace guest
         SyncGuestHeader(object);
     }
 
+    // Called with the wait mutex held.
+    static void ReportLongWait(uint32_t tid, const std::vector<std::shared_ptr<Waitable>>& objects)
+    {
+        std::string what;
+        char buf[160];
+        for (const auto& o : objects)
+        {
+            if (!o)
+                continue;
+            if (auto* m = dynamic_cast<Mutant*>(o.get()))
+                std::snprintf(buf, sizeof(buf), " mutant %p (owner T%u, recursion %u, %zu waiting)", (void*)m, m->owner, m->recursion, m->waiters.size());
+            else if (auto* e = dynamic_cast<Event*>(o.get()))
+                std::snprintf(buf, sizeof(buf), " %s event %p (%s, %zu waiting)", e->manualReset ? "manual" : "auto", (void*)e,
+                    e->signaled ? "signalled" : "not signalled", e->waiters.size());
+            else if (auto* sem = dynamic_cast<Semaphore*>(o.get()))
+                std::snprintf(buf, sizeof(buf), " semaphore %p (count %d/%d, %zu waiting)", (void*)sem, sem->count, sem->maximum, sem->waiters.size());
+            else if (auto* t = dynamic_cast<GuestThread*>(o.get()))
+                std::snprintf(buf, sizeof(buf), " thread T%u (%s)", t->id, t->finished ? "finished" : "running");
+            else
+                std::snprintf(buf, sizeof(buf), " object %p", (void*)o.get());
+            what += buf;
+        }
+        TTT2_LOG("T%u waiting >2s on%s", tid, what.c_str());
+    }
+
+    // Consecutive waits satisfied by an event the waiting thread set itself.
+    static thread_local uint32_t t_selfTaken = 0;
+    constexpr uint32_t kSelfSpinLimit = 64;
+
     uint32_t WaitForObjects(const std::vector<std::shared_ptr<Waitable>>& objects, bool waitAll, uint32_t timeout)
     {
         const uint32_t tid = CurrentThreadId();
@@ -216,6 +247,10 @@ namespace guest
                 {
                     // Only take state no earlier, still-blocked waiter is owed.
                     auto owedToEarlier = [&](const Waitable& o) {
+                        // A mutant's owner re-acquires it recursively whoever is queued:
+                        // making it wait behind them would deadlock (they wait for it).
+                        if (auto* m = dynamic_cast<const Mutant*>(&o); m && m->owner == tid)
+                            return false;
                         for (Waiter* w : o.waiters)
                         {
                             if (w == &waiter)
@@ -227,6 +262,35 @@ namespace guest
                     };
                     if (objects[i] && objects[i]->IsSignaled(tid) && !owedToEarlier(*objects[i]))
                     {
+                        // A thread that keeps taking back an auto-reset event it set itself
+                        // (nobody else was waiting) is spinning: the game's "wait until the
+                        // counter reaches N" loop sets its event to pass the wakeup on and
+                        // then waits on it again. Each round costs the global wait lock, which
+                        // every other thread needs (badly so in the browser). After a run of
+                        // these, consume the signal but block up to 1 ms first; a set from
+                        // another thread still wakes the waiter at once.
+                        auto* e = dynamic_cast<Event*>(objects[i].get());
+                        if (e && !e->manualReset && e->setter == tid && ++t_selfTaken > kSelfSpinLimit)
+                        {
+                            e->signaled = false;
+                            SyncGuestHeader(*e);
+                            if (!queued)
+                            {
+                                for (auto& o : objects)
+                                    if (o)
+                                        o->waiters.push_back(&waiter);
+                                queued = true;
+                            }
+                            auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(1);
+                            if (deadline && *deadline < until)
+                                until = *deadline;
+                            while (waiter.satisfiedIndex < 0 && waiter.cv.wait_until(lock, until) != std::cv_status::timeout) {}
+                            const int index = waiter.satisfiedIndex >= 0 ? waiter.satisfiedIndex : int(i);
+                            unqueue();
+                            return STATUS_SUCCESS + uint32_t(index);
+                        }
+                        if (e && e->setter != tid)
+                            t_selfTaken = 0; // (taking a free mutex in between is part of the loop)
                         objects[i]->Acquire(tid);
                         SyncGuestHeader(*objects[i]);
                         unqueue();
@@ -242,6 +306,7 @@ namespace guest
                         o->waiters.push_back(&waiter);
                 queued = true;
             }
+            t_selfTaken = 0; // really blocking
 
             if (deadline)
             {
@@ -256,7 +321,13 @@ namespace guest
             }
             else
             {
-                waiter.cv.wait(lock);
+                // Infinite waits report once if they last over 2 s (what is held, by whom).
+                if (waiter.cv.wait_for(lock, std::chrono::seconds(2)) == std::cv_status::timeout && !waiter.reported &&
+                    waiter.satisfiedIndex < 0)
+                {
+                    waiter.reported = true;
+                    ReportLongWait(tid, objects);
+                }
             }
         }
     }
@@ -267,6 +338,7 @@ namespace guest
         if (auto* e = dynamic_cast<Event*>(object.get()))
         {
             e->signaled = true;
+            e->setter = CurrentThreadId();
         }
         else if (auto* m = dynamic_cast<Mutant*>(object.get()))
         {

@@ -20,6 +20,10 @@
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #include <emscripten/wasmfs.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <cstring>
+#include <string>
 #endif
 
 namespace fs = std::filesystem;
@@ -67,12 +71,56 @@ static uint32_t ReadEntryPoint(const fs::path& infoPath)
     return 0;
 }
 
+#ifdef __EMSCRIPTEN__
+// Development: `--stream` (the page opened with ?stream) reads game data from the dev
+// server (`node web/serve.mjs <build> 8080 --game game`) on demand, in 1 MiB ranges,
+// instead of from OPFS. The server's manifest lists the files to create.
+static bool MountStreamedGame()
+{
+    backend_t backend = wasmfs_create_fetch_backend("/game", 1u << 20);
+    if (wasmfs_create_directory("/game", 0777, backend) != 0)
+        return false;
+    if (int fd = open("/game/manifest.txt", O_CREAT | O_RDONLY, 0444); fd >= 0)
+        close(fd);
+    std::ifstream manifest("/game/manifest.txt");
+    std::string line;
+    size_t files = 0;
+    while (std::getline(manifest, line))
+    {
+        if (line.empty() || line == "manifest.txt")
+            continue;
+        const fs::path path = fs::path("/game") / line;
+        std::error_code ec;
+        fs::create_directories(path.parent_path(), ec);
+        if (int fd = open(path.string().c_str(), O_CREAT | O_RDONLY, 0444); fd >= 0)
+        {
+            close(fd);
+            ++files;
+        }
+    }
+    TTT2_LOG("streaming %zu game files from the dev server", files);
+    return files > 0;
+}
+#endif
+
 int main(int argc, char** argv)
 {
 #ifdef __EMSCRIPTEN__
-    // web/loader.js copies the user's files into OPFS as files/ and scan/.
-    backend_t opfs = wasmfs_create_opfs_backend();
-    wasmfs_create_directory("/game", 0777, opfs);
+    const bool stream = argc > 1 && std::strcmp(argv[1], "--stream") == 0;
+    if (stream)
+    {
+        if (!MountStreamedGame())
+        {
+            TTT2_LOG("could not read /game/manifest.txt: start the server with --game <game folder>");
+            return 1;
+        }
+    }
+    else
+    {
+        // web/loader.js copies the user's files into OPFS as files/ and scan/.
+        backend_t opfs = wasmfs_create_opfs_backend();
+        wasmfs_create_directory("/game", 0777, opfs);
+    }
     const fs::path dataRoot = "/game";
 #else
     const fs::path dataRoot = argc > 1 ? fs::path(argv[1]) : fs::path("game");

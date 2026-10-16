@@ -89,8 +89,8 @@ Rough milestones, in order. Each depends on the previous one.
       3D textures, real MSAA (MSAA views are supersampled), 64bpp/32bpp aliasing of the
       same EDRAM, Xenos 7e3 float colour precision
 - [ ] Check Kuma's dark face on the post-fight screen with the verifier (lighting or bug)
-- [ ] The game sometimes stops submitting at frame 4 when the GPU side is fast (WebGPU,
-      or `TTT2_SOFT_GPU=0`): a guest-side race, about one start in three
+- [x] The early startup stall (frame 4-8, most starts in the browser): a mutant's owner
+      re-acquiring it recursively was queued behind a waiter that was waiting for it
 - [ ] Browser: emdawnwebgpu build of the same backend, canvas presentation
 
 ## M4: Sound
@@ -98,7 +98,21 @@ Rough milestones, in order. Each depends on the previous one.
 - [ ] XMA decoding (FFmpeg xma2 → wasm)
 
 ## M5: Playable in the browser
-- [ ] wasm64 build runs in Chrome/Edge
+- [x] wasm64 build runs in Chrome/Edge: boots from game data streamed off the dev server
+      (`serve.mjs --game game`, page `?stream`), intro and logos on a 2D canvas with the
+      software renderer at ~18 fps (CPU texture decoding is ~10x slower than native)
+- [x] WebGPU in the browser (`?stream&TTT2_GPU=webgpu`): the canvas is transferred to the
+      command-processor worker as an OffscreenCanvas, the adapter/device arrive through
+      spontaneous callbacks (software rendering until then), and the processor runs in
+      event-loop slices so frames are shown. The processor is busy ~0.4 ms per frame;
+      the intro runs at ~26 swaps/s (native: 60), bound by the game's own threads in wasm
+- [ ] GPU readbacks in the browser (resolves the CPU reads, front-buffer screenshots): they
+      need an async map, which a synchronous resolve cannot wait for; they return zeros now
+- [x] A thread of the game spun on its own event: `sub_82ABFDE8` sets an auto-reset event
+      and SignalAndWaits on it until a 64-bit counter changes (~8 M kernel calls/s, all on
+      the global wait lock). Waits now detect a run of self-set signals and block up to
+      1 ms (a set from another thread still wakes them). Browser intro: ~26 -> 60 fps
+- [ ] Profile the remaining browser slowdowns (frames 2048-4096 average ~51 fps)
 - [ ] Stable 60 fps in matches (profile; enable XenonRecomp's local-register optimisations)
 - [ ] Input latency pass (fighting games are sensitive to it)
 - [ ] Saves persist in OPFS

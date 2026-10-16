@@ -279,7 +279,11 @@ namespace gpu
         class WebGpuBackend final : public CaptureSink
         {
         public:
-            bool Init();
+            bool Init();                 // native: synchronous
+            void Start();                // begins the adapter -> device chain
+            enum class State { Pending, Ready, Failed };
+            State state_ = State::Pending;
+            std::function<void(bool)> onReady_; // browser: called when the chain ends
 
             void BeginDraw(const CaptureDraw& draw) override;
             bool DrawGpu(const GpuDrawRequest& request) override;
@@ -309,6 +313,10 @@ namespace gpu
             }
 
         private:
+            void OnAdapter(WGPUAdapter adapter);
+            void OnDevice(WGPUDevice device);
+            bool InitDeviceObjects();
+
             // ---- device
             WGPUInstance instance_ = nullptr;
             WGPUAdapter adapter_ = nullptr;
@@ -413,31 +421,53 @@ namespace gpu
 
         WebGpuBackend* g_backend = nullptr;
 
+        // Adapter -> device -> GPU objects, as a chain of callbacks. Natively Init() pumps
+        // events until the chain ends; in the browser (where the promises only resolve once
+        // the worker returns to its event loop) StartAsync() lets them fire on their own and
+        // the backend installs itself as the capture sink when ready.
+#ifdef __EMSCRIPTEN__
+        constexpr WGPUCallbackMode kCallbackMode = WGPUCallbackMode_AllowSpontaneous;
+#else
+        constexpr WGPUCallbackMode kCallbackMode = WGPUCallbackMode_AllowProcessEvents;
+#endif
+
         bool WebGpuBackend::Init()
+        {
+            Start();
+            while (state_ == State::Pending)
+                wgpuInstanceProcessEvents(instance_);
+            return state_ == State::Ready;
+        }
+
+        void WebGpuBackend::Start()
         {
             instance_ = wgpuCreateInstance(nullptr);
             if (!instance_)
-                return false;
-
-            struct AdapterResult { WGPUAdapter adapter = nullptr; bool done = false; } ar;
+            {
+                state_ = State::Failed;
+                return;
+            }
             WGPURequestAdapterOptions options = WGPU_REQUEST_ADAPTER_OPTIONS_INIT;
             options.powerPreference = WGPUPowerPreference_HighPerformance;
             WGPURequestAdapterCallbackInfo acb = WGPU_REQUEST_ADAPTER_CALLBACK_INFO_INIT;
-            acb.mode = WGPUCallbackMode_AllowProcessEvents;
+            acb.mode = kCallbackMode;
             acb.callback = [](WGPURequestAdapterStatus status, WGPUAdapter adapter, WGPUStringView message, void* u1, void*) {
-                auto* r = static_cast<AdapterResult*>(u1);
-                r->adapter = status == WGPURequestAdapterStatus_Success ? adapter : nullptr;
-                r->done = true;
                 if (status != WGPURequestAdapterStatus_Success)
                     std::fprintf(stderr, "[gpu] webgpu: no adapter: %s\n", FromView(message).c_str());
+                static_cast<WebGpuBackend*>(u1)->OnAdapter(status == WGPURequestAdapterStatus_Success ? adapter : nullptr);
             };
-            acb.userdata1 = &ar;
+            acb.userdata1 = this;
             wgpuInstanceRequestAdapter(instance_, &options, acb);
-            while (!ar.done)
-                wgpuInstanceProcessEvents(instance_);
-            adapter_ = ar.adapter;
+        }
+
+        void WebGpuBackend::OnAdapter(WGPUAdapter adapter)
+        {
+            adapter_ = adapter;
             if (!adapter_)
-                return false;
+            {
+                state_ = State::Failed;
+                return;
+            }
 
             WGPUAdapterInfo info = WGPU_ADAPTER_INFO_INIT;
             if (wgpuAdapterGetInfo(adapter_, &info) == WGPUStatus_Success)
@@ -450,7 +480,8 @@ namespace gpu
             if (!wgpuAdapterHasFeature(adapter_, WGPUFeatureName_Depth32FloatStencil8))
             {
                 std::fprintf(stderr, "[gpu] webgpu: adapter lacks depth32float-stencil8\n");
-                return false;
+                state_ = State::Failed;
+                return;
             }
             features.push_back(WGPUFeatureName_Depth32FloatStencil8);
             if (wgpuAdapterHasFeature(adapter_, WGPUFeatureName_DepthClipControl))
@@ -464,7 +495,6 @@ namespace gpu
                 float32Filterable_ = true;
             }
 
-            struct DeviceResult { WGPUDevice device = nullptr; bool done = false; } dr;
             WGPUDeviceDescriptor dd = WGPU_DEVICE_DESCRIPTOR_INIT;
             dd.label = Str("ttt2");
             dd.requiredFeatureCount = features.size();
@@ -474,27 +504,38 @@ namespace gpu
                 if (reported++ < 20)
                     std::fprintf(stderr, "[gpu] webgpu error %d: %s\n", int(type), FromView(message).c_str());
             };
+            dd.deviceLostCallbackInfo.mode = kCallbackMode;
             dd.deviceLostCallbackInfo.callback = [](WGPUDevice const*, WGPUDeviceLostReason reason, WGPUStringView message, void*, void*) {
                 if (reason != WGPUDeviceLostReason_Destroyed)
                     std::fprintf(stderr, "[gpu] webgpu device lost (%d): %s\n", int(reason), FromView(message).c_str());
             };
             WGPURequestDeviceCallbackInfo dcb = WGPU_REQUEST_DEVICE_CALLBACK_INFO_INIT;
-            dcb.mode = WGPUCallbackMode_AllowProcessEvents;
+            dcb.mode = kCallbackMode;
             dcb.callback = [](WGPURequestDeviceStatus status, WGPUDevice device, WGPUStringView message, void* u1, void*) {
-                auto* r = static_cast<DeviceResult*>(u1);
-                r->device = status == WGPURequestDeviceStatus_Success ? device : nullptr;
-                r->done = true;
                 if (status != WGPURequestDeviceStatus_Success)
                     std::fprintf(stderr, "[gpu] webgpu: no device: %s\n", FromView(message).c_str());
+                static_cast<WebGpuBackend*>(u1)->OnDevice(status == WGPURequestDeviceStatus_Success ? device : nullptr);
             };
-            dcb.userdata1 = &dr;
+            dcb.userdata1 = this;
             wgpuAdapterRequestDevice(adapter_, &dd, dcb);
-            while (!dr.done)
-                wgpuInstanceProcessEvents(instance_);
-            device_ = dr.device;
+        }
+
+        void WebGpuBackend::OnDevice(WGPUDevice device)
+        {
+            device_ = device;
             if (!device_)
-                return false;
+            {
+                state_ = State::Failed;
+                return;
+            }
             queue_ = wgpuDeviceGetQueue(device_);
+            state_ = InitDeviceObjects() ? State::Ready : State::Failed;
+            if (onReady_)
+                onReady_(state_ == State::Ready);
+        }
+
+        bool WebGpuBackend::InitDeviceObjects()
+        {
 
             WGPUBufferDescriptor bd = WGPU_BUFFER_DESCRIPTOR_INIT;
             bd.label = Str("draw data");
@@ -1012,6 +1053,7 @@ fn to20e4(f: f32) -> u32 {
                 }
             }
             WGPURenderPassDepthStencilAttachment ds = WGPU_RENDER_PASS_DEPTH_STENCIL_ATTACHMENT_INIT;
+            ds.depthClearValue = 1.0f; // the initialiser leaves NaN, which browsers reject even when unused
             if (depth)
             {
                 ds.view = depth->view;
@@ -1582,6 +1624,23 @@ fn to20e4(f: f32) -> u32 {
             const auto start = std::chrono::steady_clock::now();
             rowBytes = (uint32_t(w) * bytesPerPixel + 255) & ~255u;
             const uint64_t size = uint64_t(rowBytes) * uint32_t(h);
+#ifdef __EMSCRIPTEN__
+            // A map only completes after the worker returns to its event loop, which a
+            // synchronous resolve cannot wait for: such reads come back empty in the browser.
+            static bool warned = false;
+            if (!warned)
+            {
+                warned = true;
+                std::fprintf(stderr, "[gpu] webgpu: a resolve needed a GPU readback, which the browser build does not do yet\n");
+            }
+            out.assign(size_t(size), 0);
+            (void)start;
+            (void)texture;
+            (void)aspect;
+            (void)x0;
+            (void)y0;
+            return;
+#endif
             if (size > readbackSize_)
             {
                 if (readback_)
@@ -2002,6 +2061,11 @@ fn to20e4(f: f32) -> u32 {
         // packed, endian-swapped), so CPU-side readers and later decodes see it.
         void WebGpuBackend::FlushToMemory(uint32_t base, ResolvedImage& image)
         {
+#ifdef __EMSCRIPTEN__
+            (void)base;
+            (void)image;
+            return; // needs a readback (see ReadTexture)
+#endif
             std::vector<uint8_t> data;
             uint32_t rowBytes = 0;
             ReadTexture(image.texture, WGPUTextureAspect_All, 8, 0, 0, int(image.width), int(image.height), data, rowBytes);
@@ -2076,13 +2140,21 @@ fn to20e4(f: f32) -> u32 {
             ResolvedImage* image = ResolvedFor(fetch);
             if (!image || disabled || surfaceFailed_)
                 return false;
+#if defined(_WIN32) || defined(__EMSCRIPTEN__)
 #ifdef _WIN32
             HWND hwnd = static_cast<HWND>(PresenterWindow());
+#endif
             if (!surface_)
             {
+#ifdef _WIN32
                 WGPUSurfaceSourceWindowsHWND source = WGPU_SURFACE_SOURCE_WINDOWS_HWND_INIT;
                 source.hinstance = GetModuleHandleW(nullptr);
                 source.hwnd = hwnd;
+#else
+                // The page canvas, transferred to this worker as an OffscreenCanvas.
+                WGPUEmscriptenSurfaceSourceCanvasHTMLSelector source = WGPU_EMSCRIPTEN_SURFACE_SOURCE_CANVAS_HTML_SELECTOR_INIT;
+                source.selector = Str("#screen");
+#endif
                 WGPUSurfaceDescriptor sd = WGPU_SURFACE_DESCRIPTOR_INIT;
                 sd.nextInChain = &source.chain;
                 surface_ = wgpuInstanceCreateSurface(instance_, &sd);
@@ -2164,9 +2236,13 @@ struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f, }
                 PresenterSetGpu(true);
             }
 
+#ifdef _WIN32
             RECT client{};
             GetClientRect(hwnd, &client);
             const uint32_t w = uint32_t(client.right - client.left), h = uint32_t(client.bottom - client.top);
+#else
+            const uint32_t w = 1280, h = 720; // the canvas backing store; CSS scales it
+#endif
             if (!w || !h)
                 return true; // minimised: nothing to show
             if (w != surfaceWidth_ || h != surfaceHeight_)
@@ -2223,7 +2299,9 @@ struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f, }
             wgpuRenderPassEncoderEnd(pass);
             wgpuRenderPassEncoderRelease(pass);
             Submit();
-            wgpuSurfacePresent(surface_);
+#ifndef __EMSCRIPTEN__
+            wgpuSurfacePresent(surface_); // the browser presents when this task ends
+#endif
             wgpuBindGroupRelease(bind);
             wgpuTextureViewRelease(target);
             wgpuTextureRelease(st.texture);
@@ -2236,6 +2314,9 @@ struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f, }
 
         bool WebGpuBackend::ReadFrontBuffer(const uint32_t fetch[6], std::vector<uint32_t>& bgra, uint32_t& width, uint32_t& height)
         {
+#ifdef __EMSCRIPTEN__
+            return false;
+#endif
             ResolvedImage* image = g_softKeepTexels ? nullptr : ResolvedFor(fetch);
             if (!image)
                 return false;
@@ -2336,6 +2417,22 @@ struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f, }
 
     CaptureSink* CreateWebGpuBackend()
     {
+#ifdef __EMSCRIPTEN__
+        // Asynchronous: draws stay in software until the device is ready.
+        auto* backend = new WebGpuBackend();
+        backend->onReady_ = [backend](bool ok) {
+            if (!ok)
+            {
+                std::fprintf(stderr, "[gpu] webgpu: initialisation failed, keeping the software renderer\n");
+                return;
+            }
+            std::fprintf(stderr, "[gpu] webgpu: ready\n");
+            g_backend = backend;
+            SoftSetCaptureSink(backend);
+        };
+        backend->Start();
+        return nullptr;
+#else
         auto backend = std::make_unique<WebGpuBackend>();
         if (!backend->Init())
         {
@@ -2344,6 +2441,7 @@ struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f, }
         }
         g_backend = backend.release();
         return g_backend;
+#endif
     }
 
     void WebGpuEndFrame()

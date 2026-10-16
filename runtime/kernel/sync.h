@@ -38,6 +38,7 @@ namespace guest
         const std::vector<std::shared_ptr<Waitable>>* objects = nullptr;
         bool waitAll = false;
         int satisfiedIndex = -1;
+        bool reported = false; // a long wait was logged
         std::condition_variable cv;
     };
 
@@ -61,6 +62,7 @@ namespace guest
     {
         bool manualReset = false;
         bool signaled = false;
+        uint32_t setter = 0; // thread whose set left it signalled (nobody was waiting)
         bool IsSignaled(uint32_t) override { return signaled; }
         void Acquire(uint32_t) override { if (!manualReset) signaled = false; }
     };

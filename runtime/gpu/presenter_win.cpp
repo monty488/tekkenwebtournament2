@@ -131,11 +131,70 @@ namespace gpu
     uint64_t PresentedToScreen() { return g_shown.load(); }
 }
 
+#elif defined(__EMSCRIPTEN__)
+
+#include <emscripten.h>
+
+#include <atomic>
+#include <vector>
+
+namespace gpu
+{
+    // Web, software renderer: frames go to the page's <canvas> through a 2D context on
+    // the main browser thread. The worker converts BGRA to RGBA into a buffer the main
+    // thread copies into an ImageData; while it is busy, newer frames are dropped.
+    static std::vector<uint8_t> g_rgba;
+    static int g_busy = 0; // set by the worker, cleared by the main thread
+    static std::atomic<uint64_t> g_shown{ 0 };
+
+    void Present(const uint32_t* bgra, uint32_t width, uint32_t height)
+    {
+        if (__atomic_load_n(&g_busy, __ATOMIC_ACQUIRE))
+            return;
+        const size_t count = size_t(width) * height;
+        g_rgba.resize(count * 4);
+        for (size_t i = 0; i < count; i++)
+        {
+            const uint32_t p = bgra[i];
+            g_rgba[i * 4 + 0] = uint8_t(p >> 16);
+            g_rgba[i * 4 + 1] = uint8_t(p >> 8);
+            g_rgba[i * 4 + 2] = uint8_t(p);
+            g_rgba[i * 4 + 3] = 255;
+        }
+        __atomic_store_n(&g_busy, 1, __ATOMIC_RELEASE);
+        ++g_shown;
+        MAIN_THREAD_ASYNC_EM_ASM({
+            const canvas = Module['canvas'];
+            // (No top-level commas in here: the preprocessor would split the macro argument.)
+            const ptr = Number($0);
+            const width = $1;
+            const height = $2;
+            const flag = Number($3);
+            // With WebGPU the canvas belongs to the command processor's worker.
+            if (canvas && !canvas.controlTransferredOffscreen) {
+                if (canvas.width != width || canvas.height != height) {
+                    canvas.width = width;
+                    canvas.height = height;
+                }
+                const ctx = Module.ttt2Context || (Module.ttt2Context = canvas.getContext('2d'));
+                const pixels = new Uint8ClampedArray(width * height * 4);
+                pixels.set(HEAPU8.subarray(ptr, ptr + width * height * 4));
+                ctx.putImageData(new ImageData(pixels, width, height), 0, 0);
+            }
+            Atomics.store(HEAP32, flag >> 2, 0);
+        }, g_rgba.data(), width, height, &g_busy);
+    }
+
+    uint64_t PresentedToScreen() { return g_shown.load(); }
+    void* PresenterWindow() { return nullptr; }
+    void PresenterSetGpu(bool) {}
+    void PresenterCountFrame() {}
+}
+
 #else
 
 namespace gpu
 {
-    // Web: presentation goes through the WebGPU canvas (not implemented yet).
     void Present(const uint32_t*, uint32_t, uint32_t) {}
     uint64_t PresentedToScreen() { return 0; }
     void* PresenterWindow() { return nullptr; }

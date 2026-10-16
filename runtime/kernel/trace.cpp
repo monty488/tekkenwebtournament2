@@ -35,6 +35,7 @@ namespace guest
     {
         std::atomic<const char*> lastImport{ "(none)" };
         std::atomic<uint64_t> lastLr{ 0 };
+        std::atomic<uint32_t> lastSp{ 0 }; // guest r1 at the last kernel call
         std::atomic<uint64_t> calls{ 0 };
 #ifdef _WIN32
         HANDLE handle = nullptr;
@@ -46,6 +47,26 @@ namespace guest
     static std::atomic<uint64_t> g_totalCalls{ 0 };
     static thread_local ThreadInfo* t_info = nullptr;
     static const bool g_trace = [] { const char* v = std::getenv("TTT2_TRACE"); return v && *v && *v != '0'; }();
+
+    // Guest call chain from a stack pointer: each frame's first word is the caller's stack
+    // pointer (back chain) and prologues save LR 8 bytes below the caller's frame. Racy
+    // (the thread keeps running) but enough to see where a thread loops or waits; works
+    // where host stack walks do not (the browser).
+    static void PrintGuestCallChain(uint32_t sp)
+    {
+        if (!sp)
+            return;
+        std::fprintf(stderr, "        guest:");
+        for (int depth = 0; depth < 16; depth++)
+        {
+            const uint32_t back = Load<uint32_t>(sp);
+            if (back <= sp || back - sp > 0x100000)
+                break;
+            std::fprintf(stderr, " %08X", Load<uint32_t>(back - 8));
+            sp = back;
+        }
+        std::fprintf(stderr, "\n");
+    }
 
     void RegisterGuestThread()
     {
@@ -85,6 +106,7 @@ namespace guest
             RegisterGuestThread();
         t_info->lastImport.store(name, std::memory_order_relaxed);
         t_info->lastLr.store(lr, std::memory_order_relaxed);
+        t_info->lastSp.store(ctx.r1.u32, std::memory_order_relaxed);
         t_info->calls.fetch_add(1, std::memory_order_relaxed);
         const uint32_t tid = CurrentThreadId();
         // TTT2_TRACE_RANGE=<lo>-<hi> (hex): trace only imports called from that code range.
@@ -187,6 +209,7 @@ namespace guest
                     {
                         std::fprintf(stderr, "    T%u: %llu calls, last %s (lr=%08llX)\n", tid,
                             (unsigned long long)info->calls.load(), info->lastImport.load(), (unsigned long long)info->lastLr.load());
+                        PrintGuestCallChain(info->lastSp.load());
 #ifdef _WIN32
                         if (info->handle)
                             DumpThreadStack(info->handle);
@@ -227,6 +250,7 @@ namespace guest
                             continue;
                         std::fprintf(stderr, "    T%u: %llu calls, last %s (lr=%08llX)\n", tid,
                             (unsigned long long)info->calls.load(), info->lastImport.load(), (unsigned long long)info->lastLr.load());
+                        PrintGuestCallChain(info->lastSp.load());
 #ifdef _WIN32
                         if (info->handle)
                             DumpThreadStack(info->handle);
