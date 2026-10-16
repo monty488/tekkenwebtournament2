@@ -13,6 +13,7 @@
 // public Xenos documentation in Xenia.
 
 #include "soft_gpu.h"
+#include "soft_internal.h"
 #include "texture.h"
 #include "../kernel/guest.h"
 
@@ -45,7 +46,6 @@ namespace gpu
         static_assert(sizeof(VertexFetchInstruction) == 12);
         static_assert(sizeof(TextureFetchInstruction) == 12);
 
-        using F4 = std::array<float, 4>;
 
         constexpr uint32_t kRegisterBase = 0x7FC80000;
         uint32_t Reg(uint32_t index) { return guest::Load<uint32_t>(kRegisterBase + index * 4); }
@@ -54,6 +54,7 @@ namespace gpu
         uint32_t PhysicalToGuest(uint32_t physical) { return 0xA0000000u + (physical & 0x1FFFFFFFu); }
 
         std::atomic<uint64_t> g_pixels{ 0 };
+        CaptureSink* g_sink = nullptr; // hardware backend, if any (see soft_internal.h)
 
         // Per-draw rejection counts for g_softLogDraw.
         struct DrawDebug { std::atomic<uint64_t> triangles, setups, inside, stencilFail, depthFail; } g_drawDebug;
@@ -302,8 +303,6 @@ namespace gpu
         // is kept as float4 per sample and depth as float, both addressed by tile so that
         // render targets placed at different bases alias the way they do on hardware.
 
-        constexpr uint32_t kEdramTiles = 2048;
-        constexpr uint32_t kTileSamples = 80 * 16;
 
         std::vector<F4> g_edramColor(size_t(kEdramTiles) * kTileSamples, F4{ 0, 0, 0, 0 });
         std::vector<float> g_edramDepth(size_t(kEdramTiles) * kTileSamples, 1.0f);
@@ -320,62 +319,9 @@ namespace gpu
             return format == 0 || format == 1 || format == 2 || format == 10;
         }
 
-        struct Surface
-        {
-            uint32_t baseTile = 0;
-            uint32_t pitch = 0;      // pixels
-            uint32_t scaleX = 1, scaleY = 1;
-            uint32_t tileWidth = 80;  // samples per tile row
-            uint32_t tilesPerRow = 1;
-            uint32_t format = 0;
-
-            void Init(uint32_t base, uint32_t surfaceInfo, uint32_t fmt, bool wide)
-            {
-                baseTile = base & 0xFFF;
-                pitch = surfaceInfo & 0x3FFF;
-                const uint32_t msaa = (surfaceInfo >> 16) & 3;
-                scaleY = msaa >= 1 ? 2 : 1;
-                scaleX = msaa >= 2 ? 2 : 1;
-                format = fmt;
-                tileWidth = wide ? 40 : 80;
-                tilesPerRow = std::max(1u, (pitch * scaleX + tileWidth - 1) / tileWidth);
-            }
-
-            size_t Index(uint32_t sx, uint32_t sy) const
-            {
-                // Constant divisors (the tile width is 80 or 40) avoid a hardware divide.
-                const uint32_t tx = tileWidth == 80 ? sx / 80 : sx / 40;
-                const uint32_t tile = (baseTile + (sy / 16) * tilesPerRow + tx) % kEdramTiles;
-                return size_t(tile) * kTileSamples + (sy % 16) * tileWidth + (sx - tx * tileWidth);
-            }
-
-            template <typename Fn>
-            void ForEachSample(uint32_t x, uint32_t y, Fn&& fn) const
-            {
-                // A pixel's samples (at most 2x2, starting on even coordinates) never straddle
-                // a tile, whose width and height are even: they sit side by side in one tile.
-                const size_t first = Index(x * scaleX, y * scaleY);
-                for (uint32_t j = 0; j < scaleY; j++)
-                    for (uint32_t i = 0; i < scaleX; i++)
-                        fn(first + j * tileWidth + i);
-            }
-        };
 
         // ---- Textures ------------------------------------------------------------
 
-        struct Texture
-        {
-            bool ok = false;
-            uint32_t width = 0, height = 0;
-            uint32_t clampX = 0, clampY = 0;
-            uint32_t magFilter = 0, minFilter = 0;
-            std::vector<F4> texels; // after the fetch constant's swizzle
-            // Source memory and its hash, to reuse the decode while the data is unchanged.
-            uint32_t base = 0, bytes = 0;
-            uint64_t hash = 0;
-            uint64_t verifiedFrame = 0;
-            bool stale = false; // a resolve overwrote the source: decode again on next use
-        };
 
         struct FetchKey
         {
@@ -642,6 +588,8 @@ namespace gpu
         void DecodeTexture(Texture& tex, const uint32_t fetch[6])
         {
             ScopedTimer timer{ g_stats.texture };
+            static std::atomic<uint64_t> versions{ 0 };
+            tex.version = ++versions;
             tex.ok = false;
             tex.stale = false;
             if ((fetch[0] & 3) != 2)
@@ -909,23 +857,6 @@ namespace gpu
 
         // An ALU instruction with its operands decoded and aL folded into the indices it
         // offsets, so executing it per pixel does no bitfield or control-flow work.
-        struct AluOp
-        {
-            struct Source
-            {
-                uint32_t index = 0;      // register (taken & 127) or constant (taken & 255)
-                bool isRegister = false;
-                bool relativeA0 = false; // constants: index += a0 when read
-                bool abs = false, negate = false;
-                uint8_t comp[4] = { 0, 1, 2, 3 };
-            };
-            AluInstruction a;
-            Source src[3];
-            // Scalar ops 42-47 take constant src3 .w-ish (scalarConstComp) and a GPR component.
-            bool scalarConst = false;
-            uint32_t scalarConstComp = 0, scalarGpr = 0, scalarGprComp = 0;
-            uint32_t vectorDest = 0, scalarDest = 0; // GPR destinations, aL applied
-        };
 
         AluOp DecodeAlu(const uint32_t* ins, int aL)
         {
@@ -1645,21 +1576,7 @@ namespace gpu
         // pixel. Programs whose flow depends on the predicate (predicated jumps, calls or
         // loop breaks) are not compiled and keep using the Interpreter.
 
-        struct CompiledOp
-        {
-            enum class Kind : uint8_t { Clause, Alu, VertexFetch, TextureFetch };
-            Kind kind = Kind::Clause;
-            int8_t clausePredicate = -1; // Clause: -1 always runs, else only where p0 == it
-            AluOp alu;
-            VertexFetchInstruction vertexFetch;
-            TextureFetchInstruction textureFetch;
-        };
 
-        struct CompiledShader
-        {
-            std::vector<CompiledOp> ops;
-            bool ok = false;
-        };
 
         // Mirrors Interpreter::Run with the per-invocation state that control flow can
         // depend on (aL) tracked statically.
@@ -2197,127 +2114,6 @@ namespace gpu
             const Vertex* v;
         };
 
-        struct RasterState
-        {
-            uint32_t mode = 0;
-            // viewport / transform
-            uint32_t vte = 0;
-            float scale[3] = { 1, 1, 1 }, offset[3] = { 0, 0, 0 };
-            float windowX = 0, windowY = 0;
-            bool windowOffset = false;
-            // PA_SU_SC_MODE_CNTL: face culling; front faces wind clockwise in window
-            // space (y down) when frontCW is set, counter-clockwise otherwise.
-            bool cullFront = false, cullBack = false, frontCW = false;
-            float pixelCenter = 0.0f;
-            bool clip = true;
-            // scissor (pixels, exclusive max)
-            int sx0 = 0, sy0 = 0, sx1 = 0, sy1 = 0;
-            // targets
-            Surface color[4];
-            uint32_t colorMask = 0;
-            uint32_t blend[4] = {};
-            F4 blendConstant{};
-            Surface depth;
-            bool depthTest = false, depthWrite = false;
-            // Stencil (RB_DEPTHCONTROL / RB_STENCILREFMASK[_BF]): [0] front, [1] back faces.
-            struct StencilFace { uint32_t func = 7, fail = 0, zpass = 0, zfail = 0, ref = 0, mask = 0xFF, writeMask = 0xFF; };
-            bool stencil = false;
-            StencilFace stencilFace[2];
-            uint32_t depthFunc = 7;
-            bool alphaTest = false;
-            uint32_t alphaFunc = 7;
-            float alphaRef = 0.0f;
-            // pixel shader inputs
-            uint32_t interpolatorMask = 0;
-            bool paramGen = false;
-            uint32_t paramGenRegister = 0;
-
-            void Load()
-            {
-                mode = Reg(0x2208) & 7;
-                vte = Reg(0x2206);
-                scale[0] = (vte & 0x01) ? RegF(0x210F) : 1.0f;
-                offset[0] = (vte & 0x02) ? RegF(0x2110) : 0.0f;
-                scale[1] = (vte & 0x04) ? RegF(0x2111) : 1.0f;
-                offset[1] = (vte & 0x08) ? RegF(0x2112) : 0.0f;
-                scale[2] = (vte & 0x10) ? RegF(0x2113) : 1.0f;
-                offset[2] = (vte & 0x20) ? RegF(0x2114) : 0.0f;
-
-                const uint32_t modeCntl = Reg(0x2205);
-                const uint32_t windowOffsetReg = Reg(0x2080);
-                windowOffset = (modeCntl >> 16) & 1;
-                cullFront = modeCntl & 1;
-                cullBack = (modeCntl >> 1) & 1;
-                frontCW = (modeCntl >> 2) & 1;
-                windowX = float(int32_t(windowOffsetReg << 17) >> 17);
-                windowY = float(int32_t((windowOffsetReg >> 16) << 17) >> 17);
-                pixelCenter = (Reg(0x2302) & 1) ? 0.5f : 0.0f;
-                clip = !((Reg(0x2204) >> 16) & 1);
-
-                const uint32_t tl = Reg(0x2081), br = Reg(0x2082);
-                sx0 = int(tl & 0x7FFF); sy0 = int((tl >> 16) & 0x7FFF);
-                sx1 = int(br & 0x7FFF); sy1 = int((br >> 16) & 0x7FFF);
-                if (!(tl >> 31))
-                {
-                    const int ox = int(windowX), oy = int(windowY);
-                    sx0 += ox; sx1 += ox; sy0 += oy; sy1 += oy;
-                }
-                const uint32_t stl = Reg(0x200E), sbr = Reg(0x200F);
-                sx0 = std::max(sx0, int(stl & 0x7FFF)); sy0 = std::max(sy0, int((stl >> 16) & 0x7FFF));
-                if (sbr)
-                {
-                    sx1 = std::min(sx1, int(sbr & 0x7FFF));
-                    sy1 = std::min(sy1, int((sbr >> 16) & 0x7FFF));
-                }
-                sx0 = std::max(sx0, 0); sy0 = std::max(sy0, 0);
-
-                const uint32_t surfaceInfo = Reg(0x2000);
-                static constexpr uint32_t kColorInfo[4] = { 0x2001, 0x2003, 0x2004, 0x2005 };
-                static constexpr uint32_t kBlend[4] = { 0x2201, 0x2209, 0x220A, 0x220B };
-                for (int i = 0; i < 4; i++)
-                {
-                    const uint32_t info = Reg(kColorInfo[i]);
-                    const uint32_t format = (info >> 16) & 0xF;
-                    color[i].Init(info & 0xFFF, surfaceInfo, format, Is64bppColor(format));
-                    blend[i] = Reg(kBlend[i]);
-                }
-                // Keep pixels inside the surface pitch.
-                sx1 = std::min(sx1, int(color[0].pitch ? color[0].pitch : 8192));
-                colorMask = Reg(0x2104);
-                blendConstant = { RegF(0x2105), RegF(0x2106), RegF(0x2107), RegF(0x2108) };
-
-                const uint32_t depthInfo = Reg(0x2002);
-                depth.Init(depthInfo & 0xFFF, surfaceInfo, 0, false);
-                const uint32_t depthControl = Reg(0x2200);
-                depthTest = (depthControl >> 1) & 1;
-                depthWrite = depthTest && ((depthControl >> 2) & 1);
-                depthFunc = (depthControl >> 4) & 7;
-                stencil = depthControl & 1;
-                const bool backfaceStencil = (depthControl >> 7) & 1;
-                for (int f = 0; f < 2; f++)
-                {
-                    StencilFace& sf = stencilFace[f];
-                    const uint32_t shift = (f == 1 && backfaceStencil) ? 12 : 0;
-                    sf.func = (depthControl >> (8 + shift)) & 7;
-                    sf.fail = (depthControl >> (11 + shift)) & 7;
-                    sf.zpass = (depthControl >> (14 + shift)) & 7;
-                    sf.zfail = (depthControl >> (17 + shift)) & 7;
-                    const uint32_t refMask = Reg((f == 1 && backfaceStencil) ? 0x210C : 0x210D);
-                    sf.ref = refMask & 0xFF;
-                    sf.mask = (refMask >> 8) & 0xFF;
-                    sf.writeMask = (refMask >> 16) & 0xFF;
-                }
-
-                const uint32_t colorControl = Reg(0x2202);
-                alphaTest = (colorControl >> 3) & 1;
-                alphaFunc = colorControl & 7;
-                alphaRef = RegF(0x210E);
-
-                const uint32_t programCntl = Reg(0x2180);
-                paramGen = (programCntl >> 18) & 1;
-                paramGenRegister = (Reg(0x2181) >> 8) & 0xFF;
-            }
-        };
 
         float BlendFactor(uint32_t factor, const F4& src, const F4& dst, const F4& constant, int c)
         {
@@ -2623,6 +2419,12 @@ namespace gpu
                 su.front = !cull || (area > 0.0f) == rs.frontCW;
                 if (cull && (su.front ? rs.cullFront : rs.cullBack))
                     return;
+                if (g_sink)
+                {
+                    g_sink->Triangle({ a.x, a.y, a.z, a.invW, a.v->interpolators }, { b.x, b.y, b.z, b.invW, b.v->interpolators },
+                        { c.x, c.y, c.z, c.invW, c.v->interpolators }, su.front);
+                    return;
+                }
                 if (area < 0.0f)
                 {
                     std::swap(su.v[1], su.v[2]);
@@ -3032,6 +2834,18 @@ namespace gpu
             }
             else if (command != 3 && destPitch && Reg(0x2319))
             {
+                // A hardware backend owns the render targets: read the rectangle back first.
+                std::vector<F4> sinkColor;
+                std::vector<float> sinkDepth;
+                std::vector<uint8_t> sinkStencil;
+                if (g_sink)
+                {
+                    if (source < 4)
+                        g_sink->ReadColor(rs, source, ex0, ey0, ex1, ey1, sinkColor);
+                    else
+                        g_sink->ReadDepth(rs, ex0, ey0, ex1, ey1, sinkDepth, sinkStencil);
+                }
+                const size_t sinkPitch = size_t(ex1 - ex0);
                 const uint32_t pitchAligned = (destPitch + 31) & ~31u;
                 const float scale = std::ldexp(1.0f, expBias);
                 const uint32_t log2 = bytes == 1 ? 0 : bytes == 2 ? 1 : bytes == 4 ? 2 : bytes == 8 ? 3 : 4;
@@ -3045,7 +2859,23 @@ namespace gpu
                         if (dx < 0 || uint32_t(dx) >= destPitch)
                             continue;
                         F4 c;
-                        if (source < 4)
+                        if (g_sink)
+                        {
+                            const size_t at = size_t(y - ey0) * sinkPitch + size_t(x - ex0);
+                            if (source < 4)
+                            {
+                                c = at < sinkColor.size() ? sinkColor[at] : F4{ 0, 0, 0, 0 };
+                                if (rs.color[source].format == 1)
+                                    for (int k = 0; k < 3; k++)
+                                        c[k] = LinearToPwlGamma(c[k]);
+                            }
+                            else
+                            {
+                                const float d = at < sinkDepth.size() ? sinkDepth[at] : 0.0f;
+                                c = { d, float(at < sinkStencil.size() ? sinkStencil[at] : 0), d, d };
+                            }
+                        }
+                        else if (source < 4)
                         {
                             const Surface& s = rs.color[source];
                             const uint32_t samples = s.scaleX * s.scaleY;
@@ -3111,20 +2941,26 @@ namespace gpu
                     c = { AsFloat(v), 0, 0, 0 };
                 else
                     c = { float(v & 0xFF) / 255.0f, float((v >> 8) & 0xFF) / 255.0f, float((v >> 16) & 0xFF) / 255.0f, float(v >> 24) / 255.0f };
-                parallelRows([&](int y) {
-                    for (int x = ex0; x < ex1; x++)
-                        s.ForEachSample(uint32_t(x), uint32_t(y), [&](size_t i) { g_edramColor[i] = c; });
-                });
+                if (g_sink)
+                    g_sink->ClearColor(rs, source, ex0, ey0, ex1, ey1, c);
+                else
+                    parallelRows([&](int y) {
+                        for (int x = ex0; x < ex1; x++)
+                            s.ForEachSample(uint32_t(x), uint32_t(y), [&](size_t i) { g_edramColor[i] = c; });
+                    });
             }
             if (depthClear)
             {
                 const uint32_t clear = Reg(0x231D);
                 const float d = (Reg(0x2002) >> 16) & 1 ? Float20e4To32(clear >> 8) : float(clear >> 8) / float(0xFFFFFF);
                 const uint8_t st = uint8_t(clear & 0xFF);
-                parallelRows([&](int y) {
-                    for (int x = ex0; x < ex1; x++)
-                        rs.depth.ForEachSample(uint32_t(x), uint32_t(y), [&](size_t i) { g_edramDepth[i] = d; g_edramStencil[i] = st; });
-                });
+                if (g_sink)
+                    g_sink->ClearDepth(rs, ex0, ey0, ex1, ey1, d, st);
+                else
+                    parallelRows([&](int y) {
+                        for (int x = ex0; x < ex1; x++)
+                            rs.depth.ForEachSample(uint32_t(x), uint32_t(y), [&](size_t i) { g_edramDepth[i] = d; g_edramStencil[i] = st; });
+                    });
             }
 
             // Textures sampled from the destination must be decoded again.
@@ -3176,6 +3012,94 @@ namespace gpu
     bool g_softLogVertices = false;
     bool g_softLogDraw = false;
     bool g_softDumpTextures = false;
+
+    void RasterState::Load()
+    {
+        mode = Reg(0x2208) & 7;
+        vte = Reg(0x2206);
+        scale[0] = (vte & 0x01) ? RegF(0x210F) : 1.0f;
+        offset[0] = (vte & 0x02) ? RegF(0x2110) : 0.0f;
+        scale[1] = (vte & 0x04) ? RegF(0x2111) : 1.0f;
+        offset[1] = (vte & 0x08) ? RegF(0x2112) : 0.0f;
+        scale[2] = (vte & 0x10) ? RegF(0x2113) : 1.0f;
+        offset[2] = (vte & 0x20) ? RegF(0x2114) : 0.0f;
+
+        const uint32_t modeCntl = Reg(0x2205);
+        const uint32_t windowOffsetReg = Reg(0x2080);
+        windowOffset = (modeCntl >> 16) & 1;
+        cullFront = modeCntl & 1;
+        cullBack = (modeCntl >> 1) & 1;
+        frontCW = (modeCntl >> 2) & 1;
+        windowX = float(int32_t(windowOffsetReg << 17) >> 17);
+        windowY = float(int32_t((windowOffsetReg >> 16) << 17) >> 17);
+        pixelCenter = (Reg(0x2302) & 1) ? 0.5f : 0.0f;
+        clip = !((Reg(0x2204) >> 16) & 1);
+
+        const uint32_t tl = Reg(0x2081), br = Reg(0x2082);
+        sx0 = int(tl & 0x7FFF); sy0 = int((tl >> 16) & 0x7FFF);
+        sx1 = int(br & 0x7FFF); sy1 = int((br >> 16) & 0x7FFF);
+        if (!(tl >> 31))
+        {
+            const int ox = int(windowX), oy = int(windowY);
+            sx0 += ox; sx1 += ox; sy0 += oy; sy1 += oy;
+        }
+        const uint32_t stl = Reg(0x200E), sbr = Reg(0x200F);
+        sx0 = std::max(sx0, int(stl & 0x7FFF)); sy0 = std::max(sy0, int((stl >> 16) & 0x7FFF));
+        if (sbr)
+        {
+            sx1 = std::min(sx1, int(sbr & 0x7FFF));
+            sy1 = std::min(sy1, int((sbr >> 16) & 0x7FFF));
+        }
+        sx0 = std::max(sx0, 0); sy0 = std::max(sy0, 0);
+
+        const uint32_t surfaceInfo = Reg(0x2000);
+        static constexpr uint32_t kColorInfo[4] = { 0x2001, 0x2003, 0x2004, 0x2005 };
+        static constexpr uint32_t kBlend[4] = { 0x2201, 0x2209, 0x220A, 0x220B };
+        for (int i = 0; i < 4; i++)
+        {
+            const uint32_t info = Reg(kColorInfo[i]);
+            const uint32_t format = (info >> 16) & 0xF;
+            color[i].Init(info & 0xFFF, surfaceInfo, format, Is64bppColor(format));
+            blend[i] = Reg(kBlend[i]);
+        }
+        // Keep pixels inside the surface pitch.
+        sx1 = std::min(sx1, int(color[0].pitch ? color[0].pitch : 8192));
+        colorMask = Reg(0x2104);
+        blendConstant = { RegF(0x2105), RegF(0x2106), RegF(0x2107), RegF(0x2108) };
+
+        const uint32_t depthInfo = Reg(0x2002);
+        depth.Init(depthInfo & 0xFFF, surfaceInfo, 0, false);
+        const uint32_t depthControl = Reg(0x2200);
+        depthTest = (depthControl >> 1) & 1;
+        depthWrite = depthTest && ((depthControl >> 2) & 1);
+        depthFunc = (depthControl >> 4) & 7;
+        stencil = depthControl & 1;
+        const bool backfaceStencil = (depthControl >> 7) & 1;
+        for (int f = 0; f < 2; f++)
+        {
+            StencilFace& sf = stencilFace[f];
+            const uint32_t shift = (f == 1 && backfaceStencil) ? 12 : 0;
+            sf.func = (depthControl >> (8 + shift)) & 7;
+            sf.fail = (depthControl >> (11 + shift)) & 7;
+            sf.zpass = (depthControl >> (14 + shift)) & 7;
+            sf.zfail = (depthControl >> (17 + shift)) & 7;
+            const uint32_t refMask = Reg((f == 1 && backfaceStencil) ? 0x210C : 0x210D);
+            sf.ref = refMask & 0xFF;
+            sf.mask = (refMask >> 8) & 0xFF;
+            sf.writeMask = (refMask >> 16) & 0xFF;
+        }
+
+        const uint32_t colorControl = Reg(0x2202);
+        alphaTest = (colorControl >> 3) & 1;
+        alphaFunc = colorControl & 7;
+        alphaRef = RegF(0x210E);
+
+        const uint32_t programCntl = Reg(0x2180);
+        paramGen = (programCntl >> 18) & 1;
+        paramGenRegister = (Reg(0x2181) >> 8) & 0xFF;
+    }
+
+    void SoftSetCaptureSink(CaptureSink* sink) { g_sink = sink; }
 
     void SoftParallelFor(uint32_t count, const std::function<void(uint32_t)>& fn)
     {
@@ -3327,7 +3251,24 @@ namespace gpu
         // TTT2_SOFT_INTERP=1 interprets every pixel (reference for the compiled path).
         static const bool interpretOnly = [] { const char* v = std::getenv("TTT2_SOFT_INTERP"); return v && *v == '1'; }();
         CompiledShader compiledPs;
-        if (rs.mode == 4 && renderer.ps.count && !interpretOnly)
+        if (g_sink && rs.mode != 6)
+        {
+            // The backend shades pixels: flatten the pixel shader's control flow for it.
+            if (rs.mode == 4 && renderer.ps.count)
+            {
+                compiledPs = CompileFlow(state, renderer.ps);
+                for (const CompiledOp& op : compiledPs.ops)
+                    if (op.kind == CompiledOp::Kind::VertexFetch)
+                        compiledPs.ok = false;
+            }
+            CaptureDraw capture;
+            capture.rs = &rs;
+            capture.ps = compiledPs.ok ? &compiledPs : nullptr;
+            capture.psConstants = &state.constants[256];
+            capture.texture = [](uint32_t slot) -> const Texture& { return state.TextureSlot(slot); };
+            g_sink->BeginDraw(capture);
+        }
+        else if (rs.mode == 4 && renderer.ps.count && !interpretOnly)
         {
             compiledPs = Compile(state, renderer.ps);
             if (compiledPs.ok)
@@ -3345,7 +3286,7 @@ namespace gpu
         }
 
         // ---- decode the pixel shader's textures before fanning out
-        if (rs.mode == 4)
+        if (rs.mode == 4 && !g_sink)
         {
             const uint32_t slots = TextureSlotsUsed(psCode.data(), uint32_t(psCode.size()));
             for (uint32_t slot = 0; slot < 32; slot++)
@@ -3418,6 +3359,11 @@ namespace gpu
                 renderer.Triangle(s3, s[order[1]], s[order[2]]);
             }
             break;
+        }
+        if (g_sink)
+        {
+            g_sink->EndDraw();
+            return;
         }
         renderer.Flush();
         g_pixels += renderer.pixels;

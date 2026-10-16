@@ -17,6 +17,8 @@ if (TTT2_HAVE_RECOMP)
         gpu/video.cpp
         gpu/texture.cpp
         gpu/soft_gpu.cpp
+        gpu/xenos_wgsl.cpp
+        gpu/webgpu_backend.cpp
         gpu/presenter_win.cpp
         apu/audio.cpp
         apu/xma.cpp
@@ -30,6 +32,19 @@ endif()
 
 if (WIN32)
     target_compile_definitions(ttt2 PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+endif()
+
+# WebGPU: wgpu-native natively (scripts/fetch-wgpu.ps1), emdawnwebgpu in the browser.
+if (TTT2_HAVE_RECOMP AND NOT EMSCRIPTEN)
+    set(WGPU_NATIVE_DIR ${CMAKE_SOURCE_DIR}/.tools/wgpu-native)
+    if (NOT EXISTS ${WGPU_NATIVE_DIR}/include/webgpu/webgpu.h)
+        message(FATAL_ERROR "wgpu-native not found in ${WGPU_NATIVE_DIR}: run scripts\fetch-wgpu.ps1")
+    endif()
+    target_include_directories(ttt2 PRIVATE ${WGPU_NATIVE_DIR}/include)
+    target_link_libraries(ttt2 PRIVATE ${WGPU_NATIVE_DIR}/lib/wgpu_native.dll.lib)
+    add_custom_command(TARGET ttt2 POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${WGPU_NATIVE_DIR}/lib/wgpu_native.dll $<TARGET_FILE_DIR:ttt2>
+    )
 endif()
 
 if (MSVC AND TTT2_HAVE_RECOMP)

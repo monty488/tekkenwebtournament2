@@ -17,6 +17,7 @@
 #include "video.h"
 #include "presenter.h"
 #include "soft_gpu.h"
+#include "webgpu_backend.h"
 #include "texture.h"
 #include "../kernel/guest.h"
 #include "../kernel/threads.h"
@@ -239,6 +240,7 @@ namespace gpu
             std::fprintf(stderr, "\n");
         }
         g_drawsThisFrame = 0;
+        WebGpuEndFrame();
         SoftEndFrame();
         if (g_gpuLog && (swaps <= 3 || (swaps & (swaps - 1)) == 0))
             std::fprintf(stderr, "[gpu]   soft renderer: %llu pixels, %llu resolves so far\n",
@@ -256,6 +258,7 @@ namespace gpu
             g_cpBusyNs = 0;
             g_presentNs = 0;
             SoftPrintStats();
+            WebGpuPrintStats();
         }
         struct PresentTimer
         {
@@ -300,6 +303,16 @@ namespace gpu
     {
         if (!g_softGpu)
             return;
+        // TTT2_GPU=webgpu: rasterise and shade pixels on the GPU (falls back to the
+        // software renderer if no WebGPU adapter is available).
+        static const bool backendChosen = [] {
+            const char* v = std::getenv("TTT2_GPU");
+            if (v && std::strcmp(v, "webgpu") == 0)
+                if (CaptureSink* sink = CreateWebGpuBackend())
+                    SoftSetCaptureSink(sink);
+            return true;
+        }();
+        (void)backendChosen;
         static std::vector<uint32_t> vsStorage, psStorage;
         DrawCall call;
         call.primitive = initiator & 0x3F;

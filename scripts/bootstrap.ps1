@@ -45,6 +45,7 @@ try {
     Invoke-Checked (Join-Path $emsdk 'emsdk.bat') @('activate', 'latest')
 } finally { Pop-Location }
 
+& "$PSScriptRoot\fetch-wgpu.ps1"
 & "$PSScriptRoot\apply-patches.ps1"
 
 Write-Host "`nDone. Open a NEW terminal so PATH changes apply, then run scripts\build-tools.ps1" -ForegroundColor Green
