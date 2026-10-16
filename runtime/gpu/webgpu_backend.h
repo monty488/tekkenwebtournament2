@@ -16,6 +16,10 @@ namespace gpu
     // Submits the frame's outstanding GPU work (called on every swap).
     void WebGpuEndFrame();
 
+    // The front buffer as BGRA if the backend holds it as a GPU-resolved image (guest
+    // memory then is stale). False: present from memory as usual.
+    bool WebGpuReadFrontBuffer(const uint32_t fetch[6], std::vector<uint32_t>& bgra, uint32_t& width, uint32_t& height);
+
     // Debug: per-frame timings and counters since the previous call.
     void WebGpuPrintStats();
 }

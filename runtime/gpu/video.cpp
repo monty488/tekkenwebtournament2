@@ -267,9 +267,10 @@ namespace gpu
         } presentTimer;
 
         // Show the front buffer the game just swapped to.
-        const TextureInfo info = DecodeTextureFetch(fetch.data());
+        TextureInfo info = DecodeTextureFetch(fetch.data());
         static std::vector<uint32_t> pixels;
-        if (info.width > 1 && info.width <= 4096 && info.height <= 4096 && ConvertToBgra(info, pixels, SoftParallelFor))
+        if (WebGpuReadFrontBuffer(fetch.data(), pixels, info.width, info.height) ||
+            (info.width > 1 && info.width <= 4096 && info.height <= 4096 && ConvertToBgra(info, pixels, SoftParallelFor)))
         {
             for (uint32_t& p : pixels)
                 p |= 0xFF000000u; // the window shows colour only

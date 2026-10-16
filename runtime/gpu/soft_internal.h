@@ -164,7 +164,24 @@ namespace gpu
         const RasterState* rs = nullptr;
         const CompiledShader* ps = nullptr; // control flow flattened for this draw (null: none)
         const F4* psConstants = nullptr;    // c256..c511
+        const uint32_t* fetch = nullptr;    // fetch constants (32 slots x 6 dwords)
         std::function<const Texture&(uint32_t slot)> texture;
+    };
+
+    // A resolve (EDRAM -> memory copy) as decoded from the RB_COPY_* registers.
+    struct ResolveRequest
+    {
+        const RasterState* rs = nullptr;
+        uint32_t source = 0;          // colour render target 0-3 (4 = depth)
+        uint32_t sampleSelect = 0;
+        int x0 = 0, y0 = 0, x1 = 0, y1 = 0; // EDRAM pixel rectangle
+        int offsetX = 0, offsetY = 0;       // destination = EDRAM position - offset
+        uint32_t destBase = 0;        // guest address
+        uint32_t destPitch = 0, destHeight = 0;
+        uint32_t destFormat = 0;      // texture format
+        uint32_t endian = 0;
+        int expBias = 0;
+        bool swapRB = false;
     };
 
     class CaptureSink
@@ -180,6 +197,10 @@ namespace gpu
         virtual void ReadDepth(const RasterState& rs, int x0, int y0, int x1, int y1, std::vector<float>& depth, std::vector<uint8_t>& stencil) = 0;
         virtual void ClearColor(const RasterState& rs, uint32_t rt, int x0, int y0, int x1, int y1, const F4& color) = 0;
         virtual void ClearDepth(const RasterState& rs, int x0, int y0, int x1, int y1, float depth, uint8_t stencil) = 0;
+        // Performs the copy without touching guest memory (the backend keeps the image and
+        // binds it where the game samples that address). False: use ReadColor/ReadDepth
+        // and write memory as usual.
+        virtual bool ResolveToGpu(const ResolveRequest&) { return false; }
     };
 
     void SoftSetCaptureSink(CaptureSink* sink);

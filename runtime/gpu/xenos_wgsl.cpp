@@ -60,6 +60,7 @@ namespace gpu
             bool depthExport = false;
             uint32_t textureSlots = 0;
             int indent = 1;
+            const WgslOptions* options = nullptr;
 
             void Line(const std::string& text)
             {
@@ -342,7 +343,23 @@ namespace gpu
                         uv += buf;
                     }
                     Line("let tv = textureSampleLevel(" + t + ", " + s + ", " + uv + ", 0.0);");
-                    DestSwizzle(f.dstRegister, f.dstSwizzle, "tv");
+                    const uint32_t swizzle = options ? options->slotSwizzle[slot] : 0x688u;
+                    if (swizzle != 0x688u)
+                    {
+                        std::string remap = "vec4f(";
+                        for (int i = 0; i < 4; i++)
+                        {
+                            const uint32_t sel = (swizzle >> (i * 3)) & 7;
+                            remap += sel < 4 ? std::string("tv.") + kComp[sel] : (sel == 5 ? "1.0" : "0.0");
+                            remap += i < 3 ? ", " : ")";
+                        }
+                        Line("let tvs = " + remap + ";");
+                        DestSwizzle(f.dstRegister, f.dstSwizzle, "tvs");
+                    }
+                    else
+                    {
+                        DestSwizzle(f.dstRegister, f.dstSwizzle, "tv");
+                    }
                 }
                 else if (f.opcode == FetchOpcode::GetTextureWeights || f.opcode == FetchOpcode::GetTextureComputedLod ||
                     f.opcode == FetchOpcode::GetTextureGradients || f.opcode == FetchOpcode::GetTextureBorderColorFrac)
@@ -378,6 +395,7 @@ struct DrawData {
     WgslShader TranslateToWgsl(const CompiledShader* ps, const WgslOptions& options)
     {
         Emitter e;
+        e.options = &options;
         if (ps)
         {
             for (size_t i = 0; i < ps->ops.size(); i++)

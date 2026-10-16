@@ -2823,6 +2823,26 @@ namespace gpu
 
             uint32_t probe[4];
             const uint32_t bytes = PackPixel(F4{ 0, 0, 0, 0 }, format, probe);
+
+            // A hardware backend may keep the copy on the GPU.
+            bool resolvedOnGpu = false;
+            if (g_sink && command != 3 && destPitch && Reg(0x2319) && bytes)
+            {
+                ResolveRequest request;
+                request.rs = &rs;
+                request.source = source;
+                request.sampleSelect = sampleSelect;
+                request.x0 = ex0; request.y0 = ey0; request.x1 = ex1; request.y1 = ey1;
+                request.offsetX = offsetX; request.offsetY = offsetY;
+                request.destBase = destBase;
+                request.destPitch = destPitch;
+                request.destHeight = destHeight;
+                request.destFormat = format;
+                request.endian = endian;
+                request.expBias = expBias;
+                request.swapRB = swapRB;
+                resolvedOnGpu = g_sink->ResolveToGpu(request);
+            }
             if (command != 3 && destPitch && Reg(0x2319) && !bytes)
             {
                 static bool warned[64];
@@ -2832,7 +2852,7 @@ namespace gpu
                     std::fprintf(stderr, "[gpu] soft: unsupported resolve format %u\n", format);
                 }
             }
-            else if (command != 3 && destPitch && Reg(0x2319))
+            else if (command != 3 && destPitch && Reg(0x2319) && !resolvedOnGpu)
             {
                 // A hardware backend owns the render targets: read the rectangle back first.
                 std::vector<F4> sinkColor;
@@ -3116,7 +3136,9 @@ namespace gpu
     void SoftEndFrame()
     {
         ++g_frame;
-        if (g_textureCache.size() > 256)
+        // Decoded texels are large (16 bytes each); a hardware backend drops them after
+        // uploading, leaving small entries whose hashes avoid re-decoding unchanged data.
+        if (g_textureCache.size() > (g_sink ? 4096u : 256u))
             g_textureCache.clear();
     }
 
@@ -3265,6 +3287,7 @@ namespace gpu
             capture.rs = &rs;
             capture.ps = compiledPs.ok ? &compiledPs : nullptr;
             capture.psConstants = &state.constants[256];
+            capture.fetch = state.fetch;
             capture.texture = [](uint32_t slot) -> const Texture& { return state.TextureSlot(slot); };
             g_sink->BeginDraw(capture);
         }

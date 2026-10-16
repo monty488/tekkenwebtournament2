@@ -22,6 +22,12 @@ namespace gpu
         uint32_t paramGenRegister = 0;
         uint32_t alphaFunc = 7;        // alpha test (7 = always passes)
         uint32_t colorTargets = 0;     // bit per bound render target (outputs @location(k))
+        // Fetch-constant swizzle to apply after sampling, per slot (3 bits per component:
+        // 0-3 = component, 4 = 0, 5 = 1). Identity (0x688) for textures decoded on the CPU,
+        // which already have it applied; GPU-resolved images need it here.
+        uint16_t slotSwizzle[32] = { 0x688, 0x688, 0x688, 0x688, 0x688, 0x688, 0x688, 0x688, 0x688, 0x688, 0x688,
+            0x688, 0x688, 0x688, 0x688, 0x688, 0x688, 0x688, 0x688, 0x688, 0x688, 0x688, 0x688, 0x688, 0x688, 0x688,
+            0x688, 0x688, 0x688, 0x688, 0x688, 0x688 };
     };
 
     struct WgslShader

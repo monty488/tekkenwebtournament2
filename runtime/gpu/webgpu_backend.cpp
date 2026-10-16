@@ -13,6 +13,8 @@
 
 #include "webgpu_backend.h"
 #include "xenos_wgsl.h"
+#include "texture.h"
+#include "../kernel/guest.h"
 
 #include <webgpu/webgpu.h>
 #ifndef __EMSCRIPTEN__
@@ -178,10 +180,33 @@ namespace gpu
             WGPUTextureFormat format = WGPUTextureFormat_Undefined;
         };
 
+        // A resolve kept on the GPU: the destination surface (dest pitch x height) for one
+        // guest address, plus exact-size copies for fetches that use a smaller extent.
+        struct ResolvedImage
+        {
+            WGPUTexture texture = nullptr;
+            WGPUTextureView view = nullptr;
+            uint32_t width = 0, height = 0;
+            uint32_t format = 0;          // destination texture format
+            uint32_t endian = 0;
+            uint64_t generation = 0;      // bumped by every resolve into it
+            uint64_t lastResolveFrame = 0;
+            struct Exact { uint64_t generation = 0; GpuTexture texture; };
+            std::map<std::pair<uint32_t, uint32_t>, Exact> exact;
+        };
+
+        // Texture formats a GPU resolve can produce, and the fetch formats that may sample them.
+        bool GpuResolvableFormat(uint32_t f) { return f == 2 || f == 4 || f == 6 || f == 7 || f == 10 || f == 25 || f == 26 || f == 31 || f == 32; }
+        bool SameTextureFormat(uint32_t a, uint32_t b)
+        {
+            auto family = [](uint32_t f) { return (f == 14 || f == 50) ? 6u : f; };
+            return family(a) == family(b);
+        }
+
         struct Stats
         {
             uint64_t draws = 0, triangles = 0, pipelinesCreated = 0, shadersCreated = 0, readbacks = 0, clears = 0,
-                     textureUploads = 0, submits = 0, readbackNs = 0, encodeNs = 0;
+                     textureUploads = 0, submits = 0, readbackNs = 0, encodeNs = 0, gpuResolves = 0, gpuResolveBinds = 0, flushes = 0;
         };
 
         class WebGpuBackend final : public CaptureSink
@@ -197,8 +222,11 @@ namespace gpu
             void ClearColor(const RasterState& rs, uint32_t rt, int x0, int y0, int x1, int y1, const F4& color) override;
             void ClearDepth(const RasterState& rs, int x0, int y0, int x1, int y1, float depth, uint8_t stencil) override;
 
+            bool ResolveToGpu(const ResolveRequest& request) override;
+
             void EndFrame();
             void PrintStats();
+            bool ReadFrontBuffer(const uint32_t fetch[6], std::vector<uint32_t>& bgra, uint32_t& width, uint32_t& height);
 
         private:
             // ---- device
@@ -232,6 +260,11 @@ namespace gpu
             WGPUBuffer readback_ = nullptr;
             uint64_t readbackSize_ = 0;
             WGPUShaderModule clearModule_ = nullptr;
+            WGPUShaderModule resolveModule_ = nullptr;
+            WGPUBindGroupLayout resolveSourceLayout_ = nullptr;
+            WGPURenderPipeline resolvePipeline_ = nullptr;
+            std::unordered_map<uint32_t, ResolvedImage> resolved_; // by guest address
+            uint64_t frame_ = 1;
 
             // ---- current draw
             const RasterState* rs_ = nullptr;
@@ -258,6 +291,10 @@ namespace gpu
             WGPUBindGroupLayout TextureLayout(uint32_t slots);
             WGPUPipelineLayout PipelineLayout(uint32_t slots);
             WGPUSampler Sampler(const Texture& tex);
+            WGPUSampler Sampler(uint32_t clampX, uint32_t clampY, bool linear);
+            ResolvedImage* ResolvedFor(const uint32_t* fetch);
+            WGPUTextureView ResolvedView(ResolvedImage& image, uint32_t width, uint32_t height);
+            void FlushToMemory(uint32_t base, ResolvedImage& image);
             const GpuTexture& Upload(const Texture& tex);
             void ReadTexture(WGPUTexture texture, WGPUTextureAspect aspect, uint32_t bytesPerPixel, int x0, int y0, int w, int h,
                 std::vector<uint8_t>& out, uint32_t& rowBytes);
@@ -404,6 +441,79 @@ struct DrawData { misc: vec4f, c: array<vec4f, 256>, }
 }
 @fragment fn fs() -> @location(0) vec4f { return D.misc; }
 )");
+
+            // Resolves: copy a render-target rectangle into a resolved image, applying what
+            // the copy unit does on the way to memory (gamma encode, exponent bias, red/blue
+            // swap, quantisation to the destination format).
+            WGPUBindGroupLayoutEntry src = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+            src.binding = 0;
+            src.visibility = WGPUShaderStage_Fragment;
+            src.texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
+            src.texture.viewDimension = WGPUTextureViewDimension_2D;
+            WGPUBindGroupLayoutDescriptor sld = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+            sld.entryCount = 1;
+            sld.entries = &src;
+            resolveSourceLayout_ = wgpuDeviceCreateBindGroupLayout(device_, &sld);
+            resolveModule_ = Module(R"(
+struct DrawData { misc: vec4f, c: array<vec4f, 256>, }
+@group(0) @binding(0) var<storage, read> D: DrawData;
+@group(1) @binding(0) var src: texture_2d<f32>;
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+    let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u)) * 2.0 - 1.0;
+    return vec4f(p, 0.0, 1.0);
+}
+fn pwl(x: f32) -> f32 {
+    let v = clamp(x, 0.0, 1.0);
+    if (v < 0.0625) { return v * 4.0; }
+    if (v < 0.125) { return v * 2.0 + 0.125; }
+    if (v < 0.5) { return v + 0.25; }
+    return v * 0.5 + 0.5;
+}
+fn quantise(v: f32, bits: f32) -> f32 {
+    if (bits <= 0.0) { return v; }
+    let m = exp2(bits) - 1.0;
+    return round(clamp(v, 0.0, 1.0) * m) / m;
+}
+@fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
+    let dims = vec2i(textureDimensions(src));
+    let at = clamp(vec2i(p.xy) + vec2i(i32(D.c[0].x), i32(D.c[0].y)), vec2i(0), dims - 1);
+    var v = textureLoad(src, at, 0);
+    if (D.c[0].z > 0.5) { v = vec4f(pwl(v.x), pwl(v.y), pwl(v.z), v.w); }
+    v = v * D.c[0].w;
+    if (D.c[1].x > 0.5) { v = v.zyxw; }
+    let bits = D.c[2];
+    v = vec4f(quantise(v.x, bits.x), quantise(v.y, bits.y), quantise(v.z, bits.z), quantise(v.w, bits.w));
+    // What a fetch of the destination format decodes into components 0-3.
+    let decodeAs = i32(D.c[1].y);
+    if (decodeAs == 1) { v = vec4f(v.x, v.x, v.x, 1.0); }      // k_8
+    else if (decodeAs == 2) { v = vec4f(v.xy, 0.0, 0.0); }    // k_8_8
+    else if (decodeAs == 3) { v = vec4f(v.xyz, 1.0); }        // k_5_6_5
+    return v;
+}
+)");
+            {
+                WGPUBindGroupLayout layouts[2] = { drawLayout_, resolveSourceLayout_ };
+                WGPUPipelineLayoutDescriptor pld = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+                pld.bindGroupLayoutCount = 2;
+                pld.bindGroupLayouts = layouts;
+                WGPUPipelineLayout layout = wgpuDeviceCreatePipelineLayout(device_, &pld);
+                WGPUColorTargetState target = WGPU_COLOR_TARGET_STATE_INIT;
+                target.format = WGPUTextureFormat_RGBA16Float;
+                WGPUFragmentState fs = WGPU_FRAGMENT_STATE_INIT;
+                fs.module = resolveModule_;
+                fs.entryPoint = Str("fs");
+                fs.targetCount = 1;
+                fs.targets = &target;
+                WGPURenderPipelineDescriptor pd = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+                pd.layout = layout;
+                pd.vertex.module = resolveModule_;
+                pd.vertex.entryPoint = Str("vs");
+                pd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+                pd.multisample.count = 1;
+                pd.multisample.mask = 0xFFFFFFFF;
+                pd.fragment = &fs;
+                resolvePipeline_ = wgpuDeviceCreateRenderPipeline(device_, &pd);
+            }
             return true;
         }
 
@@ -478,6 +588,15 @@ struct DrawData { misc: vec4f, c: array<vec4f, 256>, }
             return layout;
         }
 
+        WGPUSampler WebGpuBackend::Sampler(uint32_t clampX, uint32_t clampY, bool linear)
+        {
+            Texture t;
+            t.clampX = clampX;
+            t.clampY = clampY;
+            t.magFilter = linear ? 1 : 0;
+            return Sampler(t);
+        }
+
         WGPUSampler WebGpuBackend::Sampler(const Texture& tex)
         {
             auto address = [](uint32_t mode) {
@@ -501,11 +620,14 @@ struct DrawData { misc: vec4f, c: array<vec4f, 256>, }
 
         const GpuTexture& WebGpuBackend::Upload(const Texture& tex)
         {
-            if (!tex.ok || !tex.width || !tex.height || tex.texels.size() < size_t(tex.width) * tex.height)
+            if (!tex.ok || !tex.width || !tex.height)
+                return dummy_;
+            auto cached = textures_.find(&tex);
+            if (cached != textures_.end() && cached->second.texture && cached->second.version == tex.version)
+                return cached->second;
+            if (tex.texels.size() < size_t(tex.width) * tex.height)
                 return dummy_;
             GpuTexture& g = textures_[&tex];
-            if (g.texture && g.version == tex.version)
-                return g;
 
             // Texels within [0, 1] (most textures) upload as rgba8; others keep half floats.
             const size_t count = size_t(tex.width) * tex.height;
@@ -567,6 +689,9 @@ struct DrawData { misc: vec4f, c: array<vec4f, 256>, }
             const WGPUExtent3D size = { tex.width, tex.height, 1 };
             wgpuQueueWriteTexture(queue_, &dst, staging.data(), staging.size(), &layout, &size);
             ++stats_.textureUploads;
+            // The GPU copy is what gets sampled from now on; the software cache keeps the
+            // entry (its hash detects changes) without the float texels.
+            std::vector<F4>().swap(const_cast<Texture&>(tex).texels);
             return g;
         }
 
@@ -746,6 +871,11 @@ struct DrawData { misc: vec4f, c: array<vec4f, 256>, }
                     std::fprintf(stderr, "[gpu] webgpu: pixel shader with predicate-driven flow not translated (colour skipped)\n");
                 }
             }
+            // Slots whose texture is a GPU-resolved image: bound directly, swizzled in the shader.
+            ResolvedImage* gpuSlot[32] = {};
+            for (uint32_t slot = 0; slot < 32 && draw.fetch; slot++)
+                if ((gpuSlot[slot] = ResolvedFor(draw.fetch + slot * 6)))
+                    options.slotSwizzle[slot] = uint16_t((draw.fetch[slot * 6 + 3] >> 1) & 0xFFF);
             const bool hasFragment = rs.mode == 4 && options.colorTargets && draw.ps;
             const WgslShader shader = TranslateToWgsl(hasFragment ? draw.ps : nullptr, options);
             const WGPUShaderModule module = Module(shader.code);
@@ -908,15 +1038,24 @@ struct DrawData { misc: vec4f, c: array<vec4f, 256>, }
             {
                 if (!(slots & (1u << slot)))
                     continue;
-                const Texture& tex = draw.texture(slot);
-                const GpuTexture& g = Upload(tex);
                 WGPUBindGroupEntry t = WGPU_BIND_GROUP_ENTRY_INIT;
                 t.binding = slot * 2;
-                t.textureView = g.view;
-                entries.push_back(t);
                 WGPUBindGroupEntry s = WGPU_BIND_GROUP_ENTRY_INIT;
                 s.binding = slot * 2 + 1;
-                s.sampler = Sampler(tex);
+                if (gpuSlot[slot])
+                {
+                    const uint32_t* f = draw.fetch + slot * 6;
+                    t.textureView = ResolvedView(*gpuSlot[slot], (f[2] & 0x1FFF) + 1, ((f[2] >> 13) & 0x1FFF) + 1);
+                    s.sampler = Sampler((f[0] >> 10) & 7, (f[0] >> 13) & 7, ((f[3] >> 19) & 3) == 1);
+                    ++stats_.gpuResolveBinds;
+                }
+                else
+                {
+                    const Texture& tex = draw.texture(slot);
+                    t.textureView = Upload(tex).view;
+                    s.sampler = Sampler(tex);
+                }
+                entries.push_back(t);
                 entries.push_back(s);
             }
             WGPUBindGroupDescriptor bgd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
@@ -1210,13 +1349,277 @@ struct DrawData { misc: vec4f, c: array<vec4f, 256>, }
                     ClearRect(rt.get(), x0, y0, x1, y1, F4{ 0, 0, 0, 0 }, depth, stencil);
         }
 
+        bool WebGpuBackend::ResolveToGpu(const ResolveRequest& r)
+        {
+            static const bool disabled = [] { const char* v = std::getenv("TTT2_GPU_CPU_RESOLVE"); return v && *v == '1'; }();
+            if (disabled || r.source >= 4 || !GpuResolvableFormat(r.destFormat))
+                return false;
+            const RasterState& rs = *r.rs;
+            const Surface& surface = rs.color[r.source];
+            RenderTarget* rt = Target(false, surface, ColorFormat(surface.format));
+            if (!rt)
+                return false;
+            const uint32_t width = r.destPitch;
+            const uint32_t height = r.destHeight ? r.destHeight : uint32_t(std::max(0, r.y1 - r.offsetY));
+            if (!width || !height || width > 8192 || height > 8192)
+                return false;
+
+            ResolvedImage& image = resolved_[r.destBase];
+            if (!image.texture || image.width != width || image.height != height)
+            {
+                if (image.view)
+                    wgpuTextureViewRelease(image.view);
+                if (image.texture)
+                    wgpuTextureRelease(image.texture);
+                for (auto& [size, e] : image.exact)
+                {
+                    wgpuTextureViewRelease(e.texture.view);
+                    wgpuTextureRelease(e.texture.texture);
+                }
+                image.exact.clear();
+                WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
+                td.label = Str("resolved image");
+                td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopySrc | WGPUTextureUsage_CopyDst;
+                td.size = { width, height, 1 };
+                td.format = WGPUTextureFormat_RGBA16Float;
+                image.texture = wgpuDeviceCreateTexture(device_, &td);
+                image.view = wgpuTextureCreateView(image.texture, nullptr);
+                image.width = width;
+                image.height = height;
+            }
+            image.format = r.destFormat;
+            image.endian = r.endian;
+            ++image.generation;
+            image.lastResolveFrame = frame_;
+
+            const int dx0 = std::clamp(r.x0 - r.offsetX, 0, int(width)), dy0 = std::clamp(r.y0 - r.offsetY, 0, int(height));
+            const int dx1 = std::clamp(r.x1 - r.offsetX, dx0, int(width)), dy1 = std::clamp(r.y1 - r.offsetY, dy0, int(height));
+            if (dx1 <= dx0 || dy1 <= dy0)
+                return true;
+
+            // Per-channel bits and the component layout a fetch of this format decodes.
+            F4 bits{ 0, 0, 0, 0 };
+            float layout = 0.0f;
+            switch (r.destFormat)
+            {
+            case 2: bits = { 8, 0, 0, 0 }; layout = 1.0f; break;
+            case 4: bits = { 5, 6, 5, 0 }; layout = 3.0f; break;
+            case 6: bits = { 8, 8, 8, 8 }; break;
+            case 7: bits = { 10, 10, 10, 2 }; break;
+            case 10: bits = { 8, 8, 0, 0 }; layout = 2.0f; break;
+            case 25: case 26: bits = { 16, 16, 16, 16 }; break;
+            default: break; // half floats: the image format rounds them
+            }
+            const F4 constants[3] = {
+                F4{ float(r.offsetX), float(r.offsetY), surface.format == 1 ? 1.0f : 0.0f, std::ldexp(1.0f, r.expBias) },
+                F4{ r.swapRB ? 1.0f : 0.0f, layout, 0, 0 },
+                bits,
+            };
+            const float misc[4] = {};
+            const uint32_t offset = WriteDrawData(misc, constants, 3);
+
+            EndPass();
+            EnsureEncoder();
+            WGPURenderPassColorAttachment attachment = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+            attachment.view = image.view;
+            attachment.loadOp = WGPULoadOp_Load;
+            attachment.storeOp = WGPUStoreOp_Store;
+            WGPURenderPassDescriptor pd = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+            pd.colorAttachmentCount = 1;
+            pd.colorAttachments = &attachment;
+            WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(encoder_, &pd);
+            WGPUBindGroupEntry e = WGPU_BIND_GROUP_ENTRY_INIT;
+            e.binding = 0;
+            e.textureView = rt->view;
+            WGPUBindGroupDescriptor bgd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+            bgd.layout = resolveSourceLayout_;
+            bgd.entryCount = 1;
+            bgd.entries = &e;
+            WGPUBindGroup source = wgpuDeviceCreateBindGroup(device_, &bgd);
+            wgpuRenderPassEncoderSetPipeline(pass, resolvePipeline_);
+            wgpuRenderPassEncoderSetBindGroup(pass, 0, drawBindGroup_, 1, &offset);
+            wgpuRenderPassEncoderSetBindGroup(pass, 1, source, 0, nullptr);
+            wgpuRenderPassEncoderSetScissorRect(pass, uint32_t(dx0), uint32_t(dy0), uint32_t(dx1 - dx0), uint32_t(dy1 - dy0));
+            wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
+            wgpuRenderPassEncoderEnd(pass);
+            wgpuRenderPassEncoderRelease(pass);
+            wgpuBindGroupRelease(source);
+            ++stats_.gpuResolves;
+            return true;
+        }
+
+        ResolvedImage* WebGpuBackend::ResolvedFor(const uint32_t* fetch)
+        {
+            if ((fetch[0] & 3) != 2 || resolved_.empty())
+                return nullptr;
+            const uint32_t base = 0xA0000000u + ((fetch[1] & ~0xFFFu) & 0x1FFFFFFF);
+            auto it = resolved_.find(base);
+            if (it == resolved_.end() || !SameTextureFormat(fetch[1] & 0x3F, it->second.format))
+                return nullptr;
+            return &it->second;
+        }
+
+        WGPUTextureView WebGpuBackend::ResolvedView(ResolvedImage& image, uint32_t width, uint32_t height)
+        {
+            if (width == image.width && height == image.height)
+                return image.view;
+            // The fetch covers part of the destination: keep an exact-size copy so that
+            // normalised coordinates and wrapping match the texture the game describes.
+            auto& e = image.exact[{ width, height }];
+            if (!e.texture.texture)
+            {
+                WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
+                td.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
+                td.size = { width, height, 1 };
+                td.format = WGPUTextureFormat_RGBA16Float;
+                e.texture.texture = wgpuDeviceCreateTexture(device_, &td);
+                e.texture.view = wgpuTextureCreateView(e.texture.texture, nullptr);
+            }
+            if (e.generation != image.generation)
+            {
+                EndPass();
+                EnsureEncoder();
+                WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+                src.texture = image.texture;
+                WGPUTexelCopyTextureInfo dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+                dst.texture = e.texture.texture;
+                const WGPUExtent3D extent = { std::min(width, image.width), std::min(height, image.height), 1 };
+                wgpuCommandEncoderCopyTextureToTexture(encoder_, &src, &dst, &extent);
+                e.generation = image.generation;
+            }
+            return e.texture.view;
+        }
+
+        // Writes a resolved image to guest memory the way the copy unit would have (tiled,
+        // packed, endian-swapped), so CPU-side readers and later decodes see it.
+        void WebGpuBackend::FlushToMemory(uint32_t base, ResolvedImage& image)
+        {
+            std::vector<uint8_t> data;
+            uint32_t rowBytes = 0;
+            ReadTexture(image.texture, WGPUTextureAspect_All, 8, 0, 0, int(image.width), int(image.height), data, rowBytes);
+            const uint32_t bpp = image.format == 2 ? 1 : (image.format == 4 || image.format == 10) ? 2 : (image.format == 26 || image.format == 32) ? 8 : 4;
+            const uint32_t log2 = bpp == 1 ? 0 : bpp == 2 ? 1 : bpp == 4 ? 2 : 3;
+            const uint32_t pitch = (image.width + 31) & ~31u;
+            auto unorm = [](float v, uint32_t b) { return uint32_t(std::lround(std::clamp(v, 0.0f, 1.0f) * float((1u << b) - 1))); };
+            for (uint32_t y = 0; y < image.height; y++)
+                for (uint32_t x = 0; x < image.width; x++)
+                {
+                    float c[4];
+                    for (int k = 0; k < 4; k++)
+                    {
+                        uint16_t h;
+                        std::memcpy(&h, data.data() + size_t(y) * rowBytes + size_t(x) * 8 + k * 2, 2);
+                        c[k] = HalfToFloat(h);
+                    }
+                    uint32_t w[2] = {};
+                    switch (image.format)
+                    {
+                    case 2: w[0] = unorm(c[0], 8); break;
+                    case 4: w[0] = (unorm(c[0], 5) << 11) | (unorm(c[1], 6) << 5) | unorm(c[2], 5); break;
+                    case 6: w[0] = unorm(c[0], 8) | (unorm(c[1], 8) << 8) | (unorm(c[2], 8) << 16) | (unorm(c[3], 8) << 24); break;
+                    case 7: w[0] = unorm(c[0], 10) | (unorm(c[1], 10) << 10) | (unorm(c[2], 10) << 20) | (unorm(c[3], 2) << 30); break;
+                    case 10: w[0] = unorm(c[0], 8) | (unorm(c[1], 8) << 8); break;
+                    case 25: w[0] = unorm(c[0], 16) | (unorm(c[1], 16) << 16); break;
+                    case 26: w[0] = unorm(c[0], 16) | (unorm(c[1], 16) << 16); w[1] = unorm(c[2], 16) | (unorm(c[3], 16) << 16); break;
+                    case 31: w[0] = FloatToHalf(c[0]) | (uint32_t(FloatToHalf(c[1])) << 16); break;
+                    case 32: w[0] = FloatToHalf(c[0]) | (uint32_t(FloatToHalf(c[1])) << 16); w[1] = FloatToHalf(c[2]) | (uint32_t(FloatToHalf(c[3])) << 16); break;
+                    default: break;
+                    }
+                    const uint32_t address = base + TiledOffset2D(x, y, pitch, log2);
+                    auto swap32 = [&](uint32_t v) {
+                        switch (image.endian & 3)
+                        {
+                        case 1: return ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
+                        case 2: return (v >> 24) | ((v >> 8) & 0xFF00u) | ((v << 8) & 0xFF0000u) | (v << 24);
+                        case 3: return (v << 16) | (v >> 16);
+                        default: return v;
+                        }
+                    };
+                    if (bpp >= 4)
+                    {
+                        for (uint32_t i = 0; i < bpp / 4; i++)
+                            *guest::ToHost<uint32_t>(address + i * 4) = swap32(w[i]);
+                    }
+                    else if (bpp == 2)
+                    {
+                        uint16_t v = uint16_t(w[0]);
+                        uint32_t at = address;
+                        if (image.endian == 1 || image.endian == 2)
+                            v = uint16_t((v >> 8) | (v << 8));
+                        if (image.endian == 2 || image.endian == 3)
+                            at ^= 2;
+                        *guest::ToHost<uint16_t>(at) = v;
+                    }
+                    else
+                    {
+                        uint32_t at = address;
+                        if (image.endian == 1) at ^= 1;
+                        else if (image.endian == 2) at ^= 3;
+                        else if (image.endian == 3) at ^= 2;
+                        *guest::ToHost<uint8_t>(at) = uint8_t(w[0]);
+                    }
+                }
+            ++stats_.flushes;
+        }
+
+        bool WebGpuBackend::ReadFrontBuffer(const uint32_t fetch[6], std::vector<uint32_t>& bgra, uint32_t& width, uint32_t& height)
+        {
+            ResolvedImage* image = ResolvedFor(fetch);
+            if (!image)
+                return false;
+            width = (fetch[2] & 0x1FFF) + 1;
+            height = ((fetch[2] >> 13) & 0x1FFF) + 1;
+            const int w = int(std::min(width, image->width)), h = int(std::min(height, image->height));
+            std::vector<uint8_t> data;
+            uint32_t rowBytes = 0;
+            ReadTexture(image->texture, WGPUTextureAspect_All, 8, 0, 0, w, h, data, rowBytes);
+            bgra.assign(size_t(width) * height, 0xFF000000u);
+            // As ConvertToBgra presents 8_8_8_8: component k in byte k.
+            SoftParallelFor(uint32_t(h), [&](uint32_t y) {
+                const uint8_t* line = data.data() + size_t(y) * rowBytes;
+                for (int x = 0; x < w; x++)
+                {
+                    uint32_t p = 0xFF000000u;
+                    for (int k = 0; k < 3; k++)
+                    {
+                        uint16_t hb;
+                        std::memcpy(&hb, line + size_t(x) * 8 + k * 2, 2);
+                        p |= uint32_t(std::lround(std::clamp(HalfToFloat(hb), 0.0f, 1.0f) * 255.0f)) << (8 * k);
+                    }
+                    bgra[size_t(y) * width + x] = p;
+                }
+            });
+            return true;
+        }
+
         void WebGpuBackend::EndFrame()
         {
+            // Images the game stopped resolving into may be read from memory later (or the
+            // memory reused): write them back and forget them.
+            for (auto it = resolved_.begin(); it != resolved_.end();)
+            {
+                if (frame_ - it->second.lastResolveFrame > 4)
+                {
+                    FlushToMemory(it->first, it->second);
+                    ResolvedImage& image = it->second;
+                    for (auto& [size, e] : image.exact)
+                    {
+                        wgpuTextureViewRelease(e.texture.view);
+                        wgpuTextureRelease(e.texture.texture);
+                    }
+                    wgpuTextureViewRelease(image.view);
+                    wgpuTextureRelease(image.texture);
+                    it = resolved_.erase(it);
+                }
+                else
+                    ++it;
+            }
+            ++frame_;
             Submit();
 #ifndef __EMSCRIPTEN__
             wgpuDevicePoll(device_, false, nullptr);
 #endif
-            if (textures_.size() > 512)
+            if (textures_.size() > 4096)
             {
                 for (auto& [tex, g] : textures_)
                 {
@@ -1234,6 +1637,8 @@ struct DrawData { misc: vec4f, c: array<vec4f, 256>, }
                 (unsigned long long)stats_.draws, (unsigned long long)stats_.triangles, (unsigned long long)stats_.clears,
                 (unsigned long long)stats_.readbacks, stats_.readbackNs / 1e6, stats_.encodeNs / 1e6, (unsigned long long)stats_.textureUploads,
                 (unsigned long long)stats_.submits, (unsigned long long)stats_.pipelinesCreated, (unsigned long long)stats_.shadersCreated);
+            std::fprintf(stderr, "[gpu]   webgpu: %llu GPU resolves, %llu resolved-image binds, %llu flushed to memory\n",
+                (unsigned long long)stats_.gpuResolves, (unsigned long long)stats_.gpuResolveBinds, (unsigned long long)stats_.flushes);
             stats_ = {};
         }
     }
@@ -1254,6 +1659,11 @@ struct DrawData { misc: vec4f, c: array<vec4f, 256>, }
     {
         if (g_backend)
             g_backend->EndFrame();
+    }
+
+    bool WebGpuReadFrontBuffer(const uint32_t fetch[6], std::vector<uint32_t>& bgra, uint32_t& width, uint32_t& height)
+    {
+        return g_backend && g_backend->ReadFrontBuffer(fetch, bgra, width, height);
     }
 
     void WebGpuPrintStats()
