@@ -39,8 +39,12 @@ Rough milestones, in order. Each depends on the previous one.
 - [x] NT wait semantics: FIFO waiter queues with direct hand-off; thread self-suspend;
       ExTerminateThread; non-trapping integer divides; fall-through across split functions
 - [ ] Some worker threads wait >2 s on locks the main thread holds: check for a leak
-- [ ] Remaining memory, I/O and XAM calls from the stub log (~208 still stubbed)
-- [ ] Content/save APIs (XContent*), profile/sign-in (currently: nobody signed in)
+- [x] XAM system UI, enumerators and content calls complete their XOVERLAPPED requests
+      (message boxes, device selector, achievement/content enumerators, content
+      create/close/delete; `runtime/kernel/xam_ui.cpp`)
+- [ ] Remaining memory, I/O and XAM calls from the stub log (145 still stubbed)
+- [ ] Save data backed by host files (content creation is rejected cleanly for now; with
+      nobody signed in the game does not save), profiles/sign-in (currently: nobody)
 
 ## M3: Pictures
 - [x] Decode draw/state PM4 packets: register, constant, fetch and shader state reach a
@@ -64,7 +68,11 @@ Rough milestones, in order. Each depends on the previous one.
       timer or credit mode; not yet explained)
 - [x] The game stops submitting frames after a timing-dependent point: fixed in the
       kernel HLE (audio callback argument, wakeup storms, critical sections)
-- [ ] Menus are not reachable yet: pressing Start during the movie or at the title hangs
+- [x] Menus and fights are reachable natively: title -> "not signed in" dialog -> main
+      menu; Offline > Arcade reaches the VS screen and a Stage 1 fight (HUD, timer, 3D
+      stage); Fight Lab loads a Combot match. Unattended:
+      `TTT2_AUTOPRESS=start,start,start,none,a,none,none,a,none,a,none,a,... TTT2_AUTOPRESS_DELAY=40000`
+- [ ] Fights run at roughly 15-30 fps on the software renderer
       the main thread in the sound-player teardown (XAudio2 voices never drain; XMA is
       unimplemented, see M4). The movie also freezes or ends early for the same reason
 - [ ] The attract-mode fight crashes on an indirect call to 824B0DA4, which is not a

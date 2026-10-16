@@ -7,6 +7,7 @@ if (TTT2_HAVE_RECOMP)
         kernel/sync.cpp
         kernel/xconfig.cpp
         kernel/xam.cpp
+        kernel/xam_ui.cpp
         kernel/dpc.cpp
         kernel/objects.cpp
         kernel/threads.cpp

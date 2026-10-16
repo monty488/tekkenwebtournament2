@@ -117,6 +117,11 @@ namespace
     }
 }
 
+namespace guest
+{
+    void BroadcastNotification(uint32_t id, uint32_t param) { Broadcast(id, param); }
+}
+
 // u32 XamNotifyCreateListener(u64 areaMask, u32 maxVersion): returns a handle, 0 on failure.
 GUEST_IMPORT(XamNotifyCreateListener)
 {

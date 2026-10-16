@@ -37,7 +37,7 @@ namespace hid
         bool connected = false;
     };
 
-    // Testing aid: TTT2_AUTOPRESS=start|a|b taps that button for 150 ms every 2 s on player 1.
+    // Testing aid: TTT2_AUTOPRESS=start|back|a|b|x|y|up|down|left|right taps that button for 150 ms every 2 s on player 1.
     // A comma-separated list (e.g. start,start,a) names the button for each press in turn
     // ("none" skips one); the last entry repeats.
     static uint16_t AutoPressButtons()
@@ -49,8 +49,15 @@ namespace hid
                 const char* end = std::strchr(p, ',');
                 const std::string name(p, end ? size_t(end - p) : std::strlen(p));
                 list.push_back(name == "start" ? XAMINPUT_GAMEPAD_START
+                    : name == "back"           ? XAMINPUT_GAMEPAD_BACK
                     : name == "a"              ? XAMINPUT_GAMEPAD_A
                     : name == "b"              ? XAMINPUT_GAMEPAD_B
+                    : name == "x"              ? XAMINPUT_GAMEPAD_X
+                    : name == "y"              ? XAMINPUT_GAMEPAD_Y
+                    : name == "up"             ? XAMINPUT_GAMEPAD_DPAD_UP
+                    : name == "down"           ? XAMINPUT_GAMEPAD_DPAD_DOWN
+                    : name == "left"           ? XAMINPUT_GAMEPAD_DPAD_LEFT
+                    : name == "right"          ? XAMINPUT_GAMEPAD_DPAD_RIGHT
                                                : 0);
                 p = end ? end + 1 : nullptr;
             }
