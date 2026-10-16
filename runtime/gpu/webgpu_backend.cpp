@@ -96,6 +96,56 @@ namespace gpu
             return h;
         }
 
+        // Cheap identity of a flattened shader: its instructions as decoded for this draw.
+        uint64_t Mix(uint64_t h, uint64_t v)
+        {
+            h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+            return h * 0xFF51AFD7ED558CCDull;
+        }
+
+        uint64_t HashShader(const CompiledShader* cs, uint64_t h)
+        {
+            if (!cs)
+                return Mix(h, 0x5A5A);
+            h = Mix(h, cs->ops.size());
+            for (const CompiledOp& op : cs->ops)
+            {
+                h = Mix(h, uint64_t(op.kind) | (uint64_t(uint8_t(op.clausePredicate)) << 8));
+                uint32_t raw[3] = {};
+                switch (op.kind)
+                {
+                case CompiledOp::Kind::Alu:
+                {
+                    std::memcpy(raw, &op.alu.a, 12);
+                    h = Mix(h, raw[0] | (uint64_t(raw[1]) << 32));
+                    h = Mix(h, raw[2] | (uint64_t(op.alu.vectorDest) << 32));
+                    h = Mix(h, op.alu.scalarDest | (uint64_t(op.alu.scalarGpr) << 16) | (uint64_t(op.alu.scalarGprComp) << 24) |
+                        (uint64_t(op.alu.scalarConstComp) << 32) | (uint64_t(op.alu.scalarConst) << 40));
+                    for (const AluOp::Source& src : op.alu.src)
+                    {
+                        uint32_t comps;
+                        std::memcpy(&comps, src.comp, 4);
+                        h = Mix(h, uint64_t(src.index) | (uint64_t(src.isRegister) << 32) | (uint64_t(src.relativeA0) << 33) |
+                            (uint64_t(src.abs) << 34) | (uint64_t(src.negate) << 35));
+                        h = Mix(h, comps);
+                    }
+                    break;
+                }
+                case CompiledOp::Kind::VertexFetch:
+                    std::memcpy(raw, &op.vertexFetch, 12);
+                    h = Mix(Mix(h, raw[0] | (uint64_t(raw[1]) << 32)), raw[2]);
+                    break;
+                case CompiledOp::Kind::TextureFetch:
+                    std::memcpy(raw, &op.textureFetch, 12);
+                    h = Mix(Mix(h, raw[0] | (uint64_t(raw[1]) << 32)), raw[2]);
+                    break;
+                default:
+                    break;
+                }
+            }
+            return h;
+        }
+
         WGPUCompareFunction Compare(uint32_t func)
         {
             static constexpr WGPUCompareFunction k[8] = { WGPUCompareFunction_Never, WGPUCompareFunction_Less, WGPUCompareFunction_Equal,
@@ -265,6 +315,8 @@ namespace gpu
             // ---- caches
             std::map<std::tuple<bool, uint32_t, uint32_t, uint32_t, uint32_t, int>, std::unique_ptr<RenderTarget>> targets_;
             std::unordered_map<uint64_t, WGPUShaderModule> modules_;
+            struct Translation { WgslShader shader; WGPUShaderModule module = nullptr; uint64_t key = 0; };
+            std::unordered_map<uint64_t, Translation> translations_; // by shader ops + options
             std::unordered_map<std::string, WGPURenderPipeline> pipelines_;
             std::unordered_map<uint32_t, WGPUBindGroupLayout> textureLayouts_;
             std::unordered_map<uint32_t, WGPUPipelineLayout> pipelineLayouts_;
@@ -279,6 +331,8 @@ namespace gpu
             WGPUShaderModule resolveModule_ = nullptr;
             WGPUBindGroupLayout resolveSourceLayout_ = nullptr;
             WGPURenderPipeline resolvePipeline_ = nullptr;
+            WGPUBindGroupLayout resolveDepthLayout_ = nullptr;
+            WGPURenderPipeline resolveDepthPipeline_ = nullptr;
             std::unordered_map<uint32_t, ResolvedImage> resolved_; // by guest address
             uint64_t frame_ = 1;
 
@@ -571,6 +625,75 @@ fn quantise(v: f32, bits: f32) -> f32 {
                 pd.multisample.mask = 0xFFFFFFFF;
                 pd.fragment = &fs;
                 resolvePipeline_ = wgpuDeviceCreateRenderPipeline(device_, &pd);
+            }
+
+            // Depth resolves into a colour format: the raw depth/stencil word as bytes.
+            {
+                WGPUBindGroupLayoutEntry e[2] = { WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT };
+                e[0].binding = 0;
+                e[0].visibility = WGPUShaderStage_Fragment;
+                e[0].texture.sampleType = WGPUTextureSampleType_Depth;
+                e[0].texture.viewDimension = WGPUTextureViewDimension_2D;
+                e[1].binding = 1;
+                e[1].visibility = WGPUShaderStage_Fragment;
+                e[1].texture.sampleType = WGPUTextureSampleType_Uint;
+                e[1].texture.viewDimension = WGPUTextureViewDimension_2D;
+                WGPUBindGroupLayoutDescriptor d = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+                d.entryCount = 2;
+                d.entries = e;
+                resolveDepthLayout_ = wgpuDeviceCreateBindGroupLayout(device_, &d);
+                WGPUShaderModule module = Module(std::string(kWgslDrawData) + R"(
+@group(1) @binding(0) var depthTex: texture_depth_2d;
+@group(1) @binding(1) var stencilTex: texture_2d<u32>;
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+    let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u)) * 2.0 - 1.0;
+    return vec4f(p, 0.0, 1.0);
+}
+fn to20e4(f: f32) -> u32 {
+    var bits = bitcast<u32>(f);
+    if (bitcast<i32>(bits) <= 0) { return 0u; }
+    if (bits >= 0x40000000u) { return 0xFFFFFFu; }
+    if (bits < 0x38800000u) {
+        let shift = min(113u - (bits >> 23u), 24u);
+        bits = (0x800000u | (bits & 0x7FFFFFu)) >> shift;
+    } else {
+        bits = bits - 0x38000000u;
+    }
+    return ((bits + 3u + ((bits >> 3u) & 1u)) >> 3u) & 0xFFFFFFu;
+}
+@fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
+    let dims = vec2i(textureDimensions(depthTex));
+    let pixel = vec2i(p.xy) + vec2i(i32(D.c[0].x), i32(D.c[0].y));
+    let scale = vec2i(i32(D.c[1].z), i32(D.c[1].w));
+    let at = clamp(pixel * scale, vec2i(0), dims - 1);
+    let d = textureLoad(depthTex, at, 0);
+    let st = textureLoad(stencilTex, at, 0).x;
+    let bits = select(u32(round(clamp(d, 0.0, 1.0) * 16777215.0)), to20e4(d), D.c[1].x > 0.5);
+    let raw = (bits << 8u) | (st & 0xFFu);
+    return vec4f(f32(raw & 0xFFu), f32((raw >> 8u) & 0xFFu), f32((raw >> 16u) & 0xFFu), f32(raw >> 24u)) / 255.0;
+}
+)");
+                WGPUBindGroupLayout layouts[2] = { drawLayout_, resolveDepthLayout_ };
+                WGPUPipelineLayoutDescriptor pld = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+                pld.bindGroupLayoutCount = 2;
+                pld.bindGroupLayouts = layouts;
+                WGPUPipelineLayout layout = wgpuDeviceCreatePipelineLayout(device_, &pld);
+                WGPUColorTargetState target = WGPU_COLOR_TARGET_STATE_INIT;
+                target.format = WGPUTextureFormat_RGBA16Float;
+                WGPUFragmentState fs = WGPU_FRAGMENT_STATE_INIT;
+                fs.module = module;
+                fs.entryPoint = Str("fs");
+                fs.targetCount = 1;
+                fs.targets = &target;
+                WGPURenderPipelineDescriptor pd = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+                pd.layout = layout;
+                pd.vertex.module = module;
+                pd.vertex.entryPoint = Str("vs");
+                pd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+                pd.multisample.count = 1;
+                pd.multisample.mask = 0xFFFFFFFF;
+                pd.fragment = &fs;
+                resolveDepthPipeline_ = wgpuDeviceCreateRenderPipeline(device_, &pd);
             }
             return true;
         }
@@ -1061,11 +1184,27 @@ fn quantise(v: f32, bits: f32) -> f32 {
                 if ((gpuSlot[slot] = ResolvedFor(args.fetch + slot * 6)))
                     options.slotSwizzle[slot] = uint16_t((args.fetch[slot * 6 + 3] >> 1) & 0xFFF);
             const bool hasFragment = rs.mode == 4 && options.colorTargets && args.ps;
-            const WgslShader shader = TranslateToWgsl(args.vs, hasFragment ? args.ps : nullptr, options);
-            if (shader.code.empty())
+            // Translations are cached by the flattened instructions and the options that
+            // shape the generated code (building and hashing WGSL text per draw is costly).
+            uint64_t translationKey = HashShader(hasFragment ? args.ps : nullptr, HashShader(args.vs, 0x1234));
+            translationKey = Mix(translationKey, uint64_t(options.interpolatorMask) | (uint64_t(options.colorTargets) << 16) |
+                (uint64_t(options.alphaFunc) << 20) | (uint64_t(options.paramGen) << 24) | (uint64_t(options.paramGenRegister) << 32));
+            for (uint32_t k = 0; k < 32; k += 4)
+                translationKey = Mix(translationKey, options.slotSwizzle[k] | (uint64_t(options.slotSwizzle[k + 1]) << 16) |
+                    (uint64_t(options.slotSwizzle[k + 2]) << 32) | (uint64_t(options.slotSwizzle[k + 3]) << 48));
+            Translation& translation = translations_[translationKey];
+            if (!translation.key)
+            {
+                translation.shader = TranslateToWgsl(args.vs, hasFragment ? args.ps : nullptr, options);
+                translation.module = translation.shader.code.empty() ? nullptr : Module(translation.shader.code);
+                translation.key = translationKey | 1;
+                translation.shader.code.clear(); // only the module is needed from now on
+            }
+            if (!translation.module)
                 return false;
+            const WgslShader& shader = translation.shader;
             interpolatorMask_ = shader.interpolators;
-            const WGPUShaderModule module = Module(shader.code);
+            const WGPUShaderModule module = translation.module;
             const uint32_t slots = hasFragment ? shader.textureSlots : 0;
 
             // ---- pipeline
@@ -1090,7 +1229,7 @@ fn quantise(v: f32, bits: f32) -> f32 {
 
             std::string key;
             auto add = [&](uint64_t v) { key.append(reinterpret_cast<const char*>(&v), sizeof(v)); };
-            add(Fnv(shader.code.data(), shader.code.size()));
+            add(translationKey);
             add(rs.interpolatorMask);
             add(hasFragment);
             add(gpuVertex_);
@@ -1640,11 +1779,24 @@ fn quantise(v: f32, bits: f32) -> f32 {
         bool WebGpuBackend::ResolveToGpu(const ResolveRequest& r)
         {
             static const bool disabled = [] { const char* v = std::getenv("TTT2_GPU_CPU_RESOLVE"); return v && *v == '1'; }();
-            if (disabled || g_softKeepTexels || r.source >= 4 || !GpuResolvableFormat(r.destFormat))
+            const bool depthSource = r.source >= 4;
+            if (disabled || g_softKeepTexels || !GpuResolvableFormat(r.destFormat) || (depthSource && r.destFormat != 6))
+            {
+                // TTT2_GPU_STATS: say once which kinds of resolve still go through the CPU.
+                static std::map<std::pair<uint32_t, uint32_t>, bool> reported;
+                static const bool log = [] { const char* v = std::getenv("TTT2_GPU_STATS"); return v && *v == '1'; }();
+                if (log && !reported[{ r.source, r.destFormat }])
+                {
+                    reported[{ r.source, r.destFormat }] = true;
+                    std::fprintf(stderr, "[gpu] webgpu: CPU resolve: source %u (format %u) -> texture format %u, %ux%u\n", r.source,
+                        r.source < 4 ? r.rs->color[r.source].format : 0u, r.destFormat, r.destPitch, r.destHeight);
+                }
                 return false;
+            }
             const RasterState& rs = *r.rs;
-            const Surface& surface = rs.color[r.source];
-            RenderTarget* rt = Target(false, surface, ColorFormat(surface.format));
+            const Surface& surface = depthSource ? rs.depth : rs.color[r.source];
+            RenderTarget* rt = depthSource ? Target(true, rs.depth, WGPUTextureFormat_Depth32FloatStencil8)
+                                           : Target(false, surface, ColorFormat(surface.format));
             if (!rt)
                 return false;
             const uint32_t width = r.destPitch;
@@ -1699,8 +1851,8 @@ fn quantise(v: f32, bits: f32) -> f32 {
             default: break; // half floats: the image format rounds them
             }
             const F4 constants[4] = {
-                F4{ float(r.offsetX), float(r.offsetY), surface.format == 1 ? 1.0f : 0.0f, std::ldexp(1.0f, r.expBias) },
-                F4{ r.swapRB ? 1.0f : 0.0f, layout, float(surface.scaleX), float(surface.scaleY) },
+                F4{ float(r.offsetX), float(r.offsetY), (!depthSource && surface.format == 1) ? 1.0f : 0.0f, std::ldexp(1.0f, r.expBias) },
+                F4{ depthSource ? (r.floatDepth ? 1.0f : 0.0f) : (r.swapRB ? 1.0f : 0.0f), layout, float(surface.scaleX), float(surface.scaleY) },
                 bits,
                 F4{ (r.sampleSelect >= 4 && surface.scaleX * surface.scaleY > 1) ? 1.0f : 0.0f,
                     float(r.sampleSelect < surface.scaleX * surface.scaleY ? r.sampleSelect : 0), 0, 0 },
@@ -1718,15 +1870,33 @@ fn quantise(v: f32, bits: f32) -> f32 {
             pd.colorAttachmentCount = 1;
             pd.colorAttachments = &attachment;
             WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(encoder_, &pd);
-            WGPUBindGroupEntry e = WGPU_BIND_GROUP_ENTRY_INIT;
-            e.binding = 0;
-            e.textureView = rt->view;
+            WGPUBindGroupEntry e[2] = { WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT };
+            WGPUTextureView aspectViews[2] = {};
             WGPUBindGroupDescriptor bgd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
-            bgd.layout = resolveSourceLayout_;
-            bgd.entryCount = 1;
-            bgd.entries = &e;
+            if (depthSource)
+            {
+                WGPUTextureViewDescriptor vd = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+                vd.aspect = WGPUTextureAspect_DepthOnly;
+                aspectViews[0] = wgpuTextureCreateView(rt->texture, &vd);
+                vd.aspect = WGPUTextureAspect_StencilOnly;
+                aspectViews[1] = wgpuTextureCreateView(rt->texture, &vd);
+                e[0].binding = 0;
+                e[0].textureView = aspectViews[0];
+                e[1].binding = 1;
+                e[1].textureView = aspectViews[1];
+                bgd.layout = resolveDepthLayout_;
+                bgd.entryCount = 2;
+            }
+            else
+            {
+                e[0].binding = 0;
+                e[0].textureView = rt->view;
+                bgd.layout = resolveSourceLayout_;
+                bgd.entryCount = 1;
+            }
+            bgd.entries = e;
             WGPUBindGroup source = wgpuDeviceCreateBindGroup(device_, &bgd);
-            wgpuRenderPassEncoderSetPipeline(pass, resolvePipeline_);
+            wgpuRenderPassEncoderSetPipeline(pass, depthSource ? resolveDepthPipeline_ : resolvePipeline_);
             wgpuRenderPassEncoderSetBindGroup(pass, 0, drawBindGroup_, 1, &offset);
             wgpuRenderPassEncoderSetBindGroup(pass, 1, source, 0, nullptr);
             wgpuRenderPassEncoderSetScissorRect(pass, uint32_t(dx0), uint32_t(dy0), uint32_t(dx1 - dx0), uint32_t(dy1 - dy0));
@@ -1734,6 +1904,9 @@ fn quantise(v: f32, bits: f32) -> f32 {
             wgpuRenderPassEncoderEnd(pass);
             wgpuRenderPassEncoderRelease(pass);
             wgpuBindGroupRelease(source);
+            for (WGPUTextureView v : aspectViews)
+                if (v)
+                    wgpuTextureViewRelease(v);
             ++stats_.gpuResolves;
             return true;
         }

@@ -2777,6 +2777,16 @@ namespace gpu
             *guest::ToHost<uint8_t>(at) = uint8_t(words[0]);
         }
 
+        // A depth resolve into a colour format copies the raw EDRAM word: depth in the high
+        // 24 bits (unorm, or 20e4 float for D24FS8), stencil in the low 8. Returned as the
+        // bytes, so the colour packing reproduces the word exactly.
+        F4 DepthAsColor(float depth, uint8_t stencil, bool floatDepth)
+        {
+            const uint32_t bits = floatDepth ? Float32To20e4(depth) : uint32_t(std::lround(Saturate(depth) * 16777215.0f));
+            const uint32_t raw = (bits << 8) | stencil;
+            return { float(raw & 0xFF) / 255.0f, float((raw >> 8) & 0xFF) / 255.0f, float((raw >> 16) & 0xFF) / 255.0f, float(raw >> 24) / 255.0f };
+        }
+
         void Resolve(const RasterState& rs, const ScreenVertex* corners, size_t count)
         {
             ScopedTimer timer{ g_stats.resolve };
@@ -2812,6 +2822,8 @@ namespace gpu
             const uint32_t format = (destInfo >> 7) & 0x3F;
             const int expBias = int32_t(destInfo << 10) >> 26; // bits 16-21, signed
             const bool swapRB = (destInfo >> 24) & 1;
+            const bool floatDepth = (Reg(0x2002) >> 16) & 1;
+            const bool depthAsColor = format != 22 && format != 23; // not a depth texture format
 
             const int rows = ey1 - ey0;
             auto parallelRows = [&](auto&& row) {
@@ -2843,6 +2855,7 @@ namespace gpu
                 request.endian = endian;
                 request.expBias = expBias;
                 request.swapRB = swapRB;
+                request.floatDepth = floatDepth;
                 resolvedOnGpu = g_sink->ResolveToGpu(request);
             }
             if (command != 3 && destPitch && Reg(0x2319) && !bytes)
@@ -2894,7 +2907,8 @@ namespace gpu
                             else
                             {
                                 const float d = at < sinkDepth.size() ? sinkDepth[at] : 0.0f;
-                                c = { d, float(at < sinkStencil.size() ? sinkStencil[at] : 0), d, d };
+                                const uint8_t st = at < sinkStencil.size() ? sinkStencil[at] : 0;
+                                c = depthAsColor ? DepthAsColor(d, st, floatDepth) : F4{ d, float(st), d, d };
                             }
                         }
                         else if (source < 4)
@@ -2931,7 +2945,8 @@ namespace gpu
                         {
                             const size_t i = rs.depth.Index(uint32_t(x) * rs.depth.scaleX, uint32_t(y) * rs.depth.scaleY);
                             const float d = g_edramDepth[i];
-                            c = { d, float(g_edramStencil[i]), d, d }; // y = stencil for k_24_8 packing
+                            // y = stencil for k_24_8 packing
+                            c = depthAsColor ? DepthAsColor(d, g_edramStencil[i], floatDepth) : F4{ d, float(g_edramStencil[i]), d, d };
                         }
                         if (expBias)
                             for (float& v : c)

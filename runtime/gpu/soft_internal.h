@@ -183,6 +183,7 @@ namespace gpu
         uint32_t endian = 0;
         int expBias = 0;
         bool swapRB = false;
+        bool floatDepth = false;      // depth source is D24FS8 (20e4 float depth)
     };
 
     // A draw whose vertices the backend shades itself (translated vertex shader).
