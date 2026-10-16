@@ -313,9 +313,13 @@ namespace gpu
         call.pixelShader = StageCode(1, psStorage);
         static const bool logVertices = [] { const char* v = std::getenv("TTT2_GPU_LOG_VERTS"); return v && *v == '1'; }();
         g_softLogVertices = logVertices && g_logFrame && g_swapCount + 1 == g_logFrame;
+        g_softLogDraw = g_logFrame && g_swapCount + 1 == g_logFrame;
         static const bool dumpTextures = [] { const char* v = std::getenv("TTT2_GPU_DUMP_TEX"); return v && *v == '1'; }();
         g_softDumpTextures = dumpTextures && g_logFrame && g_swapCount + 1 == g_logFrame;
+        const uint64_t pixelsBefore = SoftPixelsWritten();
         SoftDraw(call);
+        if (g_logFrame && g_swapCount + 1 == g_logFrame)
+            std::fprintf(stderr, "[gpu]   -> %llu pixels written\n", (unsigned long long)(SoftPixelsWritten() - pixelsBefore));
     }
 
     static void LogDraw(uint32_t initiator, uint32_t indexBase, uint32_t indexBytes)

@@ -42,6 +42,8 @@ namespace gpu
 
     // Debug: when set, SoftDraw prints every vertex's exported position and interpolators.
     extern bool g_softLogVertices;
+    // Debug: when set, SoftDraw prints why pixels were rejected (culling, depth, stencil).
+    extern bool g_softLogDraw;
     // Debug: when set, every texture decoded is also written to tex_<address>_<format>.bmp.
     extern bool g_softDumpTextures;
 

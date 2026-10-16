@@ -54,6 +54,9 @@ namespace gpu
         uint32_t PhysicalToGuest(uint32_t physical) { return 0xA0000000u + (physical & 0x1FFFFFFFu); }
 
         std::atomic<uint64_t> g_pixels{ 0 };
+
+        // Per-draw rejection counts for g_softLogDraw.
+        struct DrawDebug { std::atomic<uint64_t> triangles, setups, inside, stencilFail, depthFail; } g_drawDebug;
         std::atomic<uint64_t> g_resolves{ 0 };
 
         // Time spent per stage since the last SoftPrintStats (ns).
@@ -2394,7 +2397,9 @@ namespace gpu
                 const F4& p = v.position;
                 float x = p[0], y = p[1], z = p[2];
                 const float w = p[3];
-                const float invW = (rs.vte & (1u << 10)) ? w : (w != 0.0f ? 1.0f / w : 1.0f);
+                // VTX_W0_FMT (bit 10) only says the rasteriser gets 1/W; the shader always
+                // exports W, so the divides below use its reciprocal either way.
+                const float invW = w != 0.0f ? 1.0f / w : 1.0f;
                 if (!(rs.vte & (1u << 8)))
                 {
                     x *= invW;
@@ -2448,11 +2453,15 @@ namespace gpu
                 const RasterState::StencilFace& sf = rs.stencilFace[front ? 0 : 1];
                 if (rs.stencil && !Compare(sf.func, float(sf.ref & sf.mask), float(g_edramStencil[depthIndex] & sf.mask)))
                 {
+                    if (g_softLogDraw)
+                        ++g_drawDebug.stencilFail;
                     UpdateStencil(px, py, sf, sf.fail);
                     return false;
                 }
                 if (rs.depthTest && !Compare(rs.depthFunc, z, g_edramDepth[depthIndex]))
                 {
+                    if (g_softLogDraw)
+                        ++g_drawDebug.depthFail;
                     if (rs.stencil)
                         UpdateStencil(px, py, sf, sf.zfail);
                     return false;
@@ -2603,6 +2612,8 @@ namespace gpu
 
             void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& c, bool cull = false)
             {
+                if (g_softLogDraw)
+                    ++g_drawDebug.triangles;
                 Setup su;
                 su.v[0] = a; su.v[1] = b; su.v[2] = c;
                 float area = (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y);
@@ -2637,6 +2648,8 @@ namespace gpu
                     su.edges[e] = { p.x, p.y, dx, dy, dy > 0.0f || (dy == 0.0f && dx < 0.0f) };
                 }
                 su.invArea = 1.0f / area;
+                if (g_softLogDraw)
+                    ++g_drawDebug.setups;
                 setups.push_back(su);
             }
 
@@ -2729,6 +2742,8 @@ namespace gpu
                         if (!inside)
                             continue;
                         const float z = bary[0] * t[0]->z + bary[1] * t[1]->z + bary[2] * t[2]->z;
+                        if (g_softLogDraw)
+                            ++g_drawDebug.inside;
                         if (rs.mode != 4 || !ps.count)
                         {
                             // No pixel shader runs: nothing reads the inputs.
@@ -3159,6 +3174,7 @@ namespace gpu
     }
 
     bool g_softLogVertices = false;
+    bool g_softLogDraw = false;
     bool g_softDumpTextures = false;
 
     void SoftParallelFor(uint32_t count, const std::function<void(uint32_t)>& fn)
@@ -3214,6 +3230,11 @@ namespace gpu
 
         // ---- indices
         const uint32_t indexOffset = Reg(0x2102);
+        // Primitive restart (PA_SU_SC_MODE_CNTL.MULTI_PRIM_IB_ENA): the reset index
+        // (VGT_MULTI_PRIM_IB_RESET_INDX) in a DMA index buffer ends the current strip or fan.
+        const bool restartEnabled = draw.indexSource == 0 && ((Reg(0x2205) >> 21) & 1);
+        const uint32_t resetIndex = Reg(0x2103) & (draw.index32 ? 0xFFFFFFFFu : 0xFFFFu);
+        std::vector<uint8_t> restart(draw.indexCount, 0);
         std::vector<uint32_t> indices(draw.indexCount);
         for (uint32_t i = 0; i < draw.indexCount; i++)
         {
@@ -3238,40 +3259,60 @@ namespace gpu
                     index = (i & 1) ? word >> 16 : word & 0xFFFF;
                 }
             }
+            if (restartEnabled && index == resetIndex)
+                restart[i] = 1;
             indices[i] = index + indexOffset;
         }
 
         // ---- vertex shading (once per distinct index)
         auto vertexStart = std::chrono::steady_clock::now();
         std::unordered_map<uint32_t, uint32_t> slotOf;
-        std::vector<Vertex> vertices;
+        std::vector<uint32_t> unique; // distinct indices in first-use order
         std::vector<uint32_t> slots(indices.size());
-        uint32_t interpolatorMask = 0;
+        constexpr uint32_t kNoSlot = UINT32_MAX; // restart markers have no vertex
         for (size_t i = 0; i < indices.size(); i++)
         {
-            auto [it, inserted] = slotOf.emplace(indices[i], uint32_t(vertices.size()));
+            if (restart[i])
+            {
+                slots[i] = kNoSlot;
+                continue;
+            }
+            auto [it, inserted] = slotOf.emplace(indices[i], uint32_t(unique.size()));
             if (inserted)
+                unique.push_back(indices[i]);
+            slots[i] = it->second;
+        }
+        // Vertices are independent: shade them across the pool.
+        std::vector<Vertex> vertices(unique.size());
+        std::vector<uint32_t> exportedMasks(unique.size());
+        constexpr size_t kVerticesPerJob = 64;
+        Pool().Run(int((unique.size() + kVerticesPerJob - 1) / kVerticesPerJob), [&](int job) {
+            const size_t end = std::min(unique.size(), size_t(job + 1) * kVerticesPerJob);
+            for (size_t u = size_t(job) * kVerticesPerJob; u < end; u++)
             {
                 Invocation inv;
                 for (F4& e : inv.exports)
                     e = { 0, 0, 0, 0 };
-                inv.r[0] = { float(indices[i]), 0, 0, 0 };
+                inv.r[0] = { float(unique[u]), 0, 0, 0 };
                 Interpreter interp{ state, vs, inv, 0 };
                 interp.Run();
-                Vertex v;
+                Vertex& v = vertices[u];
                 v.position = inv.exports[62];
                 for (int k = 0; k < 16; k++)
                     v.interpolators[k] = inv.exports[k];
-                interpolatorMask |= uint32_t(inv.exported & 0xFFFF);
-                vertices.push_back(v);
+                exportedMasks[u] = uint32_t(inv.exported & 0xFFFF);
             }
-            slots[i] = it->second;
-        }
+        });
+        uint32_t interpolatorMask = 0;
+        for (uint32_t mask : exportedMasks)
+            interpolatorMask |= mask;
         rs.interpolatorMask = interpolatorMask;
         if (g_softLogVertices)
         {
             for (size_t i = 0; i < indices.size(); i++)
             {
+                if (slots[i] == kNoSlot)
+                    continue;
                 const Vertex& v = vertices[slots[i]];
                 std::fprintf(stderr, "[gpu]       v%zu idx=%u pos=(%g %g %g %g)", i, indices[i], v.position[0], v.position[1], v.position[2], v.position[3]);
                 for (int k = 0; k < 2; k++)
@@ -3315,7 +3356,20 @@ namespace gpu
         // ---- primitive assembly
         ScopedTimer rasterTimer{ g_stats.raster };
         auto tri = [&](uint32_t a, uint32_t b, uint32_t c) {
+            if (slots[a] == kNoSlot || slots[b] == kNoSlot || slots[c] == kNoSlot)
+                return; // a list primitive containing a restart marker is dropped
             renderer.ClipAndDraw(vertices[slots[a]], vertices[slots[b]], vertices[slots[c]]);
+        };
+        // Strips and fans restart after each marker: [begin, end) runs of real vertices.
+        auto forEachRun = [&](auto&& fn) {
+            size_t begin = 0;
+            for (size_t i = 0; i <= slots.size(); i++)
+                if (i == slots.size() || slots[i] == kNoSlot)
+                {
+                    if (i > begin)
+                        fn(begin, i);
+                    begin = i + 1;
+                }
         };
         const size_t n = slots.size();
         switch (prim)
@@ -3325,17 +3379,21 @@ namespace gpu
                 tri(uint32_t(i), uint32_t(i + 1), uint32_t(i + 2));
             break;
         case 5: // triangle fan
-            for (size_t i = 1; i + 1 < n; i++)
-                tri(0, uint32_t(i), uint32_t(i + 1));
+            forEachRun([&](size_t begin, size_t end) {
+                for (size_t i = begin + 1; i + 1 < end; i++)
+                    tri(uint32_t(begin), uint32_t(i), uint32_t(i + 1));
+            });
             break;
         case 6: // triangle strip (odd triangles swap their first two vertices to keep the winding)
-            for (size_t i = 0; i + 2 < n; i++)
-            {
-                if (i & 1)
-                    tri(uint32_t(i + 1), uint32_t(i), uint32_t(i + 2));
-                else
-                    tri(uint32_t(i), uint32_t(i + 1), uint32_t(i + 2));
-            }
+            forEachRun([&](size_t begin, size_t end) {
+                for (size_t i = begin; i + 2 < end; i++)
+                {
+                    if ((i - begin) & 1)
+                        tri(uint32_t(i + 1), uint32_t(i), uint32_t(i + 2));
+                    else
+                        tri(uint32_t(i), uint32_t(i + 1), uint32_t(i + 2));
+                }
+            });
             break;
         case 13: // quad list
             for (size_t i = 0; i + 3 < n; i += 4)
@@ -3347,6 +3405,8 @@ namespace gpu
         case 8: // rect list
             for (size_t i = 0; i + 2 < n; i += 3)
             {
+                if (slots[i] == kNoSlot || slots[i + 1] == kNoSlot || slots[i + 2] == kNoSlot)
+                    continue;
                 const Vertex& v0 = vertices[slots[i]];
                 const Vertex& v1 = vertices[slots[i + 1]];
                 const Vertex& v2 = vertices[slots[i + 2]];
@@ -3361,5 +3421,21 @@ namespace gpu
         }
         renderer.Flush();
         g_pixels += renderer.pixels;
+        if (g_softLogDraw)
+        {
+            float zMin = FLT_MAX, zMax = -FLT_MAX;
+            for (const Vertex& v : vertices)
+            {
+                const ScreenVertex sv = renderer.ToScreen(v);
+                zMin = std::min(zMin, sv.z);
+                zMax = std::max(zMax, sv.z);
+            }
+            const size_t centre = rs.depth.Index(uint32_t(rs.sx1 / 2) * rs.depth.scaleX, uint32_t(rs.sy1 / 2) * rs.depth.scaleY);
+            std::fprintf(stderr, "[gpu]   debug: %llu triangles, %llu set up, %llu pixels inside, %llu stencil fails, %llu depth fails; screen z %g..%g; depth at centre %g stencil %u; depth test %d func %u write %d\n",
+                (unsigned long long)g_drawDebug.triangles.exchange(0), (unsigned long long)g_drawDebug.setups.exchange(0),
+                (unsigned long long)g_drawDebug.inside.exchange(0), (unsigned long long)g_drawDebug.stencilFail.exchange(0),
+                (unsigned long long)g_drawDebug.depthFail.exchange(0), zMin, zMax, g_edramDepth[centre], g_edramStencil[centre],
+                rs.depthTest, rs.depthFunc, rs.depthWrite);
+        }
     }
 }
