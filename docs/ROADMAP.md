@@ -108,10 +108,11 @@ Rough milestones, in order. Each depends on the previous one.
       the intro runs at ~26 swaps/s (native: 60), bound by the game's own threads in wasm
 - [ ] GPU readbacks in the browser (resolves the CPU reads, front-buffer screenshots): they
       need an async map, which a synchronous resolve cannot wait for; they return zeros now
-- [ ] A thread of the game polls a wait in a tight loop: `sub_82ABFDE8` sets its own event
-      (`NtSetEvent`) and SignalAndWaits on it until a 64-bit counter changes (~7 M calls/s);
-      costly in the browser
-- [ ] Profile the game threads in wasm (why ~26 swaps/s with the CP nearly idle)
+- [x] A thread of the game spun on its own event: `sub_82ABFDE8` sets an auto-reset event
+      and SignalAndWaits on it until a 64-bit counter changes (~8 M kernel calls/s, all on
+      the global wait lock). Waits now detect a run of self-set signals and block up to
+      1 ms (a set from another thread still wakes them). Browser intro: ~26 -> 60 fps
+- [ ] Profile the remaining browser slowdowns (frames 2048-4096 average ~51 fps)
 - [ ] Stable 60 fps in matches (profile; enable XenonRecomp's local-register optimisations)
 - [ ] Input latency pass (fighting games are sensitive to it)
 - [ ] Saves persist in OPFS
