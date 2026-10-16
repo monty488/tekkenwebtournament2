@@ -71,6 +71,10 @@ namespace gpu
         uint32_t base = 0, bytes = 0;
         uint64_t hash = 0;
         uint64_t verifiedFrame = 0;
+        // Per-phase hashes (4 KiB pages, page p in phase p % 8): textures unchanged for a
+        // while are re-checked one phase per frame instead of in full.
+        uint64_t phaseHash[8] = {};
+        uint32_t stableFrames = 0;
         bool stale = false; // a resolve overwrote the source: decode again on next use
         uint64_t version = 0; // changes on every decode (hardware backends re-upload on change)
         uint32_t format = 0;  // texture format (hardware backends pick a precision from it)

@@ -360,6 +360,30 @@ namespace gpu
 
         // Hashes guest memory in 256 KiB chunks across the pool (textures are hashed every
         // frame to detect CPU rewrites).
+        constexpr uint32_t kHashPage = 4096;
+        constexpr uint32_t kHashPhases = 8;
+
+        uint64_t PhaseHash(uint32_t address, uint32_t bytes, uint32_t phase)
+        {
+            const uint8_t* p = guest::ToHost<const uint8_t>(address);
+            uint64_t h = 0x84222325CBF29CE4ull + phase;
+            for (uint32_t page = phase; size_t(page) * kHashPage < bytes; page += kHashPhases)
+            {
+                const size_t begin = size_t(page) * kHashPage;
+                h = (h ^ HashBytes(p + begin, std::min<size_t>(kHashPage, bytes - begin))) * 0x100000001B3ull;
+            }
+            return h;
+        }
+
+        void AllPhaseHashes(uint32_t address, uint32_t bytes, uint64_t out[kHashPhases])
+        {
+            if (bytes >= 512 * 1024)
+                Pool().Run(int(kHashPhases), [&](int phase) { out[phase] = PhaseHash(address, bytes, uint32_t(phase)); });
+            else
+                for (uint32_t phase = 0; phase < kHashPhases; phase++)
+                    out[phase] = PhaseHash(address, bytes, phase);
+        }
+
         uint64_t HashMemory(uint32_t address, uint32_t bytes)
         {
             const uint8_t* p = guest::ToHost<const uint8_t>(address);
@@ -599,7 +623,14 @@ namespace gpu
                 return;
             tex.base = info.base;
             tex.bytes = TextureByteSize(info);
-            tex.hash = tex.bytes ? HashMemory(tex.base, tex.bytes) : 0;
+            tex.hash = 0;
+            tex.stableFrames = 0;
+            if (tex.bytes)
+            {
+                AllPhaseHashes(tex.base, tex.bytes, tex.phaseHash);
+                for (uint64_t h : tex.phaseHash)
+                    tex.hash = (tex.hash ^ h) * 0x100000001B3ull;
+            }
             tex.verifiedFrame = g_frame;
 
             ++g_stats.decodes;
@@ -726,13 +757,32 @@ namespace gpu
             else if (tex.verifiedFrame != g_frame)
             {
                 // First use this frame: the CPU may have rewritten the data (movie frames).
+                // Textures that have not changed for 8 frames check one eighth of their
+                // pages per frame (every page within 8 frames); others check everything.
                 ScopedTimer timer{ g_stats.texture };
-                g_stats.hashed += tex.bytes;
-                const bool same = tex.bytes && HashMemory(tex.base, tex.bytes) == tex.hash;
+                bool same = tex.bytes != 0;
+                if (same && tex.stableFrames >= kHashPhases && tex.bytes >= 64 * 1024)
+                {
+                    const uint32_t phase = uint32_t(g_frame % kHashPhases);
+                    g_stats.hashed += tex.bytes / kHashPhases;
+                    same = PhaseHash(tex.base, tex.bytes, phase) == tex.phaseHash[phase];
+                }
+                else if (same)
+                {
+                    g_stats.hashed += tex.bytes;
+                    uint64_t now[kHashPhases];
+                    AllPhaseHashes(tex.base, tex.bytes, now);
+                    same = std::equal(now, now + kHashPhases, tex.phaseHash);
+                }
                 if (same)
+                {
                     tex.verifiedFrame = g_frame;
+                    ++tex.stableFrames;
+                }
                 else
+                {
                     DecodeTexture(tex, fetch);
+                }
             }
             return tex;
         }

@@ -298,6 +298,16 @@ namespace gpu
             bool PresentFrontBuffer(const uint32_t fetch[6]);
             void FlushAllResolves();
 
+            // Texture bind groups are cached by their views and samplers; any view going away
+            // drops the cache (a later view could reuse the address).
+            std::unordered_map<uint64_t, WGPUBindGroup> bindGroups_;
+            bool bindGroupsDirty_ = false;
+            void ReleaseView(WGPUTextureView view)
+            {
+                wgpuTextureViewRelease(view);
+                bindGroupsDirty_ = true;
+            }
+
         private:
             // ---- device
             WGPUInstance instance_ = nullptr;
@@ -860,7 +870,7 @@ fn to20e4(f: f32) -> u32 {
             if (!g.texture || g.width != tex.width || g.height != tex.height || g.format != format)
             {
                 if (g.view)
-                    wgpuTextureViewRelease(g.view);
+                    ReleaseView(g.view);
                 if (g.texture)
                     wgpuTextureRelease(g.texture);
                 WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
@@ -1433,11 +1443,14 @@ fn to20e4(f: f32) -> u32 {
 
             const auto tData = std::chrono::steady_clock::now();
             stats_.dataNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(tData - tPipeline).count());
-            if (drawTextures_)
+            if (bindGroupsDirty_)
             {
-                wgpuBindGroupRelease(drawTextures_);
-                drawTextures_ = nullptr;
+                for (auto& [k, group] : bindGroups_)
+                    wgpuBindGroupRelease(group);
+                bindGroups_.clear();
+                bindGroupsDirty_ = false;
             }
+            drawTextures_ = nullptr;
             std::vector<WGPUBindGroupEntry> entries;
             for (uint32_t slot = 0; slot < 32; slot++)
             {
@@ -1467,7 +1480,14 @@ fn to20e4(f: f32) -> u32 {
             bgd.layout = TextureLayout(slots);
             bgd.entryCount = entries.size();
             bgd.entries = entries.data();
-            drawTextures_ = wgpuDeviceCreateBindGroup(device_, &bgd);
+            uint64_t groupKey = Mix(0x77, slots);
+            for (const WGPUBindGroupEntry& entry : entries)
+                groupKey = Mix(groupKey, reinterpret_cast<uintptr_t>(entry.textureView ? static_cast<void*>(entry.textureView)
+                                                                                          : static_cast<void*>(entry.sampler)));
+            WGPUBindGroup& group = bindGroups_[groupKey];
+            if (!group)
+                group = wgpuDeviceCreateBindGroup(device_, &bgd);
+            drawTextures_ = group;
             stats_.bindNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tData).count());
             stats_.encodeNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
             return true;
@@ -1833,12 +1853,12 @@ fn to20e4(f: f32) -> u32 {
             if (!image.texture || image.width != width || image.height != height)
             {
                 if (image.view)
-                    wgpuTextureViewRelease(image.view);
+                    ReleaseView(image.view);
                 if (image.texture)
                     wgpuTextureRelease(image.texture);
                 for (auto& [size, e] : image.exact)
                 {
-                    wgpuTextureViewRelease(e.texture.view);
+                    ReleaseView(e.texture.view);
                     wgpuTextureRelease(e.texture.texture);
                 }
                 image.exact.clear();
@@ -2251,10 +2271,10 @@ struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f, }
                 FlushToMemory(base, image);
                 for (auto& [size, e] : image.exact)
                 {
-                    wgpuTextureViewRelease(e.texture.view);
+                    ReleaseView(e.texture.view);
                     wgpuTextureRelease(e.texture.texture);
                 }
-                wgpuTextureViewRelease(image.view);
+                ReleaseView(image.view);
                 wgpuTextureRelease(image.texture);
             }
             resolved_.clear();
@@ -2272,10 +2292,10 @@ struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f, }
                     ResolvedImage& image = it->second;
                     for (auto& [size, e] : image.exact)
                     {
-                        wgpuTextureViewRelease(e.texture.view);
+                        ReleaseView(e.texture.view);
                         wgpuTextureRelease(e.texture.texture);
                     }
-                    wgpuTextureViewRelease(image.view);
+                    ReleaseView(image.view);
                     wgpuTextureRelease(image.texture);
                     it = resolved_.erase(it);
                 }
@@ -2291,7 +2311,7 @@ struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f, }
             {
                 for (auto& [tex, g] : textures_)
                 {
-                    wgpuTextureViewRelease(g.view);
+                    ReleaseView(g.view);
                     wgpuTextureRelease(g.texture);
                 }
                 textures_.clear();
