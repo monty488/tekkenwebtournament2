@@ -8,9 +8,12 @@ PowerPC code is translated to C++ ahead of time with
 [XenosRecomp](https://github.com/hedge-dev/XenosRecomp), and a hand-written
 runtime replaces the Xbox 360 kernel, GPU, audio and input.
 
-> **Status: scaffolding.** The pipeline, tooling, kernel basics and web shell are in
-> place. The game does **not** boot yet. Graphics and audio are the bulk of the
-> remaining work. See [docs/ROADMAP.md](docs/ROADMAP.md).
+> **Status: playable natively, booting in the browser.** The game boots, renders and
+> plays: menus, character select and fights work natively at 60 fps on the WebGPU
+> backend. In Chrome/Edge it runs from streamed game data and renders on the GPU through
+> the browser's WebGPU, with the intro at 60 fps. Still missing: audio (XMA decoding),
+> saves and sign-in, GPU readbacks in the browser, and a full play-through in the browser.
+> See [docs/ROADMAP.md](docs/ROADMAP.md).
 
 **No game data is included or ever committed.** You need your own copy of the
 game. Everything derived from it (`game/`, `recomp/ppc/`, generated shaders) is
@@ -73,7 +76,8 @@ node web\serve.mjs build\web-release 8080 --game game
 ```
 
 then open http://localhost:8080/?stream (add `&autostart` to launch straight away;
-any `TTT2_*` switch can be passed in the URL too, e.g. `&TTT2_GPU_STATS=1`).
+any `TTT2_*` switch can be passed in the URL too, e.g. `&TTT2_GPU_STATS=1`). To render
+on the GPU, as natively: http://localhost:8080/?stream&TTT2_GPU=webgpu&autostart
 
 You can build and serve the web target **before** you have the game: it then
 builds a placeholder runtime, which is a quick way to check the toolchain and
