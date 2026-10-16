@@ -9,6 +9,7 @@
 // packet order.
 
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace gpu
@@ -43,6 +44,9 @@ namespace gpu
     extern bool g_softLogVertices;
     // Debug: when set, every texture decoded is also written to tex_<address>_<format>.bmp.
     extern bool g_softDumpTextures;
+
+    // Runs fn(0..count-1) on the renderer's worker pool (rows of a conversion, etc.).
+    void SoftParallelFor(uint32_t count, const std::function<void(uint32_t)>& fn);
 
     // Debug counters.
     uint64_t SoftPixelsWritten();

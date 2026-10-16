@@ -20,12 +20,14 @@
 #include "../../thirdparty/XenosRecomp/XenosRecomp/shader_code.h"
 
 #include <algorithm>
+#include <bit>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -55,7 +57,7 @@ namespace gpu
         std::atomic<uint64_t> g_resolves{ 0 };
 
         // Time spent per stage since the last SoftPrintStats (ns).
-        struct Stats { uint64_t vertex, raster, resolve, texture, draws, decodes, decodedTexels, hashed; } g_stats{};
+        struct Stats { uint64_t vertex, raster, resolve, texture, parallel, draws, decodes, decodedTexels, hashed; } g_stats{};
         struct ScopedTimer
         {
             uint64_t& sink;
@@ -68,13 +70,16 @@ namespace gpu
         // job has finished. Used for row bands of rasterisation and resolves.
 
         thread_local bool t_inPool = false;
+        std::atomic<uint64_t> g_poolBusyNs{ 0 }; // summed over threads (TTT2_GPU_STATS)
 
         class WorkerPool
         {
         public:
             WorkerPool()
             {
-                const unsigned n = std::max(1u, std::thread::hardware_concurrency());
+                unsigned n = std::max(1u, std::thread::hardware_concurrency());
+                if (const char* v = std::getenv("TTT2_SOFT_THREADS"))
+                    n = std::max(1u, unsigned(std::strtoul(v, nullptr, 10)));
                 for (unsigned i = 1; i < n; i++)
                     std::thread([this] { Worker(); }).detach();
             }
@@ -89,6 +94,7 @@ namespace gpu
                         fn(i);
                     return;
                 }
+                ScopedTimer timer{ g_stats.parallel };
                 auto job = std::make_shared<Job>();
                 job->fn = &fn;
                 job->count = count;
@@ -119,11 +125,13 @@ namespace gpu
             {
                 t_inPool = true;
                 int completed = 0;
+                const auto start = std::chrono::steady_clock::now();
                 for (int i; (i = job.next.fetch_add(1)) < job.count;)
                 {
                     (*job.fn)(i);
                     ++completed;
                 }
+                g_poolBusyNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
                 t_inPool = false;
                 if (completed)
                 {
@@ -332,16 +340,21 @@ namespace gpu
 
             size_t Index(uint32_t sx, uint32_t sy) const
             {
-                const uint32_t tile = (baseTile + (sy / 16) * tilesPerRow + sx / tileWidth) % kEdramTiles;
-                return size_t(tile) * kTileSamples + (sy % 16) * tileWidth + sx % tileWidth;
+                // Constant divisors (the tile width is 80 or 40) avoid a hardware divide.
+                const uint32_t tx = tileWidth == 80 ? sx / 80 : sx / 40;
+                const uint32_t tile = (baseTile + (sy / 16) * tilesPerRow + tx) % kEdramTiles;
+                return size_t(tile) * kTileSamples + (sy % 16) * tileWidth + (sx - tx * tileWidth);
             }
 
             template <typename Fn>
             void ForEachSample(uint32_t x, uint32_t y, Fn&& fn) const
             {
+                // A pixel's samples (at most 2x2, starting on even coordinates) never straddle
+                // a tile, whose width and height are even: they sit side by side in one tile.
+                const size_t first = Index(x * scaleX, y * scaleY);
                 for (uint32_t j = 0; j < scaleY; j++)
                     for (uint32_t i = 0; i < scaleX; i++)
-                        fn(Index(x * scaleX + i, y * scaleY + j));
+                        fn(first + j * tileWidth + i);
             }
         };
 
@@ -358,6 +371,7 @@ namespace gpu
             uint32_t base = 0, bytes = 0;
             uint64_t hash = 0;
             uint64_t verifiedFrame = 0;
+            bool stale = false; // a resolve overwrote the source: decode again on next use
         };
 
         struct FetchKey
@@ -378,9 +392,8 @@ namespace gpu
         std::unordered_map<FetchKey, Texture, FetchKeyHash> g_textureCache;
         uint64_t g_frame = 1;
 
-        uint64_t HashMemory(uint32_t address, uint32_t bytes)
+        uint64_t HashBytes(const uint8_t* p, size_t bytes)
         {
-            const uint8_t* p = guest::ToHost<const uint8_t>(address);
             uint64_t h0 = 0x9E3779B97F4A7C15ull, h1 = 0xC2B2AE3D27D4EB4Full;
             size_t i = 0;
             for (; i + 16 <= bytes; i += 16)
@@ -394,6 +407,26 @@ namespace gpu
             for (; i < bytes; i++)
                 h0 = (h0 ^ p[i]) * 0x100000001B3ull;
             return h0 ^ (h1 * 31);
+        }
+
+        // Hashes guest memory in 256 KiB chunks across the pool (textures are hashed every
+        // frame to detect CPU rewrites).
+        uint64_t HashMemory(uint32_t address, uint32_t bytes)
+        {
+            const uint8_t* p = guest::ToHost<const uint8_t>(address);
+            constexpr size_t kChunk = 256 * 1024;
+            const int chunks = int((size_t(bytes) + kChunk - 1) / kChunk);
+            if (chunks <= 1)
+                return HashBytes(p, bytes);
+            std::vector<uint64_t> parts(chunks);
+            Pool().Run(chunks, [&](int c) {
+                const size_t begin = size_t(c) * kChunk;
+                parts[c] = HashBytes(p + begin, std::min(kChunk, size_t(bytes) - begin));
+            });
+            uint64_t h = 0xCBF29CE484222325ull;
+            for (uint64_t part : parts)
+                h = (h ^ part) * 0x100000001B3ull;
+            return h;
         }
 
         // Block size (texels per side) and bytes per block of a texture format; false if unknown.
@@ -607,6 +640,7 @@ namespace gpu
         {
             ScopedTimer timer{ g_stats.texture };
             tex.ok = false;
+            tex.stale = false;
             if ((fetch[0] & 3) != 2)
                 return;
             const TextureInfo info = DecodeTextureFetch(fetch);
@@ -627,29 +661,34 @@ namespace gpu
                 sign[k] = (fetch[0] >> (2 + 2 * k)) & 3;
             const bool integer = fetch[3] & 1;
 
-            // Format components (comp0 = X ...) per texel, before the fetch swizzle.
-            std::vector<F4> comps;
-            if (!DecodeComponents(info, fetch, comps))
-            {
-                std::vector<uint32_t> bgra;
-                const ParallelFor parallel = [](uint32_t count, const std::function<void(uint32_t)>& fn) {
-                    constexpr uint32_t kRows = 8;
-                    Pool().Run(int((count + kRows - 1) / kRows), [&](int band) {
-                        for (uint32_t row = uint32_t(band) * kRows; row < std::min(count, uint32_t(band + 1) * kRows); row++)
-                            fn(row);
-                    });
-                };
-                if (!ConvertToBgra(info, bgra, parallel))
-                {
-                    static bool warned[64];
-                    if (!warned[info.format & 63])
-                    {
-                        warned[info.format & 63] = true;
-                        std::fprintf(stderr, "[gpu] soft: unsupported texture format %u\n", info.format);
-                    }
-                    return;
-                }
+            uint32_t select[4];
+            for (int k = 0; k < 4; k++)
+                select[k] = (swizzle >> (k * 3)) & 7;
+            // Applies the fetch swizzle and exponent bias to format components (comp0 = X ...).
+            auto swizzleTexel = [&](const F4& comp, F4& out) {
+                for (int k = 0; k < 4; k++)
+                    out[k] = select[k] < 4 ? comp[select[k]] * expScale : (select[k] == 5 ? 1.0f : 0.0f);
+            };
+            constexpr size_t kChunk = 16384;
 
+            // Reused across decodes (movie frames are decoded every frame).
+            // Bound to plain references: lambdas run on pool threads would otherwise see
+            // their own thread's (empty) copies.
+            thread_local std::vector<F4> compsStorage;
+            thread_local std::vector<uint32_t> bgraStorage;
+            std::vector<F4>& comps = compsStorage;
+            std::vector<uint32_t>& bgra = bgraStorage;
+            if (DecodeComponents(info, fetch, comps))
+            {
+                tex.texels.resize(comps.size());
+                Pool().Run(int((comps.size() + kChunk - 1) / kChunk), [&](int chunk) {
+                    const size_t end = std::min(comps.size(), size_t(chunk + 1) * kChunk);
+                    for (size_t i = size_t(chunk) * kChunk; i < end; i++)
+                        swizzleTexel(comps[i], tex.texels[i]);
+                });
+            }
+            else
+            {
                 // ConvertToBgra keeps 8_8_8_8 in native component order (X in the low byte)
                 // and packs every other format as B,G,R,A bytes with R = component 0. Formats
                 // with 8-bit components keep their raw bytes, so signed modes can be applied.
@@ -658,11 +697,8 @@ namespace gpu
                 const bool oneComp = info.format == 2;  // k_8
                 const bool rawBytes = native8888 || twoComp || oneComp;
                 const bool anySign = sign[0] || sign[1] || sign[2] || sign[3] || integer;
-                comps.resize(bgra.size());
-                constexpr size_t kChunk = 16384;
-                Pool().Run(int((bgra.size() + kChunk - 1) / kChunk), [&](int chunk) {
-                    const size_t end = std::min(bgra.size(), size_t(chunk + 1) * kChunk);
-                    for (size_t i = size_t(chunk) * kChunk; i < end; i++)
+                auto convert = [&](size_t begin, size_t end) {
+                    for (size_t i = begin; i < end; i++)
                     {
                         const uint32_t c = bgra[i];
                         uint32_t raw[4];
@@ -674,7 +710,7 @@ namespace gpu
                             raw[0] = raw[1] = raw[2] = raw[3] = c & 0xFF;
                         else
                             raw[0] = (c >> 16) & 0xFF, raw[1] = (c >> 8) & 0xFF, raw[2] = c & 0xFF, raw[3] = c >> 24;
-                        F4& comp = comps[i];
+                        F4 comp;
                         for (int k = 0; k < 4; k++)
                         {
                             if (!anySign)
@@ -684,8 +720,34 @@ namespace gpu
                             else // signed mode on an expanded format: approximate from unorm
                                 comp[k] = float(raw[k]) / 255.0f * 2.0f - 1.0f;
                         }
+                        swizzleTexel(comp, tex.texels[i]);
                     }
-                });
+                };
+                // Each band of block rows is converted to texels right after it is untiled,
+                // while it is still in cache.
+                uint32_t blockW = 1, blockBytes = 0;
+                FormatBlock(info.format, blockW, blockBytes);
+                tex.texels.resize(size_t(info.width) * info.height);
+                const ParallelFor untileAndConvert = [&](uint32_t count, const std::function<void(uint32_t)>& fn) {
+                    constexpr uint32_t kRows = 8;
+                    Pool().Run(int((count + kRows - 1) / kRows), [&](int band) {
+                        const uint32_t r0 = uint32_t(band) * kRows, r1 = std::min(count, r0 + kRows);
+                        for (uint32_t row = r0; row < r1; row++)
+                            fn(row);
+                        const uint32_t y0 = std::min(info.height, r0 * blockW), y1 = std::min(info.height, r1 * blockW);
+                        convert(size_t(y0) * info.width, size_t(y1) * info.width);
+                    });
+                };
+                if (!ConvertToBgra(info, bgra, untileAndConvert))
+                {
+                    static bool warned[64];
+                    if (!warned[info.format & 63])
+                    {
+                        warned[info.format & 63] = true;
+                        std::fprintf(stderr, "[gpu] soft: unsupported texture format %u\n", info.format);
+                    }
+                    return;
+                }
             }
 
             tex.width = info.width;
@@ -694,21 +756,6 @@ namespace gpu
             tex.clampY = (fetch[0] >> 13) & 7;
             tex.magFilter = (fetch[3] >> 19) & 3;
             tex.minFilter = (fetch[3] >> 21) & 3;
-            tex.texels.resize(comps.size());
-            constexpr size_t kChunk = 16384;
-            Pool().Run(int((comps.size() + kChunk - 1) / kChunk), [&](int chunk) {
-                const size_t end = std::min(comps.size(), size_t(chunk + 1) * kChunk);
-                for (size_t i = size_t(chunk) * kChunk; i < end; i++)
-                {
-                    const F4& comp = comps[i];
-                    F4& out = tex.texels[i];
-                    for (int k = 0; k < 4; k++)
-                    {
-                        const uint32_t sel = (swizzle >> (k * 3)) & 7;
-                        out[k] = sel < 4 ? comp[sel] * expScale : (sel == 5 ? 1.0f : 0.0f);
-                    }
-                }
-            });
             tex.ok = true;
             if (g_softDumpTextures)
                 DumpTexture(tex, info);
@@ -720,7 +767,7 @@ namespace gpu
             std::memcpy(key.d, fetch, sizeof(key.d));
             auto [it, inserted] = g_textureCache.try_emplace(key);
             Texture& tex = it->second;
-            if (inserted)
+            if (inserted || tex.stale)
             {
                 DecodeTexture(tex, fetch);
             }
@@ -738,15 +785,13 @@ namespace gpu
             return tex;
         }
 
-        // Drops decodes whose memory a resolve just overwrote.
+        // Marks decodes whose memory a resolve just overwrote (keeping their storage, which
+        // the next decode reuses: render targets sampled every frame are large).
         void InvalidateTextures(uint32_t base, uint32_t bytes)
         {
-            for (auto it = g_textureCache.begin(); it != g_textureCache.end();)
-            {
-                const Texture& t = it->second;
-                const bool overlaps = t.bytes == 0 || (t.base < base + bytes && base < t.base + t.bytes);
-                it = overlaps ? g_textureCache.erase(it) : std::next(it);
-            }
+            for (auto& [key, t] : g_textureCache)
+                if (t.bytes == 0 || (t.base < base + bytes && base < t.base + t.bytes))
+                    t.stale = true;
         }
 
         int WrapCoord(int i, int n, uint32_t mode)
@@ -859,198 +904,338 @@ namespace gpu
             bool pixel = false;
         };
 
-        struct Interpreter
+        // An ALU instruction with its operands decoded and aL folded into the indices it
+        // offsets, so executing it per pixel does no bitfield or control-flow work.
+        struct AluOp
         {
-            DrawState& state;
-            const Program& program;
-            Invocation& s;
-            uint32_t constBase;
-
-            F4 ReadSource(uint32_t reg, bool isRegister, uint32_t swizzle, bool negate, bool absConstants,
-                bool constRelative, bool addressRelative, bool relativeSwizzle) const
+            struct Source
             {
-                F4 raw;
-                bool abs;
+                uint32_t index = 0;      // register (taken & 127) or constant (taken & 255)
+                bool isRegister = false;
+                bool relativeA0 = false; // constants: index += a0 when read
+                bool abs = false, negate = false;
+                uint8_t comp[4] = { 0, 1, 2, 3 };
+            };
+            AluInstruction a;
+            Source src[3];
+            // Scalar ops 42-47 take constant src3 .w-ish (scalarConstComp) and a GPR component.
+            bool scalarConst = false;
+            uint32_t scalarConstComp = 0, scalarGpr = 0, scalarGprComp = 0;
+            uint32_t vectorDest = 0, scalarDest = 0; // GPR destinations, aL applied
+        };
+
+        AluOp DecodeAlu(const uint32_t* ins, int aL)
+        {
+            AluOp op;
+            AluInstruction& a = op.a;
+            std::memcpy(&a, ins, 12);
+            auto decode = [&](uint32_t reg, bool isRegister, uint32_t swizzle, bool negate, bool constRelative, bool relativeSwizzle) {
+                AluOp::Source src;
+                src.isRegister = isRegister;
+                src.negate = negate;
                 if (isRegister)
                 {
-                    abs = (reg & 0x80) != 0;
-                    uint32_t index = reg & 0x3F;
-                    if (reg & 0x40)
-                        index += uint32_t(s.aL);
-                    raw = s.r[index & 127];
+                    src.abs = (reg & 0x80) != 0;
+                    src.index = (reg & 0x3F) + ((reg & 0x40) ? uint32_t(aL) : 0u);
                 }
                 else
                 {
-                    abs = absConstants;
-                    int index = int(reg);
+                    src.abs = a.absConstants;
+                    src.index = reg;
                     if (constRelative)
-                        index += addressRelative ? s.a0 : s.aL;
-                    raw = state.constants[constBase + (uint32_t(index) & 255)];
+                    {
+                        if (a.constAddressRegisterRelative)
+                            src.relativeA0 = true;
+                        else
+                            src.index += uint32_t(aL);
+                    }
                 }
+                for (int i = 0; i < 4; i++)
+                    src.comp[i] = uint8_t(relativeSwizzle ? (((swizzle >> (i * 2)) + i) & 3) : i);
+                return src;
+            };
+            // Constant operands take const0Relative/const1Relative in source order.
+            int constIndex = 0;
+            auto source = [&](uint32_t reg, bool select, uint32_t swizzle, bool negate) {
+                bool relative = false;
+                if (!select)
+                    relative = (constIndex++ == 0) ? a.const0Relative : a.const1Relative;
+                return decode(reg, select, swizzle, negate, relative, true);
+            };
+            op.src[0] = source(a.src1Register, a.src1Select, a.src1Swizzle, a.src1Negate);
+            op.src[1] = source(a.src2Register, a.src2Select, a.src2Swizzle, a.src2Negate);
+            const uint32_t sop = uint32_t(a.scalarOpcode);
+            op.scalarConst = sop >= 42 && sop <= 47;
+            if (op.scalarConst)
+            {
+                // const (src3Register) op GPR (encoded in the opcode/select/swizzle bits)
+                const uint32_t swz = a.src3Swizzle;
+                op.src[2] = decode(a.src3Register, false, 0xE4, a.src3Negate, a.const0Relative, false);
+                op.scalarConstComp = ((swz >> 6) + 3) & 3;
+                op.scalarGpr = ((sop & 1) | (uint32_t(a.src3Select) << 1) | (swz & 0x3C)) & 127;
+                op.scalarGprComp = swz & 3;
+            }
+            else
+            {
+                op.src[2] = source(a.src3Register, a.src3Select, a.src3Swizzle, a.src3Negate);
+            }
+            op.vectorDest = a.vectorDest + (a.vectorDestRelative ? uint32_t(aL) : 0u);
+            op.scalarDest = a.scalarDest + (a.scalarDestRelative ? uint32_t(aL) : 0u);
+            return op;
+        }
+
+        // Vector ALU op for one invocation. pushPredicate/newP0 report a predicate push,
+        // kill a kill condition (applied by the caller); newP0 must hold the current p0.
+        void VectorOp(AluVectorOpcode vop, const F4& src1, const F4& src2, const F4& src3, F4& vr,
+            bool& pushPredicate, bool& newP0, bool& kill)
+        {
+            switch (vop)
+            {
+            case AluVectorOpcode::Add: for (int i = 0; i < 4; i++) vr[i] = src1[i] + src2[i]; break;
+            case AluVectorOpcode::Mul: for (int i = 0; i < 4; i++) vr[i] = Mul(src1[i], src2[i]); break;
+            case AluVectorOpcode::Max:
+            case AluVectorOpcode::MaxA: for (int i = 0; i < 4; i++) vr[i] = src1[i] >= src2[i] ? src1[i] : src2[i]; break;
+            case AluVectorOpcode::Min: for (int i = 0; i < 4; i++) vr[i] = src1[i] < src2[i] ? src1[i] : src2[i]; break;
+            case AluVectorOpcode::Seq: for (int i = 0; i < 4; i++) vr[i] = src1[i] == src2[i] ? 1.0f : 0.0f; break;
+            case AluVectorOpcode::Sgt: for (int i = 0; i < 4; i++) vr[i] = src1[i] > src2[i] ? 1.0f : 0.0f; break;
+            case AluVectorOpcode::Sge: for (int i = 0; i < 4; i++) vr[i] = src1[i] >= src2[i] ? 1.0f : 0.0f; break;
+            case AluVectorOpcode::Sne: for (int i = 0; i < 4; i++) vr[i] = src1[i] != src2[i] ? 1.0f : 0.0f; break;
+            case AluVectorOpcode::Frc: for (int i = 0; i < 4; i++) vr[i] = src1[i] - std::floor(src1[i]); break;
+            case AluVectorOpcode::Trunc: for (int i = 0; i < 4; i++) vr[i] = std::trunc(src1[i]); break;
+            case AluVectorOpcode::Floor: for (int i = 0; i < 4; i++) vr[i] = std::floor(src1[i]); break;
+            case AluVectorOpcode::Mad: for (int i = 0; i < 4; i++) vr[i] = Mul(src1[i], src2[i]) + src3[i]; break;
+            case AluVectorOpcode::CndEq: for (int i = 0; i < 4; i++) vr[i] = src1[i] == 0.0f ? src2[i] : src3[i]; break;
+            case AluVectorOpcode::CndGe: for (int i = 0; i < 4; i++) vr[i] = src1[i] >= 0.0f ? src2[i] : src3[i]; break;
+            case AluVectorOpcode::CndGt: for (int i = 0; i < 4; i++) vr[i] = src1[i] > 0.0f ? src2[i] : src3[i]; break;
+            case AluVectorOpcode::Dp4:
+            {
+                const float d = Mul(src1[0], src2[0]) + Mul(src1[1], src2[1]) + Mul(src1[2], src2[2]) + Mul(src1[3], src2[3]);
+                vr = { d, d, d, d };
+                break;
+            }
+            case AluVectorOpcode::Dp3:
+            {
+                const float d = Mul(src1[0], src2[0]) + Mul(src1[1], src2[1]) + Mul(src1[2], src2[2]);
+                vr = { d, d, d, d };
+                break;
+            }
+            case AluVectorOpcode::Dp2Add:
+            {
+                const float d = Mul(src1[0], src2[0]) + Mul(src1[1], src2[1]) + src3[0];
+                vr = { d, d, d, d };
+                break;
+            }
+            case AluVectorOpcode::Cube:
+            {
+                // src1 = r.zzxy, src2 = r.yxzz (as the D3D compiler emits it).
+                const float x = src1[2], y = src2[0], z = src1[0];
+                const float ax = std::fabs(x), ay = std::fabs(y), az = std::fabs(z);
+                float sc, tc, ma, face;
+                if (az >= ax && az >= ay) { sc = z < 0 ? -x : x; tc = -y; ma = az; face = z < 0 ? 5.0f : 4.0f; }
+                else if (ay >= ax) { sc = x; tc = y < 0 ? -z : z; ma = ay; face = y < 0 ? 3.0f : 2.0f; }
+                else { sc = x < 0 ? z : -z; tc = -y; ma = ax; face = x < 0 ? 1.0f : 0.0f; }
+                vr = { tc, sc, 2.0f * ma, face };
+                break;
+            }
+            case AluVectorOpcode::Max4:
+            {
+                const float m = std::max(std::max(src1[0], src1[1]), std::max(src1[2], src1[3]));
+                vr = { m, m, m, m };
+                break;
+            }
+            case AluVectorOpcode::SetpEqPush:
+            case AluVectorOpcode::SetpNePush:
+            case AluVectorOpcode::SetpGtPush:
+            case AluVectorOpcode::SetpGePush:
+            {
+                const float b = src2[3];
+                bool cond = false;
+                switch (vop)
+                {
+                case AluVectorOpcode::SetpEqPush: cond = b == 0.0f; break;
+                case AluVectorOpcode::SetpNePush: cond = b != 0.0f; break;
+                case AluVectorOpcode::SetpGtPush: cond = b > 0.0f; break;
+                default: cond = b >= 0.0f; break;
+                }
+                pushPredicate = true;
+                newP0 = src1[3] == 0.0f && cond;
+                const float v = newP0 ? 0.0f : src1[0] + 1.0f;
+                vr = { v, v, v, v };
+                break;
+            }
+            case AluVectorOpcode::KillEq:
+            case AluVectorOpcode::KillGt:
+            case AluVectorOpcode::KillGe:
+            case AluVectorOpcode::KillNe:
+            {
+                for (int i = 0; i < 4; i++)
+                {
+                    switch (vop)
+                    {
+                    case AluVectorOpcode::KillEq: kill |= src1[i] == src2[i]; break;
+                    case AluVectorOpcode::KillGt: kill |= src1[i] > src2[i]; break;
+                    case AluVectorOpcode::KillGe: kill |= src1[i] >= src2[i]; break;
+                    default: kill |= src1[i] != src2[i]; break;
+                    }
+                }
+                const float v = kill ? 1.0f : 0.0f;
+                vr = { v, v, v, v };
+                break;
+            }
+            case AluVectorOpcode::Dst:
+                vr = { 1.0f, Mul(src1[1], src2[1]), src1[2], src2[3] };
+                break;
+            default:
+                break;
+            }
+        }
+
+        // Scalar ALU op for one invocation: returns the result (before saturation) and
+        // updates a0, newP0 (holding the current p0), kill and whether ps is written.
+        float ScalarOp(AluScalarOpcode sop, float sa, float sb, float ps, int& a0, bool& newP0, bool& kill, bool& scalarWrites)
+        {
+            float sr = ps;
+            scalarWrites = sop != AluScalarOpcode::RetainPrev;
+            switch (sop)
+            {
+            case AluScalarOpcode::Adds: sr = sa + sb; break;
+            case AluScalarOpcode::AddsPrev: sr = sa + ps; break;
+            case AluScalarOpcode::Muls: sr = Mul(sa, sb); break;
+            case AluScalarOpcode::MulsPrev:
+            case AluScalarOpcode::MulsPrev2: sr = Mul(sa, ps); break;
+            case AluScalarOpcode::Maxs: sr = sa >= sb ? sa : sb; break;
+            case AluScalarOpcode::Mins: sr = sa < sb ? sa : sb; break;
+            case AluScalarOpcode::Seqs: sr = sa == 0.0f ? 1.0f : 0.0f; break;
+            case AluScalarOpcode::Sgts: sr = sa > 0.0f ? 1.0f : 0.0f; break;
+            case AluScalarOpcode::Sges: sr = sa >= 0.0f ? 1.0f : 0.0f; break;
+            case AluScalarOpcode::Snes: sr = sa != 0.0f ? 1.0f : 0.0f; break;
+            case AluScalarOpcode::Frcs: sr = sa - std::floor(sa); break;
+            case AluScalarOpcode::Truncs: sr = std::trunc(sa); break;
+            case AluScalarOpcode::Floors: sr = std::floor(sa); break;
+            case AluScalarOpcode::Exp: sr = std::exp2(sa); break;
+            case AluScalarOpcode::Logc: sr = std::log2(sa); if (std::isinf(sr) && sr < 0) sr = -FLT_MAX; break;
+            case AluScalarOpcode::Log: sr = std::log2(sa); break;
+            case AluScalarOpcode::Rcpc: sr = 1.0f / sa; if (std::isinf(sr)) sr = std::copysign(FLT_MAX, sr); break;
+            case AluScalarOpcode::Rcpf: sr = 1.0f / sa; if (std::isinf(sr)) sr = std::copysign(0.0f, sr); break;
+            case AluScalarOpcode::Rcp: sr = 1.0f / sa; break;
+            case AluScalarOpcode::Rsqc: sr = 1.0f / std::sqrt(sa); if (std::isinf(sr)) sr = std::copysign(FLT_MAX, sr); break;
+            case AluScalarOpcode::Rsqf: sr = 1.0f / std::sqrt(sa); if (std::isinf(sr)) sr = std::copysign(0.0f, sr); break;
+            case AluScalarOpcode::Rsq: sr = 1.0f / std::sqrt(sa); break;
+            case AluScalarOpcode::MaxAs:
+                a0 = int(std::clamp(std::floor(sa + 0.5f), -256.0f, 255.0f));
+                sr = sa >= sb ? sa : sb;
+                break;
+            case AluScalarOpcode::MaxAsf:
+                a0 = int(std::clamp(std::floor(sa), -256.0f, 255.0f));
+                sr = sa >= sb ? sa : sb;
+                break;
+            case AluScalarOpcode::Subs: sr = sa - sb; break;
+            case AluScalarOpcode::SubsPrev: sr = sa - ps; break;
+            case AluScalarOpcode::SetpEq: newP0 = sa == 0.0f; sr = newP0 ? 0.0f : 1.0f; break;
+            case AluScalarOpcode::SetpNe: newP0 = sa != 0.0f; sr = newP0 ? 0.0f : 1.0f; break;
+            case AluScalarOpcode::SetpGt: newP0 = sa > 0.0f; sr = newP0 ? 0.0f : 1.0f; break;
+            case AluScalarOpcode::SetpGe: newP0 = sa >= 0.0f; sr = newP0 ? 0.0f : 1.0f; break;
+            case AluScalarOpcode::SetpInv:
+                newP0 = sa == 1.0f;
+                sr = newP0 ? 0.0f : (sa == 0.0f ? 1.0f : sa);
+                break;
+            case AluScalarOpcode::SetpPop:
+                newP0 = sa - 1.0f <= 0.0f;
+                sr = newP0 ? 0.0f : sa - 1.0f;
+                break;
+            case AluScalarOpcode::SetpClr: newP0 = false; sr = FLT_MAX; break;
+            case AluScalarOpcode::SetpRstr: newP0 = sa == 0.0f; sr = sa; break;
+            case AluScalarOpcode::KillsEq:
+            case AluScalarOpcode::KillsGt:
+            case AluScalarOpcode::KillsGe:
+            case AluScalarOpcode::KillsNe:
+            case AluScalarOpcode::KillsOne:
+            {
+                switch (sop)
+                {
+                case AluScalarOpcode::KillsEq: kill = sa == 0.0f; break;
+                case AluScalarOpcode::KillsGt: kill = sa > 0.0f; break;
+                case AluScalarOpcode::KillsGe: kill = sa >= 0.0f; break;
+                case AluScalarOpcode::KillsNe: kill = sa != 0.0f; break;
+                default: kill = sa == 1.0f; break;
+                }
+                sr = kill ? 1.0f : 0.0f;
+                break;
+            }
+            case AluScalarOpcode::Sqrt: sr = std::sqrt(sa); break;
+            case AluScalarOpcode::Mulsc0:
+            case AluScalarOpcode::Mulsc1: sr = Mul(sa, sb); break;
+            case AluScalarOpcode::Addsc0:
+            case AluScalarOpcode::Addsc1: sr = sa + sb; break;
+            case AluScalarOpcode::Subsc0:
+            case AluScalarOpcode::Subsc1: sr = sa - sb; break;
+            case AluScalarOpcode::Sin: sr = std::sin(sa); break;
+            case AluScalarOpcode::Cos: sr = std::cos(sa); break;
+            default: scalarWrites = false; break;
+            }
+            return sr;
+        }
+
+        // Executes decoded instructions for one invocation (shared by the interpreter and
+        // the compiled, batched pixel path).
+        struct Executor
+        {
+            DrawState& state;
+            bool pixel;
+            uint32_t constBase;
+
+            F4 Read(const AluOp::Source& src, const Invocation& s) const
+            {
+                const F4& raw = src.isRegister ? s.r[src.index & 127]
+                    : state.constants[constBase + ((src.index + (src.relativeA0 ? uint32_t(s.a0) : 0u)) & 255)];
                 F4 out;
                 for (int i = 0; i < 4; i++)
                 {
-                    float v = raw[relativeSwizzle ? (((swizzle >> (i * 2)) + i) & 3) : i];
-                    if (abs)
+                    float v = raw[src.comp[i]];
+                    if (src.abs)
                         v = std::fabs(v);
-                    out[i] = negate ? -v : v;
+                    out[i] = src.negate ? -v : v;
                 }
                 return out;
             }
 
-            void Alu(const uint32_t* ins)
+            void Alu(const AluOp& op, Invocation& s) const
             {
-                AluInstruction a;
-                std::memcpy(&a, ins, 12);
+                const AluInstruction& a = op.a;
                 if (a.isPredicated && s.p0 != bool(a.predicateCondition))
                     return;
 
-                // Constant operands take const0Relative/const1Relative in source order.
-                int constIndex = 0;
-                auto source = [&](uint32_t reg, bool select, uint32_t swizzle, bool negate) {
-                    bool relative = false;
-                    if (!select)
-                        relative = (constIndex++ == 0) ? a.const0Relative : a.const1Relative;
-                    return ReadSource(reg, select, swizzle, negate, a.absConstants, relative,
-                        a.constAddressRegisterRelative, true);
-                };
-
                 const auto vop = a.vectorOpcode;
                 const auto sop = a.scalarOpcode;
-                const F4 src1 = source(a.src1Register, a.src1Select, a.src1Swizzle, a.src1Negate);
-                const F4 src2 = source(a.src2Register, a.src2Select, a.src2Swizzle, a.src2Negate);
+                const F4 src1 = Read(op.src[0], s);
+                const F4 src2 = Read(op.src[1], s);
 
                 // Scalar operands come from src3: a = its swizzled .w, b = its swizzled .x.
-                const bool scalarConst = uint32_t(sop) >= 42 && uint32_t(sop) <= 47;
                 F4 src3{};
                 float sa = 0.0f, sb = 0.0f;
-                if (scalarConst)
+                if (op.scalarConst)
                 {
-                    // const (src3Register) op GPR (encoded in the opcode/select/swizzle bits)
-                    const uint32_t swz = a.src3Swizzle;
-                    const F4 c = ReadSource(a.src3Register, false, 0xE4 /* identity, unused */, a.src3Negate,
-                        a.absConstants, a.const0Relative, a.constAddressRegisterRelative, false);
-                    sa = c[((swz >> 6) + 3) & 3];
-                    const uint32_t gpr = (uint32_t(sop) & 1) | (uint32_t(a.src3Select) << 1) | (swz & 0x3C);
-                    float v = s.r[gpr & 127][swz & 3];
+                    sa = Read(op.src[2], s)[op.scalarConstComp];
+                    float v = s.r[op.scalarGpr][op.scalarGprComp];
                     if (a.absConstants)
                         v = std::fabs(v);
                     sb = a.src3Negate ? -v : v;
                 }
                 else
                 {
-                    src3 = source(a.src3Register, a.src3Select, a.src3Swizzle, a.src3Negate);
-                    // `source` applied the relative swizzle per component; undo it to pick
-                    // the scalar operands by their absolute positions (components 3 and 0).
+                    src3 = Read(op.src[2], s);
+                    // The relative swizzle was applied per component; the scalar operands
+                    // are picked by their absolute positions (components 3 and 0).
                     sa = src3[3];
                     sb = src3[0];
                 }
 
                 // ---- vector op
                 F4 vr{};
-                bool pushPredicate = false, newP0 = s.p0;
-                switch (vop)
-                {
-                case AluVectorOpcode::Add: for (int i = 0; i < 4; i++) vr[i] = src1[i] + src2[i]; break;
-                case AluVectorOpcode::Mul: for (int i = 0; i < 4; i++) vr[i] = Mul(src1[i], src2[i]); break;
-                case AluVectorOpcode::Max:
-                case AluVectorOpcode::MaxA: for (int i = 0; i < 4; i++) vr[i] = src1[i] >= src2[i] ? src1[i] : src2[i]; break;
-                case AluVectorOpcode::Min: for (int i = 0; i < 4; i++) vr[i] = src1[i] < src2[i] ? src1[i] : src2[i]; break;
-                case AluVectorOpcode::Seq: for (int i = 0; i < 4; i++) vr[i] = src1[i] == src2[i] ? 1.0f : 0.0f; break;
-                case AluVectorOpcode::Sgt: for (int i = 0; i < 4; i++) vr[i] = src1[i] > src2[i] ? 1.0f : 0.0f; break;
-                case AluVectorOpcode::Sge: for (int i = 0; i < 4; i++) vr[i] = src1[i] >= src2[i] ? 1.0f : 0.0f; break;
-                case AluVectorOpcode::Sne: for (int i = 0; i < 4; i++) vr[i] = src1[i] != src2[i] ? 1.0f : 0.0f; break;
-                case AluVectorOpcode::Frc: for (int i = 0; i < 4; i++) vr[i] = src1[i] - std::floor(src1[i]); break;
-                case AluVectorOpcode::Trunc: for (int i = 0; i < 4; i++) vr[i] = std::trunc(src1[i]); break;
-                case AluVectorOpcode::Floor: for (int i = 0; i < 4; i++) vr[i] = std::floor(src1[i]); break;
-                case AluVectorOpcode::Mad: for (int i = 0; i < 4; i++) vr[i] = Mul(src1[i], src2[i]) + src3[i]; break;
-                case AluVectorOpcode::CndEq: for (int i = 0; i < 4; i++) vr[i] = src1[i] == 0.0f ? src2[i] : src3[i]; break;
-                case AluVectorOpcode::CndGe: for (int i = 0; i < 4; i++) vr[i] = src1[i] >= 0.0f ? src2[i] : src3[i]; break;
-                case AluVectorOpcode::CndGt: for (int i = 0; i < 4; i++) vr[i] = src1[i] > 0.0f ? src2[i] : src3[i]; break;
-                case AluVectorOpcode::Dp4:
-                {
-                    const float d = Mul(src1[0], src2[0]) + Mul(src1[1], src2[1]) + Mul(src1[2], src2[2]) + Mul(src1[3], src2[3]);
-                    vr = { d, d, d, d };
-                    break;
-                }
-                case AluVectorOpcode::Dp3:
-                {
-                    const float d = Mul(src1[0], src2[0]) + Mul(src1[1], src2[1]) + Mul(src1[2], src2[2]);
-                    vr = { d, d, d, d };
-                    break;
-                }
-                case AluVectorOpcode::Dp2Add:
-                {
-                    const float d = Mul(src1[0], src2[0]) + Mul(src1[1], src2[1]) + src3[0];
-                    vr = { d, d, d, d };
-                    break;
-                }
-                case AluVectorOpcode::Cube:
-                {
-                    // src1 = r.zzxy, src2 = r.yxzz (as the D3D compiler emits it).
-                    const float x = src1[2], y = src2[0], z = src1[0];
-                    const float ax = std::fabs(x), ay = std::fabs(y), az = std::fabs(z);
-                    float sc, tc, ma, face;
-                    if (az >= ax && az >= ay) { sc = z < 0 ? -x : x; tc = -y; ma = az; face = z < 0 ? 5.0f : 4.0f; }
-                    else if (ay >= ax) { sc = x; tc = y < 0 ? -z : z; ma = ay; face = y < 0 ? 3.0f : 2.0f; }
-                    else { sc = x < 0 ? z : -z; tc = -y; ma = ax; face = x < 0 ? 1.0f : 0.0f; }
-                    vr = { tc, sc, 2.0f * ma, face };
-                    break;
-                }
-                case AluVectorOpcode::Max4:
-                {
-                    const float m = std::max(std::max(src1[0], src1[1]), std::max(src1[2], src1[3]));
-                    vr = { m, m, m, m };
-                    break;
-                }
-                case AluVectorOpcode::SetpEqPush:
-                case AluVectorOpcode::SetpNePush:
-                case AluVectorOpcode::SetpGtPush:
-                case AluVectorOpcode::SetpGePush:
-                {
-                    const float b = src2[3];
-                    bool cond = false;
-                    switch (vop)
-                    {
-                    case AluVectorOpcode::SetpEqPush: cond = b == 0.0f; break;
-                    case AluVectorOpcode::SetpNePush: cond = b != 0.0f; break;
-                    case AluVectorOpcode::SetpGtPush: cond = b > 0.0f; break;
-                    default: cond = b >= 0.0f; break;
-                    }
-                    pushPredicate = true;
-                    newP0 = src1[3] == 0.0f && cond;
-                    const float v = newP0 ? 0.0f : src1[0] + 1.0f;
-                    vr = { v, v, v, v };
-                    break;
-                }
-                case AluVectorOpcode::KillEq:
-                case AluVectorOpcode::KillGt:
-                case AluVectorOpcode::KillGe:
-                case AluVectorOpcode::KillNe:
-                {
-                    bool kill = false;
-                    for (int i = 0; i < 4; i++)
-                    {
-                        switch (vop)
-                        {
-                        case AluVectorOpcode::KillEq: kill |= src1[i] == src2[i]; break;
-                        case AluVectorOpcode::KillGt: kill |= src1[i] > src2[i]; break;
-                        case AluVectorOpcode::KillGe: kill |= src1[i] >= src2[i]; break;
-                        default: kill |= src1[i] != src2[i]; break;
-                        }
-                    }
-                    if (kill && program.pixel)
-                        s.killed = true;
-                    const float v = kill ? 1.0f : 0.0f;
-                    vr = { v, v, v, v };
-                    break;
-                }
-                case AluVectorOpcode::Dst:
-                    vr = { 1.0f, Mul(src1[1], src2[1]), src1[2], src2[3] };
-                    break;
-                default:
-                    break;
-                }
+                bool pushPredicate = false, newP0 = s.p0, vectorKill = false;
+                VectorOp(vop, src1, src2, src3, vr, pushPredicate, newP0, vectorKill);
+                if (vectorKill && pixel)
+                    s.killed = true;
                 if (vop == AluVectorOpcode::MaxA)
                     s.a0 = int(std::clamp(std::floor(src1[3] + 0.5f), -256.0f, 255.0f));
                 if (a.vectorSaturate)
@@ -1058,88 +1243,10 @@ namespace gpu
                         v = Saturate(v);
 
                 // ---- scalar op
-                float sr = s.ps;
-                bool scalarWrites = sop != AluScalarOpcode::RetainPrev;
-                switch (sop)
-                {
-                case AluScalarOpcode::Adds: sr = sa + sb; break;
-                case AluScalarOpcode::AddsPrev: sr = sa + s.ps; break;
-                case AluScalarOpcode::Muls: sr = Mul(sa, sb); break;
-                case AluScalarOpcode::MulsPrev:
-                case AluScalarOpcode::MulsPrev2: sr = Mul(sa, s.ps); break;
-                case AluScalarOpcode::Maxs: sr = sa >= sb ? sa : sb; break;
-                case AluScalarOpcode::Mins: sr = sa < sb ? sa : sb; break;
-                case AluScalarOpcode::Seqs: sr = sa == 0.0f ? 1.0f : 0.0f; break;
-                case AluScalarOpcode::Sgts: sr = sa > 0.0f ? 1.0f : 0.0f; break;
-                case AluScalarOpcode::Sges: sr = sa >= 0.0f ? 1.0f : 0.0f; break;
-                case AluScalarOpcode::Snes: sr = sa != 0.0f ? 1.0f : 0.0f; break;
-                case AluScalarOpcode::Frcs: sr = sa - std::floor(sa); break;
-                case AluScalarOpcode::Truncs: sr = std::trunc(sa); break;
-                case AluScalarOpcode::Floors: sr = std::floor(sa); break;
-                case AluScalarOpcode::Exp: sr = std::exp2(sa); break;
-                case AluScalarOpcode::Logc: sr = std::log2(sa); if (std::isinf(sr) && sr < 0) sr = -FLT_MAX; break;
-                case AluScalarOpcode::Log: sr = std::log2(sa); break;
-                case AluScalarOpcode::Rcpc: sr = 1.0f / sa; if (std::isinf(sr)) sr = std::copysign(FLT_MAX, sr); break;
-                case AluScalarOpcode::Rcpf: sr = 1.0f / sa; if (std::isinf(sr)) sr = std::copysign(0.0f, sr); break;
-                case AluScalarOpcode::Rcp: sr = 1.0f / sa; break;
-                case AluScalarOpcode::Rsqc: sr = 1.0f / std::sqrt(sa); if (std::isinf(sr)) sr = std::copysign(FLT_MAX, sr); break;
-                case AluScalarOpcode::Rsqf: sr = 1.0f / std::sqrt(sa); if (std::isinf(sr)) sr = std::copysign(0.0f, sr); break;
-                case AluScalarOpcode::Rsq: sr = 1.0f / std::sqrt(sa); break;
-                case AluScalarOpcode::MaxAs:
-                    s.a0 = int(std::clamp(std::floor(sa + 0.5f), -256.0f, 255.0f));
-                    sr = sa >= sb ? sa : sb;
-                    break;
-                case AluScalarOpcode::MaxAsf:
-                    s.a0 = int(std::clamp(std::floor(sa), -256.0f, 255.0f));
-                    sr = sa >= sb ? sa : sb;
-                    break;
-                case AluScalarOpcode::Subs: sr = sa - sb; break;
-                case AluScalarOpcode::SubsPrev: sr = sa - s.ps; break;
-                case AluScalarOpcode::SetpEq: newP0 = sa == 0.0f; sr = newP0 ? 0.0f : 1.0f; break;
-                case AluScalarOpcode::SetpNe: newP0 = sa != 0.0f; sr = newP0 ? 0.0f : 1.0f; break;
-                case AluScalarOpcode::SetpGt: newP0 = sa > 0.0f; sr = newP0 ? 0.0f : 1.0f; break;
-                case AluScalarOpcode::SetpGe: newP0 = sa >= 0.0f; sr = newP0 ? 0.0f : 1.0f; break;
-                case AluScalarOpcode::SetpInv:
-                    newP0 = sa == 1.0f;
-                    sr = newP0 ? 0.0f : (sa == 0.0f ? 1.0f : sa);
-                    break;
-                case AluScalarOpcode::SetpPop:
-                    newP0 = sa - 1.0f <= 0.0f;
-                    sr = newP0 ? 0.0f : sa - 1.0f;
-                    break;
-                case AluScalarOpcode::SetpClr: newP0 = false; sr = FLT_MAX; break;
-                case AluScalarOpcode::SetpRstr: newP0 = sa == 0.0f; sr = sa; break;
-                case AluScalarOpcode::KillsEq:
-                case AluScalarOpcode::KillsGt:
-                case AluScalarOpcode::KillsGe:
-                case AluScalarOpcode::KillsNe:
-                case AluScalarOpcode::KillsOne:
-                {
-                    bool kill;
-                    switch (sop)
-                    {
-                    case AluScalarOpcode::KillsEq: kill = sa == 0.0f; break;
-                    case AluScalarOpcode::KillsGt: kill = sa > 0.0f; break;
-                    case AluScalarOpcode::KillsGe: kill = sa >= 0.0f; break;
-                    case AluScalarOpcode::KillsNe: kill = sa != 0.0f; break;
-                    default: kill = sa == 1.0f; break;
-                    }
-                    if (kill && program.pixel)
-                        s.killed = true;
-                    sr = kill ? 1.0f : 0.0f;
-                    break;
-                }
-                case AluScalarOpcode::Sqrt: sr = std::sqrt(sa); break;
-                case AluScalarOpcode::Mulsc0:
-                case AluScalarOpcode::Mulsc1: sr = Mul(sa, sb); break;
-                case AluScalarOpcode::Addsc0:
-                case AluScalarOpcode::Addsc1: sr = sa + sb; break;
-                case AluScalarOpcode::Subsc0:
-                case AluScalarOpcode::Subsc1: sr = sa - sb; break;
-                case AluScalarOpcode::Sin: sr = std::sin(sa); break;
-                case AluScalarOpcode::Cos: sr = std::cos(sa); break;
-                default: scalarWrites = false; break;
-                }
+                bool scalarWrites = true, kill = false;
+                float sr = ScalarOp(sop, sa, sb, s.ps, s.a0, newP0, kill, scalarWrites);
+                if (kill && pixel)
+                    s.killed = true;
                 if (a.scalarSaturate)
                     sr = Saturate(sr);
                 const bool scalarSetsPredicate = uint32_t(sop) >= 27 && uint32_t(sop) <= 34;
@@ -1171,20 +1278,14 @@ namespace gpu
                 {
                     if (vmask)
                     {
-                        uint32_t dest = a.vectorDest;
-                        if (a.vectorDestRelative)
-                            dest += uint32_t(s.aL);
-                        F4& r = s.r[dest & 127];
+                        F4& r = s.r[op.vectorDest & 127];
                         for (int i = 0; i < 4; i++)
                             if (vmask & (1u << i))
                                 r[i] = vr[i];
                     }
                     if (smask)
                     {
-                        uint32_t dest = a.scalarDest;
-                        if (a.scalarDestRelative)
-                            dest += uint32_t(s.aL);
-                        F4& r = s.r[dest & 127];
+                        F4& r = s.r[op.scalarDest & 127];
                         for (int i = 0; i < 4; i++)
                             if (smask & (1u << i))
                                 r[i] = s.ps;
@@ -1203,10 +1304,8 @@ namespace gpu
                 }
             }
 
-            void VertexFetch(const uint32_t* ins)
+            void VertexFetch(const VertexFetchInstruction& f, Invocation& s) const
             {
-                VertexFetchInstruction f;
-                std::memcpy(&f, ins, 12);
                 if (f.isPredicated && s.p0 != bool(f.predicateCondition))
                     return;
                 if (!f.isMiniFetch)
@@ -1326,10 +1425,8 @@ namespace gpu
                 ApplyDestSwizzle(s.r[f.dstRegister & 63], v, f.dstSwizzle);
             }
 
-            void TextureFetch(const uint32_t* ins)
+            void TextureFetch(const TextureFetchInstruction& f, Invocation& s) const
             {
-                TextureFetchInstruction f;
-                std::memcpy(&f, ins, 12);
                 if (f.isPredicated && s.p0 != bool(f.predCondition))
                     return;
                 if (f.opcode != FetchOpcode::TextureFetch)
@@ -1340,9 +1437,13 @@ namespace gpu
                     return;
                 }
                 const F4& src = s.r[f.srcRegister & 63];
-                float u = src[f.srcSwizzle & 3];
-                float v = src[(f.srcSwizzle >> 2) & 3];
-                const Texture& tex = state.TextureSlot(f.constIndex);
+                const F4 result = FetchTexel(f, state.TextureSlot(f.constIndex), src[f.srcSwizzle & 3], src[(f.srcSwizzle >> 2) & 3]);
+                ApplyDestSwizzle(s.r[f.dstRegister & 63], result, f.dstSwizzle);
+            }
+
+            // A texture fetch's result for coordinates (u, v) from its source register.
+            static F4 FetchTexel(const TextureFetchInstruction& f, const Texture& tex, float u, float v)
+            {
                 F4 result{ 0.0f, 0.0f, 0.0f, 0.0f };
                 if (tex.ok && tex.width && tex.height)
                 {
@@ -1356,13 +1457,25 @@ namespace gpu
                     const uint32_t filter = f.magFilter == 3 ? tex.magFilter : f.magFilter;
                     result = SampleTexture(tex, u, v, filter == 1);
                 }
-                ApplyDestSwizzle(s.r[f.dstRegister & 63], result, f.dstSwizzle);
+                return result;
             }
+        };
 
-            bool BoolConstant(uint32_t index) const { return (state.bools[(index >> 5) & 7] >> (index & 31)) & 1; }
+        bool BoolConstant(const DrawState& state, uint32_t index) { return (state.bools[(index >> 5) & 7] >> (index & 31)) & 1; }
+
+        // Walks the control flow program for one invocation, decoding as it goes.
+        struct Interpreter
+        {
+            DrawState& state;
+            const Program& program;
+            Invocation& s;
+            uint32_t constBase;
+
+            bool BoolConstant(uint32_t index) const { return gpu::BoolConstant(state, index); }
 
             void ExecClause(uint32_t address, uint32_t count, uint32_t sequence)
             {
+                const Executor exec{ state, program.pixel, constBase };
                 for (uint32_t k = 0; k < count; k++)
                 {
                     const uint32_t at = (address + k) * 3;
@@ -1372,13 +1485,21 @@ namespace gpu
                     if ((sequence >> (k * 2)) & 1)
                     {
                         if ((ins[0] & 0x1F) == uint32_t(FetchOpcode::VertexFetch))
-                            VertexFetch(ins);
+                        {
+                            VertexFetchInstruction f;
+                            std::memcpy(&f, ins, 12);
+                            exec.VertexFetch(f, s);
+                        }
                         else
-                            TextureFetch(ins);
+                        {
+                            TextureFetchInstruction f;
+                            std::memcpy(&f, ins, 12);
+                            exec.TextureFetch(f, s);
+                        }
                     }
                     else
                     {
-                        Alu(ins);
+                        exec.Alu(DecodeAlu(ins, s.aL), s);
                     }
                 }
             }
@@ -1509,6 +1630,552 @@ namespace gpu
                         return;
                     }
                     pc = next;
+                }
+            }
+        };
+
+        // ---- Compiled pixel shaders ------------------------------------------------------
+        // Control flow that depends only on per-draw state (bool and loop constants,
+        // unconditional jumps and calls) is resolved once per draw, leaving a straight list
+        // of decoded instructions with aL folded in. Pixels then run through the list in
+        // batches, so decoding and control flow cost once per batch instead of once per
+        // pixel. Programs whose flow depends on the predicate (predicated jumps, calls or
+        // loop breaks) are not compiled and keep using the Interpreter.
+
+        struct CompiledOp
+        {
+            enum class Kind : uint8_t { Clause, Alu, VertexFetch, TextureFetch };
+            Kind kind = Kind::Clause;
+            int8_t clausePredicate = -1; // Clause: -1 always runs, else only where p0 == it
+            AluOp alu;
+            VertexFetchInstruction vertexFetch;
+            TextureFetchInstruction textureFetch;
+        };
+
+        struct CompiledShader
+        {
+            std::vector<CompiledOp> ops;
+            bool ok = false;
+        };
+
+        // Mirrors Interpreter::Run with the per-invocation state that control flow can
+        // depend on (aL) tracked statically.
+        CompiledShader CompileFlow(const DrawState& state, const Program& program);
+
+        CompiledShader Compile(const DrawState& state, const Program& program)
+        {
+            CompiledShader cs = CompileFlow(state, program);
+            for (const CompiledOp& op : cs.ops)
+                if (op.kind == CompiledOp::Kind::VertexFetch)
+                    return {};
+            return cs;
+        }
+
+        CompiledShader CompileFlow(const DrawState& state, const Program& program)
+        {
+            CompiledShader cs;
+            constexpr size_t kMaxOps = 4096;
+            int aL = 0;
+            auto clause = [&](uint32_t address, uint32_t count, uint32_t sequence, int predicate) {
+                CompiledOp head;
+                head.clausePredicate = int8_t(predicate);
+                cs.ops.push_back(head);
+                for (uint32_t k = 0; k < count; k++)
+                {
+                    const uint32_t at = (address + k) * 3;
+                    if (at + 3 > program.count)
+                        return;
+                    const uint32_t* ins = program.code + at;
+                    CompiledOp op;
+                    if ((sequence >> (k * 2)) & 1)
+                    {
+                        if ((ins[0] & 0x1F) == uint32_t(FetchOpcode::VertexFetch))
+                        {
+                            op.kind = CompiledOp::Kind::VertexFetch; // rejected by Compile
+                        }
+                        else
+                        {
+                            op.kind = CompiledOp::Kind::TextureFetch;
+                            std::memcpy(&op.textureFetch, ins, 12);
+                        }
+                    }
+                    else
+                    {
+                        op.kind = CompiledOp::Kind::Alu;
+                        op.alu = DecodeAlu(ins, aL);
+                    }
+                    cs.ops.push_back(op);
+                }
+            };
+
+            struct Loop { uint32_t count, iteration; int savedAL; int step; };
+            Loop loops[4];
+            int loopDepth = 0;
+            uint32_t calls[4];
+            int callDepth = 0;
+            uint32_t pc = 0;
+            cs.ok = true; // every exit below is a normal end of the program unless it says otherwise
+            for (int guard = 0; guard < 65536; guard++)
+            {
+                if (cs.ops.size() > kMaxOps)
+                    return {};
+                const uint32_t base = (pc / 2) * 3;
+                if (base + 3 > program.count)
+                    return cs;
+                uint32_t w0, w1;
+                if (pc & 1)
+                {
+                    w0 = (program.code[base + 1] >> 16) | (program.code[base + 2] << 16);
+                    w1 = program.code[base + 2] >> 16;
+                }
+                else
+                {
+                    w0 = program.code[base];
+                    w1 = program.code[base + 1] & 0xFFFF;
+                }
+                const uint32_t opcode = (w1 >> 12) & 0xF;
+                const bool condition = (w1 >> 10) & 1;
+                uint32_t next = pc + 1;
+
+                switch (ControlFlowOpcode(opcode))
+                {
+                case ControlFlowOpcode::Nop:
+                case ControlFlowOpcode::Alloc:
+                case ControlFlowOpcode::MarkVsFetchDone:
+                    break;
+
+                case ControlFlowOpcode::Exec:
+                case ControlFlowOpcode::ExecEnd:
+                case ControlFlowOpcode::CondExec:
+                case ControlFlowOpcode::CondExecEnd:
+                case ControlFlowOpcode::CondExecPred:
+                case ControlFlowOpcode::CondExecPredEnd:
+                case ControlFlowOpcode::CondExecPredClean:
+                case ControlFlowOpcode::CondExecPredCleanEnd:
+                {
+                    const auto op = ControlFlowOpcode(opcode);
+                    if (op == ControlFlowOpcode::CondExec || op == ControlFlowOpcode::CondExecEnd)
+                    {
+                        if (BoolConstant(state, (w1 >> 2) & 0xFF) == condition)
+                            clause(w0 & 0xFFF, (w0 >> 12) & 7, (w0 >> 16) & 0xFFF, -1);
+                    }
+                    else if (op == ControlFlowOpcode::Exec || op == ControlFlowOpcode::ExecEnd)
+                    {
+                        clause(w0 & 0xFFF, (w0 >> 12) & 7, (w0 >> 16) & 0xFFF, -1);
+                    }
+                    else
+                    {
+                        clause(w0 & 0xFFF, (w0 >> 12) & 7, (w0 >> 16) & 0xFFF, condition ? 1 : 0);
+                    }
+                    if (op == ControlFlowOpcode::ExecEnd || op == ControlFlowOpcode::CondExecEnd ||
+                        op == ControlFlowOpcode::CondExecPredEnd || op == ControlFlowOpcode::CondExecPredCleanEnd)
+                        return cs;
+                    break;
+                }
+
+                case ControlFlowOpcode::LoopStart:
+                {
+                    const uint32_t constant = state.loops[(w0 >> 16) & 31];
+                    const uint32_t count = constant & 0xFF;
+                    if (loopDepth == 4)
+                        return cs;
+                    loops[loopDepth++] = { count, 0, aL, int(int8_t(constant >> 16)) };
+                    aL = int((constant >> 8) & 0xFF);
+                    if (count == 0)
+                    {
+                        aL = loops[--loopDepth].savedAL;
+                        next = w0 & 0x1FFF;
+                    }
+                    break;
+                }
+
+                case ControlFlowOpcode::LoopEnd:
+                {
+                    if (loopDepth == 0)
+                        break;
+                    if ((w0 >> 21) & 1)
+                        return {}; // breaks on the predicate
+                    Loop& loop = loops[loopDepth - 1];
+                    if (++loop.iteration < loop.count)
+                    {
+                        aL += loop.step;
+                        next = w0 & 0x1FFF;
+                    }
+                    else
+                    {
+                        aL = loop.savedAL;
+                        --loopDepth;
+                    }
+                    break;
+                }
+
+                case ControlFlowOpcode::CondCall:
+                case ControlFlowOpcode::CondJmp:
+                {
+                    bool take;
+                    if ((w0 >> 13) & 1)
+                        take = true;
+                    else if ((w0 >> 14) & 1)
+                        return {}; // taken on the predicate
+                    else
+                        take = BoolConstant(state, (w1 >> 2) & 0xFF) == condition;
+                    if (!take)
+                        break;
+                    if (ControlFlowOpcode(opcode) == ControlFlowOpcode::CondCall)
+                    {
+                        if (callDepth == 4)
+                            return cs;
+                        calls[callDepth++] = pc + 1;
+                    }
+                    next = w0 & 0x1FFF;
+                    break;
+                }
+
+                case ControlFlowOpcode::Return:
+                    if (callDepth == 0)
+                        return cs;
+                    next = calls[--callDepth];
+                    break;
+
+                default:
+                    return cs;
+                }
+                pc = next;
+            }
+            return cs;
+        }
+
+        // ---- Batched execution ---------------------------------------------------------
+        // Compiled pixel shaders run on up to kLanes pixels at a time with registers stored
+        // component-major (each component of a register holds all lanes contiguously), so
+        // every instruction is a handful of short loops over the batch. Results match
+        // Executor exactly: the opcode math is shared through VectorOp and ScalarOp.
+
+        constexpr int kLanes = 16;
+        using LaneFloats = float[kLanes];
+
+        struct LaneBatch
+        {
+            alignas(64) float r[128][4][kLanes];
+            alignas(64) float exports[64][4][kLanes];
+            uint64_t exported[kLanes];
+            float ps[kLanes];
+            int a0[kLanes];
+            bool p0[kLanes], killed[kLanes], clauseRun[kLanes];
+
+            F4 Export(uint32_t i, int l) const { return { exports[i][0][l], exports[i][1][l], exports[i][2][l], exports[i][3][l] }; }
+
+            // The lane as an Invocation (TTT2_SOFT_VERIFY).
+            void ToInvocation(int l, Invocation& inv) const
+            {
+                for (int i = 0; i < 128; i++)
+                    for (int c = 0; c < 4; c++)
+                        inv.r[i][c] = r[i][c][l];
+                for (int i = 0; i < 64; i++)
+                    for (int c = 0; c < 4; c++)
+                        inv.exports[i][c] = exports[i][c][l];
+                inv.exported = exported[l];
+                inv.ps = ps[l];
+                inv.a0 = a0[l];
+                inv.aL = 0;
+                inv.p0 = p0[l];
+                inv.killed = killed[l];
+            }
+        };
+
+        struct BatchExecutor
+        {
+            DrawState& state;
+            uint32_t constBase;
+            LaneBatch& b;
+            int n;
+
+            void Read(const AluOp::Source& src, LaneFloats out[4]) const
+            {
+                if (src.isRegister)
+                {
+                    const auto& reg = b.r[src.index & 127];
+                    for (int c = 0; c < 4; c++)
+                    {
+                        const float* in = reg[src.comp[c]];
+                        float* o = out[c];
+                        if (!src.abs && !src.negate)
+                            std::memcpy(o, in, sizeof(LaneFloats));
+                        else
+                            for (int l = 0; l < kLanes; l++)
+                            {
+                                float v = in[l];
+                                if (src.abs)
+                                    v = std::fabs(v);
+                                o[l] = src.negate ? -v : v;
+                            }
+                    }
+                }
+                else if (!src.relativeA0)
+                {
+                    const F4& raw = state.constants[constBase + (src.index & 255)];
+                    for (int c = 0; c < 4; c++)
+                    {
+                        float v = raw[src.comp[c]];
+                        if (src.abs)
+                            v = std::fabs(v);
+                        v = src.negate ? -v : v;
+                        for (int l = 0; l < kLanes; l++)
+                            out[c][l] = v;
+                    }
+                }
+                else
+                {
+                    for (int l = 0; l < n; l++)
+                    {
+                        const F4& raw = state.constants[constBase + ((src.index + uint32_t(b.a0[l])) & 255)];
+                        for (int c = 0; c < 4; c++)
+                        {
+                            float v = raw[src.comp[c]];
+                            if (src.abs)
+                                v = std::fabs(v);
+                            out[c][l] = src.negate ? -v : v;
+                        }
+                    }
+                }
+            }
+
+            // Lanes the instruction runs for; returns whether that is all of them.
+            bool Active(const bool* clause, bool predicated, bool condition, bool active[kLanes]) const
+            {
+                bool all = true;
+                for (int l = 0; l < n; l++)
+                {
+                    active[l] = (!clause || clause[l]) && (!predicated || b.p0[l] == condition);
+                    all &= active[l];
+                }
+                return all;
+            }
+
+            void Alu(const AluOp& op, const bool* clause) const
+            {
+                const AluInstruction& a = op.a;
+                bool active[kLanes];
+                const bool all = Active(clause, a.isPredicated, a.predicateCondition, active);
+                const auto vop = a.vectorOpcode;
+                const auto sop = a.scalarOpcode;
+
+                alignas(64) LaneFloats s1[4], s2[4], s3[4];
+                LaneFloats sa, sb;
+                Read(op.src[0], s1);
+                Read(op.src[1], s2);
+                if (op.scalarConst)
+                {
+                    LaneFloats c[4];
+                    Read(op.src[2], c);
+                    const float* gpr = b.r[op.scalarGpr][op.scalarGprComp];
+                    for (int l = 0; l < kLanes; l++)
+                    {
+                        sa[l] = c[op.scalarConstComp][l];
+                        float v = gpr[l];
+                        if (a.absConstants)
+                            v = std::fabs(v);
+                        sb[l] = a.src3Negate ? -v : v;
+                    }
+                    std::memset(s3, 0, sizeof(s3));
+                }
+                else
+                {
+                    Read(op.src[2], s3);
+                    for (int l = 0; l < kLanes; l++)
+                    {
+                        sa[l] = s3[3][l];
+                        sb[l] = s3[0][l];
+                    }
+                }
+
+                // ---- vector op (common opcodes as lane loops, the rest per lane)
+                alignas(64) LaneFloats vr[4];
+                bool pushPredicate = false;
+                bool newP0[kLanes], kill[kLanes] = {};
+                std::memcpy(newP0, b.p0, sizeof(newP0));
+                auto each = [&](auto&& fn) {
+                    for (int c = 0; c < 4; c++)
+                        for (int l = 0; l < kLanes; l++)
+                            vr[c][l] = fn(s1[c][l], s2[c][l], s3[c][l]);
+                };
+                switch (vop)
+                {
+                case AluVectorOpcode::Add: each([](float x, float y, float) { return x + y; }); break;
+                case AluVectorOpcode::Mul: each([](float x, float y, float) { return Mul(x, y); }); break;
+                case AluVectorOpcode::Max:
+                case AluVectorOpcode::MaxA: each([](float x, float y, float) { return x >= y ? x : y; }); break;
+                case AluVectorOpcode::Min: each([](float x, float y, float) { return x < y ? x : y; }); break;
+                case AluVectorOpcode::Mad: each([](float x, float y, float z) { return Mul(x, y) + z; }); break;
+                case AluVectorOpcode::CndEq: each([](float x, float y, float z) { return x == 0.0f ? y : z; }); break;
+                case AluVectorOpcode::CndGe: each([](float x, float y, float z) { return x >= 0.0f ? y : z; }); break;
+                case AluVectorOpcode::CndGt: each([](float x, float y, float z) { return x > 0.0f ? y : z; }); break;
+                case AluVectorOpcode::Dp4:
+                case AluVectorOpcode::Dp3:
+                    for (int l = 0; l < kLanes; l++)
+                    {
+                        float d = Mul(s1[0][l], s2[0][l]) + Mul(s1[1][l], s2[1][l]) + Mul(s1[2][l], s2[2][l]);
+                        if (vop == AluVectorOpcode::Dp4)
+                            d += Mul(s1[3][l], s2[3][l]);
+                        vr[0][l] = vr[1][l] = vr[2][l] = vr[3][l] = d;
+                    }
+                    break;
+                default:
+                    for (int l = 0; l < n; l++)
+                    {
+                        const F4 x{ s1[0][l], s1[1][l], s1[2][l], s1[3][l] };
+                        const F4 y{ s2[0][l], s2[1][l], s2[2][l], s2[3][l] };
+                        const F4 z{ s3[0][l], s3[1][l], s3[2][l], s3[3][l] };
+                        F4 v{};
+                        VectorOp(vop, x, y, z, v, pushPredicate, newP0[l], kill[l]);
+                        for (int c = 0; c < 4; c++)
+                            vr[c][l] = v[c];
+                    }
+                    break;
+                }
+                for (int l = 0; l < n; l++)
+                    if (active[l])
+                    {
+                        if (kill[l])
+                            b.killed[l] = true;
+                        if (vop == AluVectorOpcode::MaxA)
+                            b.a0[l] = int(std::clamp(std::floor(s1[3][l] + 0.5f), -256.0f, 255.0f));
+                    }
+                if (a.vectorSaturate)
+                    for (int c = 0; c < 4; c++)
+                        for (int l = 0; l < kLanes; l++)
+                            vr[c][l] = Saturate(vr[c][l]);
+
+                // ---- scalar op
+                LaneFloats sr;
+                bool scalarWrites = false;
+                if (sop != AluScalarOpcode::RetainPrev)
+                {
+                    for (int l = 0; l < n; l++)
+                    {
+                        if (!active[l])
+                            continue;
+                        bool scalarKill = false;
+                        sr[l] = ScalarOp(sop, sa[l], sb[l], b.ps[l], b.a0[l], newP0[l], scalarKill, scalarWrites);
+                        if (a.scalarSaturate)
+                            sr[l] = Saturate(sr[l]);
+                        if (scalarKill)
+                            b.killed[l] = true;
+                    }
+                }
+                const bool scalarSetsPredicate = uint32_t(sop) >= 27 && uint32_t(sop) <= 34;
+                for (int l = 0; l < n; l++)
+                {
+                    if (!active[l])
+                        continue;
+                    if (pushPredicate || scalarSetsPredicate)
+                        b.p0[l] = newP0[l];
+                    if (scalarWrites)
+                        b.ps[l] = sr[l];
+                }
+
+                // ---- writes (lanes past n are scratch, so full batches skip the mask)
+                const uint32_t vmask = a.vectorWriteMask, smask = a.scalarWriteMask;
+                auto write = [&](float (*dst)[kLanes], int c, const float* value) {
+                    if (all)
+                        std::memcpy(dst[c], value, sizeof(LaneFloats));
+                    else
+                        for (int l = 0; l < n; l++)
+                            if (active[l])
+                                dst[c][l] = value[l];
+                };
+                auto fill = [&](float (*dst)[kLanes], int c, float value) {
+                    for (int l = 0; l < n; l++)
+                        if (active[l])
+                            dst[c][l] = value;
+                };
+                if (a.exportData)
+                {
+                    const uint32_t dest = a.vectorDest & 63;
+                    auto& e = b.exports[dest];
+                    const uint32_t ones = vmask & smask;
+                    const uint32_t zeros = a.scalarDestRelative ? (0xFu & ~(vmask | smask)) : 0u;
+                    for (int c = 0; c < 4; c++)
+                    {
+                        const uint32_t bit = 1u << c;
+                        if (ones & bit) fill(e, c, 1.0f);
+                        else if (vmask & bit) write(e, c, vr[c]);
+                        else if (smask & bit) write(e, c, b.ps);
+                        else if (zeros & bit) fill(e, c, 0.0f);
+                    }
+                    if (vmask | smask | zeros)
+                        for (int l = 0; l < n; l++)
+                            if (active[l])
+                                b.exported[l] |= 1ull << dest;
+                }
+                else
+                {
+                    if (vmask)
+                        for (int c = 0; c < 4; c++)
+                            if (vmask & (1u << c))
+                                write(b.r[op.vectorDest & 127], c, vr[c]);
+                    if (smask)
+                        for (int c = 0; c < 4; c++)
+                            if (smask & (1u << c))
+                                write(b.r[op.scalarDest & 127], c, b.ps);
+                }
+            }
+
+            void TextureFetch(const TextureFetchInstruction& f, const bool* clause) const
+            {
+                bool active[kLanes];
+                Active(clause, f.isPredicated, f.predCondition, active);
+                auto store = [&](int l, const F4& value) {
+                    auto& dst = b.r[f.dstRegister & 63];
+                    for (int c = 0; c < 4; c++)
+                    {
+                        const uint32_t sel = (f.dstSwizzle >> (c * 3)) & 7;
+                        if (sel < 4) dst[c][l] = value[sel];
+                        else if (sel == 4) dst[c][l] = 0.0f;
+                        else if (sel == 5) dst[c][l] = 1.0f;
+                    }
+                };
+                if (f.opcode != FetchOpcode::TextureFetch)
+                {
+                    if (f.opcode == FetchOpcode::GetTextureWeights || f.opcode == FetchOpcode::GetTextureComputedLod ||
+                        f.opcode == FetchOpcode::GetTextureGradients || f.opcode == FetchOpcode::GetTextureBorderColorFrac)
+                        for (int l = 0; l < n; l++)
+                            if (active[l])
+                                store(l, F4{ 0, 0, 0, 0 });
+                    return;
+                }
+                const Texture& tex = state.TextureSlot(f.constIndex);
+                const auto& src = b.r[f.srcRegister & 63];
+                for (int l = 0; l < n; l++)
+                    if (active[l])
+                        store(l, Executor::FetchTexel(f, tex, src[f.srcSwizzle & 3][l], src[(f.srcSwizzle >> 2) & 3][l]));
+            }
+
+            void Run(const CompiledShader& cs) const
+            {
+                const bool* clause = nullptr; // set while a predicated clause runs
+                for (const CompiledOp& op : cs.ops)
+                {
+                    switch (op.kind)
+                    {
+                    case CompiledOp::Kind::Clause:
+                        clause = nullptr;
+                        if (op.clausePredicate >= 0)
+                        {
+                            for (int l = 0; l < n; l++)
+                                b.clauseRun[l] = b.p0[l] == (op.clausePredicate != 0);
+                            clause = b.clauseRun;
+                        }
+                        break;
+                    case CompiledOp::Kind::Alu:
+                        Alu(op.alu, clause);
+                        break;
+                    case CompiledOp::Kind::TextureFetch:
+                        TextureFetch(op.textureFetch, clause);
+                        break;
+                    case CompiledOp::Kind::VertexFetch:
+                        break; // Compile rejects these
+                    }
                 }
             }
         };
@@ -1707,6 +2374,7 @@ namespace gpu
             DrawState& state;
             RasterState& rs;
             Program ps;
+            const CompiledShader* compiled = nullptr; // ps, compiled (null: interpret per pixel)
             uint64_t pixels = 0;
 
             // Triangles of the current draw, set up and binned, rasterised by Flush().
@@ -1770,10 +2438,12 @@ namespace gpu
                 });
             }
 
-            bool ShadePixel(int px, int py, const ScreenVertex* const t[3], const float bary[3], float z, bool front)
+            // Early stencil and depth tests (sample 0; depth exported by the shader is still
+            // tested against the interpolated value), applying the fail/zfail stencil ops.
+            bool EarlyTests(int px, int py, float z, bool front)
             {
-                // Early stencil and depth tests (sample 0; depth exported by the shader is
-                // still tested against the interpolated value).
+                if (!rs.stencil && !rs.depthTest)
+                    return true;
                 const size_t depthIndex = rs.depth.Index(uint32_t(px) * rs.depth.scaleX, uint32_t(py) * rs.depth.scaleY);
                 const RasterState::StencilFace& sf = rs.stencilFace[front ? 0 : 1];
                 if (rs.stencil && !Compare(sf.func, float(sf.ref & sf.mask), float(g_edramStencil[depthIndex] & sf.mask)))
@@ -1787,9 +2457,18 @@ namespace gpu
                         UpdateStencil(px, py, sf, sf.zfail);
                     return false;
                 }
+                return true;
+            }
 
-                Invocation inv;
+            // Fresh invocation state and the interpolated pixel shader inputs.
+            void SetupInputs(Invocation& inv, int px, int py, const ScreenVertex* const t[3], const float bary[3]) const
+            {
+                inv.exported = 0;
                 inv.ps = 0.0f;
+                inv.p0 = false;
+                inv.killed = false;
+                inv.a0 = 0;
+                inv.aL = 0;
                 // Perspective-correct interpolation.
                 const float w0 = bary[0] * t[0]->invW, w1 = bary[1] * t[1]->invW, w2 = bary[2] * t[2]->invW;
                 const float sum = w0 + w1 + w2;
@@ -1811,21 +2490,74 @@ namespace gpu
                     inv.r[rs.paramGenRegister] = { float(px), float(py), 0.0f, 0.0f };
                 for (int i = 0; i < 4; i++)
                     inv.exports[i] = { 0, 0, 0, 0 };
+            }
 
+            // The same for one lane of a batch.
+            // Fresh state for a batch: what SetupInputs below does not write for each lane.
+            void BeginBatch(LaneBatch& b) const
+            {
+                std::memset(b.exported, 0, sizeof(b.exported));
+                std::memset(b.ps, 0, sizeof(b.ps));
+                std::memset(b.a0, 0, sizeof(b.a0));
+                std::memset(b.p0, 0, sizeof(b.p0));
+                std::memset(b.killed, 0, sizeof(b.killed));
+                for (uint32_t i = 0; i < 16; i++)
+                    if (!(rs.interpolatorMask & (1u << i)))
+                        std::memset(b.r[i], 0, sizeof(b.r[i]));
+                std::memset(b.exports, 0, sizeof(b.exports[0]) * 4);
+            }
+
+            // The same as SetupInputs(Invocation&) for one lane of a batch (after BeginBatch).
+            void SetupInputs(LaneBatch& b, int l, int px, int py, const ScreenVertex* const t[3], const float bary[3]) const
+            {
+                const float w0 = bary[0] * t[0]->invW, w1 = bary[1] * t[1]->invW, w2 = bary[2] * t[2]->invW;
+                const float sum = w0 + w1 + w2;
+                const float k = sum != 0.0f ? 1.0f / sum : 0.0f;
+                for (uint32_t mask = rs.interpolatorMask & 0xFFFF; mask; mask &= mask - 1)
+                {
+                    const uint32_t i = uint32_t(std::countr_zero(mask));
+                    const F4& a = t[0]->v->interpolators[i];
+                    const F4& bb = t[1]->v->interpolators[i];
+                    const F4& c = t[2]->v->interpolators[i];
+                    for (int j = 0; j < 4; j++)
+                        b.r[i][j][l] = (a[j] * w0 + bb[j] * w1 + c[j] * w2) * k;
+                }
+                if (rs.paramGen && rs.paramGenRegister < 128)
+                {
+                    b.r[rs.paramGenRegister][0][l] = float(px);
+                    b.r[rs.paramGenRegister][1][l] = float(py);
+                    b.r[rs.paramGenRegister][2][l] = 0.0f;
+                    b.r[rs.paramGenRegister][3][l] = 0.0f;
+                }
+            }
+
+            bool WriteOutputs(int px, int py, const Invocation& inv, float z, bool front)
+            {
+                return WriteOutputs(px, py, inv.exported, inv.killed, inv.exports, inv.exports[61][0], z, front);
+            }
+
+            bool WriteOutputs(int px, int py, const LaneBatch& b, int l, float z, bool front)
+            {
+                const F4 color[4] = { b.Export(0, l), b.Export(1, l), b.Export(2, l), b.Export(3, l) };
+                return WriteOutputs(px, py, b.exported[l], b.killed[l], color, b.exports[61][0][l], z, front);
+            }
+
+            // After the pixel shader: kill and alpha test, then stencil, depth and colour
+            // writes. Returns whether the pixel was written.
+            bool WriteOutputs(int px, int py, uint64_t exported, bool killed, const F4 color[4], float depthExport, float z, bool front)
+            {
                 if (rs.mode == 4 && ps.count)
                 {
-                    Interpreter it{ state, ps, inv, 256 };
-                    it.Run();
-                    if (inv.killed)
+                    if (killed)
                         return false;
-                    if (rs.alphaTest && !Compare(rs.alphaFunc, inv.exports[0][3], rs.alphaRef))
+                    if (rs.alphaTest && !Compare(rs.alphaFunc, color[0][3], rs.alphaRef))
                         return false;
                 }
 
-                if (inv.exported & (1ull << 61))
-                    z = inv.exports[61][0];
+                if (exported & (1ull << 61))
+                    z = depthExport;
                 if (rs.stencil)
-                    UpdateStencil(px, py, sf, sf.zpass);
+                    UpdateStencil(px, py, rs.stencilFace[front ? 0 : 1], rs.stencilFace[front ? 0 : 1].zpass);
                 if (rs.depthWrite)
                 {
                     const float dz = std::clamp(z, 0.0f, 1.0f);
@@ -1837,10 +2569,10 @@ namespace gpu
                 for (int rt = 0; rt < 4; rt++)
                 {
                     const uint32_t mask = (rs.colorMask >> (rt * 4)) & 0xF;
-                    if (!mask || !(inv.exported & (1ull << rt)))
+                    if (!mask || !(exported & (1ull << rt)))
                         continue;
                     const Surface& surface = rs.color[rt];
-                    const F4 src = inv.exports[rt];
+                    const F4 src = color[rt];
                     const bool unorm = IsUnormColor(surface.format);
                     const bool replace = BlendIsReplace(rs.blend[rt]);
                     surface.ForEachSample(uint32_t(px), uint32_t(py), [&](size_t i) {
@@ -1852,6 +2584,21 @@ namespace gpu
                     });
                 }
                 return true;
+            }
+
+            // One pixel through the interpreter (programs that could not be compiled).
+            bool ShadePixel(int px, int py, const ScreenVertex* const t[3], const float bary[3], float z, bool front)
+            {
+                if (!EarlyTests(px, py, z, front))
+                    return false;
+                Invocation inv;
+                SetupInputs(inv, px, py, t, bary);
+                if (rs.mode == 4 && ps.count)
+                {
+                    Interpreter it{ state, ps, inv, 256 };
+                    it.Run();
+                }
+                return WriteOutputs(px, py, inv, z, front);
             }
 
             void Triangle(const ScreenVertex& a, const ScreenVertex& b, const ScreenVertex& c, bool cull = false)
@@ -1897,10 +2644,77 @@ namespace gpu
             {
                 const ScreenVertex* const t[3] = { &su.v[0], &su.v[1], &su.v[2] };
                 uint64_t written = 0;
+                // Compiled shaders run on batches of up to kLanes pixels from one row of one
+                // triangle; those pixels are distinct, so testing them all before writing any
+                // gives the same result as shading them one by one.
+                thread_local std::unique_ptr<LaneBatch> lanesStorage;
+                if (compiled && !lanesStorage)
+                    lanesStorage.reset(new LaneBatch{}); // zeroed: idle lanes hold harmless values
+                LaneBatch* lanes = lanesStorage.get();
+                struct Pending { int px; float z; } pending[kLanes];
+                int batch = 0;
+                auto flush = [&](int py) {
+                    // TTT2_SOFT_VERIFY=1: also interpret every pixel and report the first mismatch.
+                    static const bool verify = [] { const char* v = std::getenv("TTT2_SOFT_VERIFY"); return v && *v == '1'; }();
+                    thread_local std::unique_ptr<Invocation[]> reference;
+                    if (verify)
+                    {
+                        if (!reference)
+                            reference.reset(new Invocation[kLanes]);
+                        for (int i = 0; i < batch; i++)
+                        {
+                            lanes->ToInvocation(i, reference[i]);
+                            Interpreter{ state, ps, reference[i], 256 }.Run();
+                        }
+                    }
+                    BatchExecutor{ state, 256, *lanes, batch }.Run(*compiled);
+                    if (verify)
+                        for (int i = 0; i < batch; i++)
+                        {
+                            const Invocation& r = reference[i];
+                            bool same = lanes->exported[i] == r.exported && lanes->killed[i] == r.killed;
+                            for (int e = 0; e < 4; e++)
+                                {
+                                const F4 mine = lanes->Export(e, i);
+                                same &= std::memcmp(&r.exports[e], &mine, sizeof(F4)) == 0 || !(r.exported & (1ull << e));
+                            }
+                            static std::atomic<int> reported{ 0 };
+                            if (!same && reported++ < 4)
+                            {
+                                const F4 o0 = lanes->Export(0, i);
+                                std::fprintf(stderr, "[gpu] VERIFY mismatch px %d,%d: exported %llX/%llX killed %d/%d o0 (%g %g %g %g)/(%g %g %g %g)\n",
+                                    pending[i].px, py, (unsigned long long)lanes->exported[i], (unsigned long long)r.exported, lanes->killed[i], r.killed,
+                                    o0[0], o0[1], o0[2], o0[3], r.exports[0][0], r.exports[0][1], r.exports[0][2], r.exports[0][3]);
+                                std::fprintf(stderr, "[gpu]   ps:");
+                                for (uint32_t k = 0; k < ps.count; k++)
+                                    std::fprintf(stderr, " %08X", ps.code[k]);
+                                std::fprintf(stderr, "\n");
+                            }
+                        }
+                    for (int i = 0; i < batch; i++)
+                        written += WriteOutputs(pending[i].px, py, *lanes, i, pending[i].z, su.front);
+                    batch = 0;
+                };
                 for (int py = y0; py <= y1; py++)
                 {
                     const float sy = float(py) + rs.pixelCenter;
-                    for (int px = su.x0; px <= su.x1; px++)
+                    // Narrow the row to where every edge function can be non-negative (with
+                    // a margin; each pixel is still tested exactly below).
+                    int xs = su.x0, xe = su.x1;
+                    for (int e = 0; e < 3; e++)
+                    {
+                        const auto& E = su.edges[e];
+                        if (E.dy == 0.0f)
+                            continue;
+                        const float boundary = E.ax + E.dx * (sy - E.ay) / E.dy - rs.pixelCenter;
+                        if (!std::isfinite(boundary) || std::fabs(boundary) > 1.0e6f)
+                            continue;
+                        if (E.dy > 0.0f)
+                            xe = std::min(xe, int(std::floor(boundary)) + 2);
+                        else
+                            xs = std::max(xs, int(std::ceil(boundary)) - 2);
+                    }
+                    for (int px = xs; px <= xe; px++)
                     {
                         const float sx = float(px) + rs.pixelCenter;
                         float bary[3];
@@ -1915,8 +2729,30 @@ namespace gpu
                         if (!inside)
                             continue;
                         const float z = bary[0] * t[0]->z + bary[1] * t[1]->z + bary[2] * t[2]->z;
-                        written += ShadePixel(px, py, t, bary, z, su.front);
+                        if (rs.mode != 4 || !ps.count)
+                        {
+                            // No pixel shader runs: nothing reads the inputs.
+                            static const F4 kNoColor[4] = {};
+                            if (EarlyTests(px, py, z, su.front))
+                                written += WriteOutputs(px, py, 0, false, kNoColor, 0.0f, z, su.front);
+                            continue;
+                        }
+                        if (!compiled)
+                        {
+                            written += ShadePixel(px, py, t, bary, z, su.front);
+                            continue;
+                        }
+                        if (!EarlyTests(px, py, z, su.front))
+                            continue;
+                        if (batch == 0)
+                            BeginBatch(*lanes);
+                        SetupInputs(*lanes, batch, px, py, t, bary);
+                        pending[batch++] = { px, z };
+                        if (batch == kLanes)
+                            flush(py);
                     }
+                    if (batch)
+                        flush(py);
                 }
                 return written;
             }
@@ -2037,8 +2873,10 @@ namespace gpu
 
         uint32_t ToUnorm(float v, uint32_t bits)
         {
-            const float max = float((1u << bits) - 1);
-            return uint32_t(std::lround(Saturate(v) * max));
+            // lround of a value in [0, max], without the library call.
+            const float x = Saturate(v) * float((1u << bits) - 1);
+            const uint32_t r = uint32_t(x);
+            return x - float(r) >= 0.5f ? r + 1 : r;
         }
 
         // Packs one pixel in a texture format; returns bytes per pixel (0 = unsupported).
@@ -2323,6 +3161,15 @@ namespace gpu
     bool g_softLogVertices = false;
     bool g_softDumpTextures = false;
 
+    void SoftParallelFor(uint32_t count, const std::function<void(uint32_t)>& fn)
+    {
+        constexpr uint32_t kRows = 8;
+        Pool().Run(int((count + kRows - 1) / kRows), [&](int band) {
+            for (uint32_t row = uint32_t(band) * kRows; row < std::min(count, uint32_t(band + 1) * kRows); row++)
+                fn(row);
+        });
+    }
+
     uint64_t SoftPixelsWritten() { return g_pixels.load(); }
     uint64_t SoftResolves() { return g_resolves.load(); }
 
@@ -2335,8 +3182,8 @@ namespace gpu
 
     void SoftPrintStats()
     {
-        std::fprintf(stderr, "[gpu]   soft: %llu draws, vertex %.1f ms, raster %.1f ms (incl. texture decode %.1f ms), resolve %.1f ms; %llu texture decodes (%.1f Mtexels), %.1f MB hashed\n",
-            (unsigned long long)g_stats.draws, g_stats.vertex / 1e6, g_stats.raster / 1e6, g_stats.texture / 1e6, g_stats.resolve / 1e6,
+        std::fprintf(stderr, "[gpu]   soft: %llu draws, vertex %.1f ms, raster %.1f ms (incl. texture decode %.1f ms), resolve %.1f ms, in worker pool %.1f ms (%.1f thread-ms busy); %llu texture decodes (%.1f Mtexels), %.1f MB hashed\n",
+            (unsigned long long)g_stats.draws, g_stats.vertex / 1e6, g_stats.raster / 1e6, g_stats.texture / 1e6, g_stats.resolve / 1e6, g_stats.parallel / 1e6, g_poolBusyNs.exchange(0) / 1e6,
             (unsigned long long)g_stats.decodes, g_stats.decodedTexels / 1e6, g_stats.hashed / 1e6);
         g_stats = {};
     }
@@ -2436,6 +3283,15 @@ namespace gpu
         g_stats.vertex += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - vertexStart).count());
 
         Renderer renderer{ state, rs, Program{ psCode.data(), uint32_t(psCode.size()), true } };
+        // TTT2_SOFT_INTERP=1 interprets every pixel (reference for the compiled path).
+        static const bool interpretOnly = [] { const char* v = std::getenv("TTT2_SOFT_INTERP"); return v && *v == '1'; }();
+        CompiledShader compiledPs;
+        if (rs.mode == 4 && renderer.ps.count && !interpretOnly)
+        {
+            compiledPs = Compile(state, renderer.ps);
+            if (compiledPs.ok)
+                renderer.compiled = &compiledPs;
+        }
 
         // ---- copy: resolve the covered rectangle
         if (rs.mode == 6)

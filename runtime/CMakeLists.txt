@@ -33,6 +33,9 @@ endif()
 
 if (MSVC AND TTT2_HAVE_RECOMP)
     target_compile_options(ttt2 PRIVATE -msse4.1 -mavx)
+    # RelWithDebInfo defaults to /Ob1 (only explicitly inline functions), which leaves the
+    # software renderer's small per-pixel helpers as calls; inline like Release does.
+    target_compile_options(ttt2 PRIVATE $<$<CONFIG:RelWithDebInfo>:/Ob2>)
 endif()
 
 if (EMSCRIPTEN)

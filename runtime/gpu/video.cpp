@@ -222,6 +222,8 @@ namespace gpu
         std::fprintf(stderr, "[gpu] wrote %s\n", name);
     }
 
+    static uint64_t g_cpBusyNs = 0, g_presentNs = 0; // TTT2_GPU_STATS timings (command processor thread)
+
     static void OnSwap(uint32_t frontBuffer, uint32_t width, uint32_t height, const std::array<uint32_t, 6>& fetch)
     {
         const uint64_t swaps = ++g_swapCount;
@@ -243,12 +245,28 @@ namespace gpu
                 (unsigned long long)SoftPixelsWritten(), (unsigned long long)SoftResolves());
         static const bool softStats = [] { const char* v = std::getenv("TTT2_GPU_STATS"); return v && *v == '1'; }();
         if (softStats && swaps % 10 == 0)
+        {
+            // Command processor time per 10 swaps: executing packets (rendering included)
+            // and converting the front buffer for presentation.
+            static auto last = std::chrono::steady_clock::now();
+            const auto now = std::chrono::steady_clock::now();
+            std::fprintf(stderr, "[gpu] 10 swaps in %.1f ms: command processor busy %.1f ms, present %.1f ms\n",
+                std::chrono::duration<double, std::milli>(now - last).count(), g_cpBusyNs / 1e6, g_presentNs / 1e6);
+            last = now;
+            g_cpBusyNs = 0;
+            g_presentNs = 0;
             SoftPrintStats();
+        }
+        struct PresentTimer
+        {
+            std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+            ~PresentTimer() { g_presentNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()); }
+        } presentTimer;
 
         // Show the front buffer the game just swapped to.
         const TextureInfo info = DecodeTextureFetch(fetch.data());
         static std::vector<uint32_t> pixels;
-        if (info.width > 1 && info.width <= 4096 && info.height <= 4096 && ConvertToBgra(info, pixels))
+        if (info.width > 1 && info.width <= 4096 && info.height <= 4096 && ConvertToBgra(info, pixels, SoftParallelFor))
         {
             for (uint32_t& p : pixels)
                 p |= 0xFF000000u; // the window shows colour only
@@ -649,6 +667,7 @@ namespace gpu
     static void CommandProcessorThread()
     {
         guest::GuestEnv env = guest::CreateGuestEnv(/*cpu*/ 2);
+        auto lastWork = std::chrono::steady_clock::now();
         for (;;)
         {
             const uint32_t base = g_ringBase.load();
@@ -658,7 +677,10 @@ namespace gpu
                 const uint32_t wptr = ReadRegister(CP_RB_WPTR) % size;
                 if (wptr != g_rptr)
                 {
+                    const auto start = std::chrono::steady_clock::now();
                     ExecuteStream(env, Stream{ base, size, 1 }, g_rptr, wptr, 0);
+                    lastWork = std::chrono::steady_clock::now();
+                    g_cpBusyNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(lastWork - start).count());
                     g_rptr = wptr;
                     WriteRegister(CP_RB_RPTR, g_rptr);
                     if (const uint32_t writeback = g_rptrWriteback.load())
@@ -668,7 +690,13 @@ namespace gpu
             }
             if (g_stallLog)
                 CheckStall();
-            std::this_thread::sleep_for(std::chrono::microseconds(200));
+            // The game flushes the GPU (fence + wait) dozens of times per frame, so new
+            // packets usually follow within microseconds: poll without sleeping for a while
+            // after the last work (a Windows sleep lasts at least ~1 ms).
+            if (std::chrono::steady_clock::now() - lastWork < std::chrono::milliseconds(4))
+                std::this_thread::yield();
+            else
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
         }
     }
 
