@@ -20,6 +20,10 @@ namespace gpu
     // memory then is stale). False: present from memory as usual.
     bool WebGpuReadFrontBuffer(const uint32_t fetch[6], std::vector<uint32_t>& bgra, uint32_t& width, uint32_t& height);
 
+    bool WebGpuActive();
+    // Writes every GPU-kept resolve to guest memory and forgets them (before verification).
+    void WebGpuFlushResolves();
+
     // Debug: per-frame timings and counters since the previous call.
     void WebGpuPrintStats();
 }

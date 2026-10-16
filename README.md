@@ -83,6 +83,8 @@ The native build has switches for chasing startup problems:
 | `TTT2_GPU_STATS=1` | Every 10 swaps, prints software-renderer time per stage (vertex, raster, texture decode, resolve) |
 | `TTT2_DUMP_FRAMES=<n,...>` | Writes the presented image of those swaps to `frame_<n>.bmp` in the working directory |
 | `TTT2_GPU=webgpu` | Rasterises and shades pixels on the GPU through WebGPU (wgpu-native natively); the software renderer still shades vertices. Falls back to software if no adapter is found |
+| `TTT2_GPU_VERIFY_FRAME=<n>` | WebGPU: renders every draw of swap `n` with both the GPU and the software renderer from the same inputs, logs draws whose render targets differ and dumps both images (`verify_*.bmp`) |
+| `TTT2_GPU_CPU_VERTEX=1`, `TTT2_GPU_CPU_RESOLVE=1` | WebGPU: shade vertices on the CPU / read resolves back to memory (for narrowing down differences) |
 | `TTT2_WGSL_DUMP=1` | Writes every pixel shader translated for the WebGPU backend to `shader_<hash>.wgsl` |
 | `TTT2_SOFT_GPU=0` | Skips rendering (draws are only tracked); frames are then black but run at full speed |
 | `TTT2_FILE_LOG=1` | Logs every file open and read |

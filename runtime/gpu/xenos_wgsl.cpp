@@ -1,5 +1,7 @@
 #include "xenos_wgsl.h"
 
+#include <algorithm>
+#include <climits>
 #include <cstdio>
 #include <set>
 #include <string>
@@ -15,15 +17,15 @@ namespace gpu
         std::string Reg(uint32_t index) { return "r" + Num(index & 127); }
 
         // Operand expression with swizzle, |abs| and negation applied.
-        std::string Source(const AluOp::Source& s)
+        std::string Source(const AluOp::Source& s, uint32_t constBase)
         {
             std::string raw;
             if (s.isRegister)
                 raw = Reg(s.index);
             else if (s.relativeA0)
-                raw = "D.c[(" + Num(s.index) + "u + u32(a0)) & 255u]";
+                raw = "D.c[" + Num(constBase) + "u + ((" + Num(s.index) + "u + u32(a0)) & 255u)]";
             else
-                raw = "D.c[" + Num(s.index & 255) + "]";
+                raw = "D.c[" + Num(constBase + (s.index & 255)) + "]";
             static const char kComp[] = "xyzw";
             if (!(s.comp[0] == 0 && s.comp[1] == 1 && s.comp[2] == 2 && s.comp[3] == 3))
             {
@@ -61,6 +63,14 @@ namespace gpu
             uint32_t textureSlots = 0;
             int indent = 1;
             const WgslOptions* options = nullptr;
+            bool pixel = true;
+            uint32_t constBase = 256;
+            uint32_t vsExports = 0;      // vertex stage: interpolators written
+            uint64_t vertexSlots[2] = {};
+            // Mini vertex fetches reuse the previous full fetch's slot, index and stride.
+            uint32_t fetchSlot = 0, fetchStride = 0;
+            int fetchCounter = 0;
+            WgslShader::SlotRange slotRange[96];
 
             void Line(const std::string& text)
             {
@@ -86,15 +96,15 @@ namespace gpu
                 ++indent;
                 Use(op.src[0]);
                 Use(op.src[1]);
-                Line("let s1 = " + Source(op.src[0]) + ";");
-                Line("let s2 = " + Source(op.src[1]) + ";");
+                Line("let s1 = " + Source(op.src[0], constBase) + ";");
+                Line("let s2 = " + Source(op.src[1], constBase) + ";");
                 if (op.scalarConst)
                 {
                     Use(op.src[2]);
                     regs.insert(op.scalarGpr & 127);
                     static const char kComp[] = "xyzw";
                     Line("let s3 = vec4f(0.0);");
-                    Line(std::string("let sa = ") + Source(op.src[2]) + "." + kComp[op.scalarConstComp & 3] + ";");
+                    Line(std::string("let sa = ") + Source(op.src[2], constBase) + "." + kComp[op.scalarConstComp & 3] + ";");
                     std::string gpr = Reg(op.scalarGpr) + "." + kComp[op.scalarGprComp & 3];
                     if (a.absConstants)
                         gpr = "abs(" + gpr + ")";
@@ -103,7 +113,7 @@ namespace gpu
                 else
                 {
                     Use(op.src[2]);
-                    Line("let s3 = " + Source(op.src[2]) + ";");
+                    Line("let s3 = " + Source(op.src[2], constBase) + ";");
                     Line("let sa = s3.w;");
                     Line("let sb = s3.x;");
                 }
@@ -260,7 +270,17 @@ namespace gpu
                 {
                     const uint32_t dest = a.vectorDest & 63;
                     std::string target;
-                    if (dest < 4)
+                    if (!pixel)
+                    {
+                        if (dest == 62)
+                            target = "oPos";
+                        else if (dest < 16)
+                        {
+                            target = "oV" + Num(dest);
+                            vsExports |= 1u << dest;
+                        }
+                    }
+                    else if (dest < 4)
                     {
                         target = "o" + Num(dest);
                         colorExports |= 1u << dest;
@@ -320,6 +340,125 @@ namespace gpu
                 }
             }
 
+            void VertexFetch(const VertexFetchInstruction& f)
+            {
+                if (!f.isMiniFetch)
+                {
+                    fetchSlot = (f.constIndex * 3 + f.constIndexSelect) % 96;
+                    fetchStride = f.stride;
+                    vertexSlots[fetchSlot / 64] |= 1ull << (fetchSlot % 64);
+                    regs.insert(f.srcRegister & 63);
+                    static const char kComp[] = "xyzw";
+                    // The index is taken when the full fetch runs (later ones reuse it).
+                    const std::string idx = "fi" + Num(uint32_t(++fetchCounter));
+                    Line(idx + " = i32(floor(" + Reg(f.srcRegister & 63) + "." + kComp[f.srcSwizzle & 3] +
+                        (f.isIndexRounded ? " + 0.5" : "") + "));");
+                    lastIndex = idx;
+                }
+                if (lastIndex.empty())
+                    return;
+                Line(f.isPredicated ? std::string("if (p0 == ") + (f.predicateCondition ? "true" : "false") + ") {" : "{");
+                ++indent;
+                Line("let vf = D.vf[" + Num(fetchSlot) + "];");
+                Line("let e = vf.y;");
+                Line("let w0 = i32(vf.x) + " + lastIndex + " * " + Num(fetchStride) + " + (" + std::to_string(int(f.offset)) + ");");
+                const std::string sgn = f.formatCompAll ? "true" : "false";
+                const std::string integer = f.numFormatAll ? "true" : "false";
+                const std::string rf = f.signedRfModeAll ? "true" : "false";
+                auto n = [&](const std::string& raw, uint32_t bits) {
+                    return "nrm(" + raw + ", " + Num(bits) + "u, " + sgn + ", " + integer + ", " + rf + ")";
+                };
+                auto field = [&](const char* d, uint32_t off, uint32_t bits) {
+                    return n(std::string("bitsAt(") + d + ", " + Num(off) + "u, " + Num(bits) + "u)", bits);
+                };
+                bool isFloat = false;
+                std::string v = "vec4f(0.0, 0.0, 0.0, 1.0)";
+                switch (f.format)
+                {
+                case 6:
+                    Line("let d0 = ld(w0, e);");
+                    v = "vec4f(" + field("d0", 0, 8) + ", " + field("d0", 8, 8) + ", " + field("d0", 16, 8) + ", " + field("d0", 24, 8) + ")";
+                    break;
+                case 7:
+                    Line("let d0 = ld(w0, e);");
+                    v = "vec4f(" + field("d0", 0, 10) + ", " + field("d0", 10, 10) + ", " + field("d0", 20, 10) + ", " + field("d0", 30, 2) + ")";
+                    break;
+                case 16:
+                    Line("let d0 = ld(w0, e);");
+                    v = "vec4f(" + field("d0", 0, 10) + ", " + field("d0", 10, 11) + ", " + field("d0", 21, 11) + ", 1.0)";
+                    break;
+                case 17:
+                    Line("let d0 = ld(w0, e);");
+                    v = "vec4f(" + field("d0", 0, 11) + ", " + field("d0", 11, 11) + ", " + field("d0", 22, 10) + ", 1.0)";
+                    break;
+                case 25:
+                    Line("let d0 = ld(w0, e);");
+                    v = "vec4f(" + field("d0", 0, 16) + ", " + field("d0", 16, 16) + ", 0.0, 1.0)";
+                    break;
+                case 26:
+                    Line("let d0 = ld(w0, e);");
+                    Line("let d1 = ld(w0 + 1, e);");
+                    v = "vec4f(" + field("d0", 0, 16) + ", " + field("d0", 16, 16) + ", " + field("d1", 0, 16) + ", " + field("d1", 16, 16) + ")";
+                    break;
+                case 31:
+                    isFloat = true;
+                    Line("let d0 = ld(w0, e);");
+                    v = "vec4f(h2f(d0 & 0xFFFFu), h2f(d0 >> 16u), 0.0, 1.0)";
+                    break;
+                case 32:
+                    isFloat = true;
+                    Line("let d0 = ld(w0, e);");
+                    Line("let d1 = ld(w0 + 1, e);");
+                    v = "vec4f(h2f(d0 & 0xFFFFu), h2f(d0 >> 16u), h2f(d1 & 0xFFFFu), h2f(d1 >> 16u))";
+                    break;
+                case 33: case 34: case 35:
+                {
+                    const uint32_t count = f.format - 32;
+                    std::string c[4] = { "0.0", "0.0", "0.0", "1.0" };
+                    for (uint32_t i = 0; i < count; i++)
+                        c[i] = n("ld(w0 + " + Num(i) + ", e)", 32);
+                    v = "vec4f(" + c[0] + ", " + c[1] + ", " + c[2] + ", " + c[3] + ")";
+                    break;
+                }
+                case 36: case 37: case 38: case 57:
+                {
+                    isFloat = true;
+                    const uint32_t count = f.format == 57 ? 3 : f.format - 35;
+                    std::string c[4] = { "0.0", "0.0", "0.0", "1.0" };
+                    for (uint32_t i = 0; i < count; i++)
+                        c[i] = "bitcast<f32>(ld(w0 + " + Num(i) + ", e))";
+                    v = "vec4f(" + c[0] + ", " + c[1] + ", " + c[2] + ", " + c[3] + ")";
+                    break;
+                }
+                default:
+                    unsupportedVertexFormat = true;
+                    break;
+                }
+                if (!isFloat && f.expAdjust)
+                    v = "(" + v + " * exp2(" + std::to_string(int(f.expAdjust)) + ".0))";
+                {
+                    uint32_t words = 1;
+                    switch (f.format)
+                    {
+                    case 26: case 32: case 34: case 37: words = 2; break;
+                    case 57: words = 3; break;
+                    case 35: case 38: words = 4; break;
+                    default: break;
+                    }
+                    auto& range = slotRange[fetchSlot];
+                    range.stride = fetchStride;
+                    range.first = std::min(range.first, int32_t(f.offset));
+                    range.end = std::max(range.end, int32_t(f.offset) + int32_t(words));
+                }
+                Line("let fv = " + v + ";");
+                DestSwizzle(f.dstRegister, f.dstSwizzle, "fv");
+                --indent;
+                Line("}");
+            }
+
+            std::string lastIndex;
+            bool unsupportedVertexFormat = false;
+
             void TextureFetch(const TextureFetchInstruction& f)
             {
                 Line(f.isPredicated ? std::string("if (p0 == ") + (f.predCondition ? "true" : "false") + ") {" : "{");
@@ -371,6 +510,41 @@ namespace gpu
             }
         };
 
+        const char* kHelpers = R"(
+fn ld(w: i32, e: u32) -> u32 {
+    let v = M[u32(max(w, 0))];
+    switch (e) {
+        case 1u: { return ((v & 0x00FF00FFu) << 8u) | ((v >> 8u) & 0x00FF00FFu); }
+        case 2u: { return (v >> 24u) | ((v >> 8u) & 0xFF00u) | ((v << 8u) & 0xFF0000u) | (v << 24u); }
+        case 3u: { return (v << 16u) | (v >> 16u); }
+        default: { return v; }
+    }
+}
+fn bitsAt(v: u32, off: u32, bits: u32) -> u32 {
+    if (bits == 32u) { return v; }
+    return (v >> off) & ((1u << bits) - 1u);
+}
+fn nrm(raw: u32, bits: u32, sgn: bool, integer: bool, rf: bool) -> f32 {
+    if (sgn) {
+        let sv = i32(raw << (32u - bits)) >> (32u - bits);
+        if (integer) { return f32(sv); }
+        let maxv = f32((1u << (bits - 1u)) - 1u);
+        if (rf) { return (f32(sv) * 2.0 + 1.0) / (maxv * 2.0 + 1.0); }
+        return max(f32(sv) / maxv, -1.0);
+    }
+    if (integer) { return f32(raw); }
+    if (bits == 32u) { return f32(raw) / 4294967295.0; }
+    return f32(raw) / f32((1u << bits) - 1u);
+}
+// Xenos half floats have no inf/NaN: exponent 31 is an ordinary value.
+fn h2f(h: u32) -> f32 {
+    let e = (h >> 10u) & 31u;
+    let m = f32(h & 0x3FFu);
+    var v = select((1.0 + m / 1024.0) * exp2(f32(e) - 15.0), m * exp2(-24.0), e == 0u);
+    return select(v, -v, ((h >> 15u) & 1u) == 1u);
+}
+)";
+
         const char* kPrelude = R"(
 fn mulxs(a: f32, b: f32) -> f32 { return select(a * b, 0.0, a == 0.0 || b == 0.0); }
 fn mulx(a: vec4f, b: vec4f) -> vec4f { return select(a * b, vec4f(0.0), (a == vec4f(0.0)) | (b == vec4f(0.0))); }
@@ -384,23 +558,26 @@ fn cube(s1: vec4f, s2: vec4f) -> vec4f {
     return vec4f(-y, select(-z, z, x < 0.0), 2.0 * ax, select(0.0, 1.0, x < 0.0));
 }
 
-struct DrawData {
-    misc: vec4f,
-    c: array<vec4f, 256>,
-}
-@group(0) @binding(0) var<storage, read> D: DrawData;
 )";
     }
 
-    WgslShader TranslateToWgsl(const CompiledShader* ps, const WgslOptions& options)
+    const char* const kWgslDrawData = R"(
+struct DrawData {
+    misc: vec4f,
+    xf: array<vec4f, 3>,
+    c: array<vec4f, 512>,
+    vf: array<vec4u, 96>,
+}
+@group(0) @binding(0) var<storage, read> D: DrawData;
+@group(0) @binding(1) var<storage, read> M: array<u32>;
+)";
+
+    namespace
     {
-        Emitter e;
-        e.options = &options;
-        if (ps)
+        void EmitProgram(Emitter& e, const CompiledShader& program)
         {
-            for (size_t i = 0; i < ps->ops.size(); i++)
+            for (const CompiledOp& op : program.ops)
             {
-                const CompiledOp& op = ps->ops[i];
                 switch (op.kind)
                 {
                 case CompiledOp::Kind::Clause:
@@ -421,9 +598,12 @@ struct DrawData {
                     e.Alu(op.alu);
                     break;
                 case CompiledOp::Kind::TextureFetch:
-                    e.TextureFetch(op.textureFetch);
+                    if (e.pixel)
+                        e.TextureFetch(op.textureFetch);
                     break;
-                default:
+                case CompiledOp::Kind::VertexFetch:
+                    if (!e.pixel)
+                        e.VertexFetch(op.vertexFetch);
                     break;
                 }
             }
@@ -434,36 +614,123 @@ struct DrawData {
             }
         }
 
+        std::string Declarations(const Emitter& e)
+        {
+            std::string w;
+            for (uint32_t reg : e.regs)
+                w += "    var " + Reg(reg) + " = vec4f(0.0);\n";
+            // Vertex fetch indices outlive the clause of their full fetch (mini fetches).
+            for (int i = 1; i <= e.fetchCounter; i++)
+                w += "    var fi" + Num(uint32_t(i)) + " = 0i;\n";
+            w += "    var p0 = false;\n    var ps = 0.0;\n    var a0 = 0i;\n    var killed = false;\n";
+            return w;
+        }
+    }
+
+    WgslShader TranslateToWgsl(const CompiledShader* vs, const CompiledShader* ps, const WgslOptions& options)
+    {
         WgslShader out;
+        std::string& w = out.code;
+        w = kWgslDrawData;
+        w += kHelpers;
+        w += kPrelude;
+
+        // ---- vertex stage
+        Emitter ve;
+        ve.pixel = false;
+        ve.constBase = 0;
+        ve.options = &options;
+        if (vs)
+        {
+            ve.regs.insert(0);
+            EmitProgram(ve, *vs);
+            out.interpolators = ve.vsExports;
+            out.vertexSlots[0] = ve.vertexSlots[0];
+            out.vertexSlots[1] = ve.vertexSlots[1];
+            std::copy(std::begin(ve.slotRange), std::end(ve.slotRange), std::begin(out.slotRange));
+        }
+        else
+        {
+            out.interpolators = options.interpolatorMask;
+        }
+        const uint32_t interpolators = out.interpolators;
+
+        w += "\nstruct VsOut {\n    @builtin(position) pos: vec4f,\n";
+        uint32_t location = 0;
+        for (uint32_t i = 0; i < 16; i++)
+            if (interpolators & (1u << i))
+                w += "    @location(" + Num(location++) + ") v" + Num(i) + ": vec4f,\n";
+        w += "}\n";
+
+        if (vs)
+        {
+            w += "@vertex fn vs(@builtin(vertex_index) vertexIndex: u32) -> VsOut {\n";
+            w += Declarations(ve);
+            w += "    r0 = vec4f(f32(vertexIndex), 0.0, 0.0, 0.0);\n";
+            w += "    var oPos = vec4f(0.0, 0.0, 0.0, 1.0);\n";
+            for (uint32_t i = 0; i < 16; i++)
+                if (interpolators & (1u << i))
+                    w += "    var oV" + Num(i) + " = vec4f(0.0);\n";
+            w += ve.body;
+            // Xenos viewport transform (PA_CL_VTE_CNTL, viewport, window offset) into clip
+            // space for the render target. With the usual perspective divide the result
+            // stays linear in (x, w), so the GPU clips and interpolates it correctly.
+            w += R"(
+    let xf0 = D.xf[0];
+    let xf1 = D.xf[1];
+    let fl = D.xf[2];
+    let p = oPos;
+    var o: VsOut;
+    if (fl.x < 0.5 && fl.y < 0.5 && fl.z < 0.5) {
+        o.pos = vec4f((p.x * xf0.x + xf0.y * p.w) * 2.0 / xf1.z - p.w,
+                      p.w - (p.y * xf0.z + xf0.w * p.w) * 2.0 / xf1.w,
+                      p.z * xf1.x + xf1.y * p.w,
+                      p.w);
+    } else {
+        let invW = select(1.0 / p.w, p.w, fl.z > 0.5);
+        let xs = select(p.x * invW, p.x, fl.x > 0.5);
+        let ys = select(p.y * invW, p.y, fl.x > 0.5);
+        let zs = select(p.z * invW, p.z, fl.y > 0.5);
+        let cw = select(1.0 / invW, 1.0, fl.x > 0.5);
+        o.pos = vec4f(((xs * xf0.x + xf0.y) * 2.0 / xf1.z - 1.0) * cw,
+                      (1.0 - (ys * xf0.z + xf0.w) * 2.0 / xf1.w) * cw,
+                      (zs * xf1.x + xf1.y) * cw,
+                      cw);
+    }
+)";
+            for (uint32_t i = 0; i < 16; i++)
+                if (interpolators & (1u << i))
+                    w += "    o.v" + Num(i) + " = oV" + Num(i) + ";\n";
+            w += "    return o;\n}\n\n";
+        }
+        else
+        {
+            w += "struct VsIn {\n    @location(0) pos: vec4f,\n";
+            location = 1;
+            for (uint32_t i = 0; i < 16; i++)
+                if (interpolators & (1u << i))
+                    w += "    @location(" + Num(location++) + ") v" + Num(i) + ": vec4f,\n";
+            w += "}\n@vertex fn vs(input: VsIn) -> VsOut {\n    var o: VsOut;\n    o.pos = input.pos;\n";
+            for (uint32_t i = 0; i < 16; i++)
+                if (interpolators & (1u << i))
+                    w += "    o.v" + Num(i) + " = input.v" + Num(i) + ";\n";
+            w += "    return o;\n}\n\n";
+        }
+
+        // ---- pixel stage
+        Emitter e;
+        e.options = &options;
+        if (ps)
+            EmitProgram(e, *ps);
         out.textureSlots = e.textureSlots;
         out.colorExports = e.colorExports;
         out.depthExport = e.depthExport;
 
-        std::string& w = out.code;
-        w = kPrelude;
         for (uint32_t slot = 0; slot < 32; slot++)
             if (e.textureSlots & (1u << slot))
                 w += "@group(1) @binding(" + Num(slot * 2) + ") var t" + Num(slot) + ": texture_2d<f32>;\n@group(1) @binding(" +
                     Num(slot * 2 + 1) + ") var s" + Num(slot) + ": sampler;\n";
 
-        // Vertex stage: position and interpolators straight from the vertex buffer.
-        w += "\nstruct VsIn {\n    @location(0) pos: vec4f,\n";
-        uint32_t location = 1;
-        for (uint32_t i = 0; i < 16; i++)
-            if (options.interpolatorMask & (1u << i))
-                w += "    @location(" + Num(location++) + ") v" + Num(i) + ": vec4f,\n";
-        w += "}\nstruct VsOut {\n    @builtin(position) pos: vec4f,\n";
-        location = 0;
-        for (uint32_t i = 0; i < 16; i++)
-            if (options.interpolatorMask & (1u << i))
-                w += "    @location(" + Num(location++) + ") v" + Num(i) + ": vec4f,\n";
-        w += "}\n@vertex fn vs(input: VsIn) -> VsOut {\n    var o: VsOut;\n    o.pos = input.pos;\n";
-        for (uint32_t i = 0; i < 16; i++)
-            if (options.interpolatorMask & (1u << i))
-                w += "    o.v" + Num(i) + " = input.v" + Num(i) + ";\n";
-        w += "    return o;\n}\n\n";
-
-        // Fragment stage.
         w += "struct FsOut {\n";
         bool anyOutput = false;
         for (uint32_t k = 0; k < 4; k++)
@@ -480,14 +747,12 @@ struct DrawData {
         if (!anyOutput)
             w += "    @location(0) unused: vec4f,\n"; // never bound (no colour targets)
         w += "}\n@fragment fn fs(input: VsOut) -> FsOut {\n";
-        for (uint32_t reg : e.regs)
-            w += "    var " + Reg(reg) + " = vec4f(0.0);\n";
+        w += Declarations(e);
         for (uint32_t i = 0; i < 16; i++)
-            if ((options.interpolatorMask & (1u << i)) && e.regs.count(i))
+            if ((interpolators & (1u << i)) && e.regs.count(i))
                 w += "    " + Reg(i) + " = input.v" + Num(i) + ";\n";
         if (options.paramGen && e.regs.count(options.paramGenRegister & 127))
             w += "    " + Reg(options.paramGenRegister) + " = vec4f(floor(input.pos.x), floor(input.pos.y), 0.0, 0.0);\n";
-        w += "    var p0 = false;\n    var ps = 0.0;\n    var a0 = 0i;\n    var killed = false;\n";
         w += "    var o0 = vec4f(0.0);\n    var o1 = vec4f(0.0);\n    var o2 = vec4f(0.0);\n    var o3 = vec4f(0.0);\n    var oD = vec4f(input.pos.z);\n";
         w += e.body;
         w += "    if (killed) { discard; }\n";
@@ -504,6 +769,8 @@ struct DrawData {
         if (!anyOutput)
             w += "    result.unused = vec4f(0.0);\n";
         w += "    return result;\n}\n";
+        if (ve.unsupportedVertexFormat)
+            out.code.clear(); // the caller falls back to the software front end
         return out;
     }
 }

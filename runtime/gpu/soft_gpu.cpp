@@ -701,6 +701,7 @@ namespace gpu
                 }
             }
 
+            tex.format = info.format;
             tex.width = info.width;
             tex.height = info.height;
             tex.clampX = (fetch[0] >> 10) & 7;
@@ -1612,6 +1613,7 @@ namespace gpu
                         if ((ins[0] & 0x1F) == uint32_t(FetchOpcode::VertexFetch))
                         {
                             op.kind = CompiledOp::Kind::VertexFetch; // rejected by Compile
+                            std::memcpy(&op.vertexFetch, ins, 12);
                         }
                         else
                         {
@@ -3121,6 +3123,122 @@ namespace gpu
 
     void SoftSetCaptureSink(CaptureSink* sink) { g_sink = sink; }
 
+    bool g_softKeepTexels = false;
+
+    namespace
+    {
+        uint64_t g_verifyFrame = 0;
+        uint32_t g_verifyDraw = 0, g_verifyDumps = 0;
+
+        void DumpVerifyImage(const char* tag, uint32_t draw, uint32_t rt, const std::vector<F4>& px, int w, int h)
+        {
+            char name[96];
+            std::snprintf(name, sizeof(name), "verify_%llu_d%03u_rt%u_%s.bmp", (unsigned long long)g_verifyFrame, draw, rt, tag);
+            std::FILE* f = std::fopen(name, "wb");
+            if (!f)
+                return;
+            const uint32_t bytes = uint32_t(w) * uint32_t(h) * 4;
+            uint8_t header[54] = { 'B', 'M' };
+            auto put32 = [&](int at, uint32_t v) { for (int i = 0; i < 4; i++) header[at + i] = uint8_t(v >> (8 * i)); };
+            put32(2, 54 + bytes);
+            put32(10, 54);
+            put32(14, 40);
+            put32(18, uint32_t(w));
+            put32(22, uint32_t(-h));
+            header[26] = 1;
+            header[28] = 32;
+            put32(34, bytes);
+            std::fwrite(header, 1, sizeof(header), f);
+            for (const F4& c : px)
+            {
+                auto b = [](float v) { return uint8_t(std::lround(Saturate(v) * 255.0f)); };
+                const uint8_t pixel[4] = { b(c[2]), b(c[1]), b(c[0]), 255 };
+                std::fwrite(pixel, 1, 4, f);
+            }
+            std::fclose(f);
+        }
+    }
+
+    void SoftBeginVerify(uint64_t frame)
+    {
+        g_verifyFrame = frame;
+        g_verifyDraw = 0;
+        g_verifyDumps = 0;
+        g_softKeepTexels = true;
+        g_textureCache.clear(); // decodes whose texels a backend dropped must be redone
+        std::fprintf(stderr, "[verify] frame %llu: rendering every draw twice\n", (unsigned long long)frame);
+    }
+
+    void SoftEndVerify()
+    {
+        g_softKeepTexels = false;
+        std::fprintf(stderr, "[verify] frame %llu done: %u draws compared\n", (unsigned long long)g_verifyFrame, g_verifyDraw);
+    }
+
+    void SoftVerifyDraw(const DrawCall& draw)
+    {
+        const uint32_t index = g_verifyDraw++;
+        CaptureSink* sink = g_sink;
+        SoftDraw(draw); // hardware backend
+        g_sink = nullptr;
+        SoftDraw(draw); // software reference
+        g_sink = sink;
+        if (!sink)
+            return;
+
+        RasterState rs;
+        rs.Load();
+        if (rs.mode != 4)
+            return;
+        for (uint32_t k = 0; k < 4; k++)
+        {
+            if (!((rs.colorMask >> (k * 4)) & 0xF))
+                continue;
+            const Surface& s = rs.color[k];
+            const int x0 = std::max(rs.sx0, 0), y0 = std::max(rs.sy0, 0);
+            const int x1 = std::min({ rs.sx1, int(s.pitch), 2048 }), y1 = std::min(rs.sy1, 2048);
+            if (x1 <= x0 || y1 <= y0)
+                continue;
+            std::vector<F4> gpu;
+            sink->ReadColor(rs, k, x0, y0, x1, y1, gpu);
+            std::vector<F4> soft(gpu.size());
+            const int w = x1 - x0, h = y1 - y0;
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++)
+                {
+                    F4 c = g_edramColor[s.Index(uint32_t(x + x0) * s.scaleX, uint32_t(y + y0) * s.scaleY)];
+                    if (IsUnormColor(s.format))
+                        for (float& v : c)
+                            v = Saturate(v);
+                    soft[size_t(y) * w + x] = c;
+                }
+            double sum = 0, maxDiff = 0;
+            size_t bad = 0;
+            for (size_t i = 0; i < gpu.size(); i++)
+            {
+                double d = 0;
+                for (int c = 0; c < 4; c++)
+                    d = std::max(d, double(std::fabs(gpu[i][c] - soft[i][c])));
+                sum += d;
+                maxDiff = std::max(maxDiff, d);
+                bad += d > 0.05;
+            }
+            const double mean = gpu.empty() ? 0.0 : sum / double(gpu.size());
+            if (bad > gpu.size() / 200 + 16)
+            {
+                std::fprintf(stderr, "[verify] draw %u rt%u (base %03X fmt %u, %dx%d at %d,%d): mean diff %.4f, max %.3f, %zu/%zu pixels off; prim %u, vs %u dwords, ps %u dwords\n",
+                    index, k, s.baseTile, s.format, w, h, x0, y0, mean, maxDiff, bad, gpu.size(), draw.primitive,
+                    draw.vertexShader.count, draw.pixelShader.count);
+                if (g_verifyDumps < 12)
+                {
+                    ++g_verifyDumps;
+                    DumpVerifyImage("gpu", index, k, gpu, w, h);
+                    DumpVerifyImage("soft", index, k, soft, w, h);
+                }
+            }
+        }
+    }
+
     void SoftParallelFor(uint32_t count, const std::function<void(uint32_t)>& fn)
     {
         constexpr uint32_t kRows = 8;
@@ -3208,6 +3326,85 @@ namespace gpu
             if (restartEnabled && index == resetIndex)
                 restart[i] = 1;
             indices[i] = index + indexOffset;
+        }
+
+        // ---- hardware backend with GPU vertex shading: hand over the triangle indices
+        if (g_sink && rs.mode != 6 && prim != 8)
+        {
+            CompiledShader vsFlow = CompileFlow(state, vs);
+            if (vsFlow.ok)
+            {
+                CompiledShader psFlow;
+                if (rs.mode == 4 && !psCode.empty())
+                {
+                    psFlow = CompileFlow(state, Program{ psCode.data(), uint32_t(psCode.size()), true });
+                    for (const CompiledOp& op : psFlow.ops)
+                        if (op.kind == CompiledOp::Kind::VertexFetch)
+                            psFlow.ok = false;
+                }
+                // Assemble a triangle list; strips keep their winding, restarts split runs.
+                std::vector<uint32_t> triangles;
+                triangles.reserve(indices.size() * 3);
+                auto tri = [&](size_t a, size_t b, size_t c) {
+                    if (restart[a] || restart[b] || restart[c])
+                        return;
+                    triangles.push_back(indices[a]);
+                    triangles.push_back(indices[b]);
+                    triangles.push_back(indices[c]);
+                };
+                auto forEachRun = [&](auto&& fn) {
+                    size_t begin = 0;
+                    for (size_t i = 0; i <= indices.size(); i++)
+                        if (i == indices.size() || restart[i])
+                        {
+                            if (i > begin)
+                                fn(begin, i);
+                            begin = i + 1;
+                        }
+                };
+                const size_t n = indices.size();
+                switch (prim)
+                {
+                case 4:
+                    for (size_t i = 0; i + 2 < n; i += 3)
+                        tri(i, i + 1, i + 2);
+                    break;
+                case 5:
+                    forEachRun([&](size_t begin, size_t end) {
+                        for (size_t i = begin + 1; i + 1 < end; i++)
+                            tri(begin, i, i + 1);
+                    });
+                    break;
+                case 6:
+                    forEachRun([&](size_t begin, size_t end) {
+                        for (size_t i = begin; i + 2 < end; i++)
+                        {
+                            if ((i - begin) & 1)
+                                tri(i + 1, i, i + 2);
+                            else
+                                tri(i, i + 1, i + 2);
+                        }
+                    });
+                    break;
+                case 13:
+                    for (size_t i = 0; i + 3 < n; i += 4)
+                    {
+                        tri(i, i + 1, i + 2);
+                        tri(i, i + 2, i + 3);
+                    }
+                    break;
+                }
+                GpuDrawRequest request;
+                request.rs = &rs;
+                request.vs = &vsFlow;
+                request.ps = psFlow.ok ? &psFlow : nullptr;
+                request.constants = state.constants;
+                request.fetch = state.fetch;
+                request.indices = &triangles;
+                request.texture = [](uint32_t slot) -> const Texture& { return state.TextureSlot(slot); };
+                if (g_sink->DrawGpu(request))
+                    return;
+            }
         }
 
         // ---- vertex shading (once per distinct index)

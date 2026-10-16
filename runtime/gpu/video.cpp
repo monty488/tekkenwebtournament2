@@ -331,7 +331,29 @@ namespace gpu
         static const bool dumpTextures = [] { const char* v = std::getenv("TTT2_GPU_DUMP_TEX"); return v && *v == '1'; }();
         g_softDumpTextures = dumpTextures && g_logFrame && g_swapCount + 1 == g_logFrame;
         const uint64_t pixelsBefore = SoftPixelsWritten();
-        SoftDraw(call);
+        // TTT2_GPU_VERIFY_FRAME=n: compare the hardware backend with the software renderer
+        // draw by draw during swap n.
+        static const uint64_t verifyFrame = [] { const char* v = std::getenv("TTT2_GPU_VERIFY_FRAME"); return v ? std::strtoull(v, nullptr, 10) : 0ull; }();
+        static bool verifying = false;
+        if (verifyFrame && WebGpuActive() && g_swapCount + 1 == verifyFrame)
+        {
+            if (!verifying)
+            {
+                verifying = true;
+                WebGpuFlushResolves();
+                SoftBeginVerify(verifyFrame);
+            }
+            SoftVerifyDraw(call);
+        }
+        else
+        {
+            if (verifying)
+            {
+                verifying = false;
+                SoftEndVerify();
+            }
+            SoftDraw(call);
+        }
         if (g_logFrame && g_swapCount + 1 == g_logFrame)
             std::fprintf(stderr, "[gpu]   -> %llu pixels written\n", (unsigned long long)(SoftPixelsWritten() - pixelsBefore));
     }

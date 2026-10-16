@@ -37,6 +37,13 @@ namespace gpu
     // = copy) perform a resolve instead of rasterising.
     void SoftDraw(const DrawCall& draw);
 
+    // Verification: renders a draw with the installed hardware backend and then with the
+    // software renderer, from the same inputs, and logs how far their colour targets differ
+    // (dumping both images for the first mismatches). SoftBeginVerify starts a frame of it.
+    void SoftBeginVerify(uint64_t frame);
+    void SoftVerifyDraw(const DrawCall& draw);
+    void SoftEndVerify();
+
     // Called on every swap: drops cached texture decodes (the CPU may rewrite textures).
     void SoftEndFrame();
 

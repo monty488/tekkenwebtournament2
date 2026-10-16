@@ -150,16 +150,28 @@ namespace gpu
             return (control & 0x1FFF) == 0x0001 && ((control >> 16) & 0x1FFF) == 0x0001;
         }
 
+        // Unorm Xenos targets get unorm textures so that shader output and blending clamp to
+        // [0, 1] as on the console; float formats keep their range.
         WGPUTextureFormat ColorFormat(uint32_t xenosFormat)
         {
-            return (xenosFormat == 14 || xenosFormat == 15) ? WGPUTextureFormat_RGBA32Float : WGPUTextureFormat_RGBA16Float;
+            switch (xenosFormat)
+            {
+            case 0: case 1: case 10: return WGPUTextureFormat_RGBA8Unorm;  // 8_8_8_8 (gamma), 2_10_10_10_AS_10_10_10_10 approx.
+            case 2: return WGPUTextureFormat_RGB10A2Unorm;                  // 2_10_10_10
+            case 14: case 15: return WGPUTextureFormat_RGBA32Float;
+            default: return WGPUTextureFormat_RGBA16Float;
+            }
         }
 
         bool IsUnormColor(uint32_t format) { return format == 0 || format == 1 || format == 2 || format == 10; }
 
-        constexpr uint32_t kDrawDataStride = 4352; // misc vec4 + 256 vec4 = 4112, aligned to 256
-        constexpr uint64_t kDrawRingBytes = 16ull << 20;
+        constexpr uint32_t kDrawDataStride = (kDrawDataBytes + 255) & ~255u;
+        constexpr uint64_t kDrawRingBytes = 32ull << 20;
         constexpr uint64_t kVertexRingBytes = 64ull << 20;
+        constexpr uint64_t kVertexMemoryBytes = 128ull << 20; // guest vertex data (storage)
+        constexpr uint64_t kIndexRingBytes = 32ull << 20;
+
+        uint32_t PhysicalToGuest(uint32_t physical) { return 0xA0000000u + (physical & 0x1FFFFFFFu); }
 
         struct RenderTarget
         {
@@ -215,6 +227,7 @@ namespace gpu
             bool Init();
 
             void BeginDraw(const CaptureDraw& draw) override;
+            bool DrawGpu(const GpuDrawRequest& request) override;
             void Triangle(const CaptureVertex& a, const CaptureVertex& b, const CaptureVertex& c, bool front) override;
             void EndDraw() override;
             void ReadColor(const RasterState& rs, uint32_t rt, int x0, int y0, int x1, int y1, std::vector<F4>& out) override;
@@ -227,6 +240,7 @@ namespace gpu
             void EndFrame();
             void PrintStats();
             bool ReadFrontBuffer(const uint32_t fetch[6], std::vector<uint32_t>& bgra, uint32_t& width, uint32_t& height);
+            void FlushAllResolves();
 
         private:
             // ---- device
@@ -235,6 +249,7 @@ namespace gpu
             WGPUDevice device_ = nullptr;
             WGPUQueue queue_ = nullptr;
             bool depthClipControl_ = false;
+            bool float32Filterable_ = false; // rgba32float textures can be sampled with filtering
 
             // ---- recording
             WGPUCommandEncoder encoder_ = nullptr;
@@ -243,8 +258,9 @@ namespace gpu
             RenderTarget* passDepth_ = nullptr;
 
             // ---- rings (offsets reset after every submit)
-            WGPUBuffer drawRing_ = nullptr, vertexRing_ = nullptr;
-            uint64_t drawOffset_ = 0, vertexOffset_ = 0;
+            WGPUBuffer drawRing_ = nullptr, vertexRing_ = nullptr, vertexMemory_ = nullptr, indexRing_ = nullptr;
+            uint64_t drawOffset_ = 0, vertexOffset_ = 0, vertexMemoryOffset_ = 0, indexOffset_ = 0;
+            std::unordered_map<uint64_t, uint32_t> vertexUploads_; // (address, words) -> word offset, per submit
 
             // ---- caches
             std::map<std::tuple<bool, uint32_t, uint32_t, uint32_t, uint32_t, int>, std::unique_ptr<RenderTarget>> targets_;
@@ -277,6 +293,8 @@ namespace gpu
             uint32_t floatsPerVertex_ = 4;
             std::vector<float> vertices_;
             bool skip_ = false;
+            bool gpuVertex_ = false;
+            uint32_t scaleX_ = 1, scaleY_ = 1; // MSAA view: samples per pixel horizontally/vertically
 
             Stats stats_;
 
@@ -286,7 +304,20 @@ namespace gpu
             void EndPass();
             void Submit();
             void BeginPass(RenderTarget* const color[4], RenderTarget* depth);
-            uint32_t WriteDrawData(const float misc[4], const F4* constants, uint32_t count);
+            uint32_t WriteDrawData(const float misc[4], const F4* xf, const F4* constants, uint32_t first, uint32_t count,
+                const uint32_t (*vertexFetch)[4] = nullptr);
+            struct PrepareArgs
+            {
+                const RasterState* rs = nullptr;
+                const CompiledShader* vs = nullptr;  // null: vertices come pre-shaded
+                const CompiledShader* ps = nullptr;
+                const F4* constants = nullptr;       // vs: c0..c511; otherwise c256..c511
+                const uint32_t* fetch = nullptr;
+                const std::function<const Texture&(uint32_t)>* texture = nullptr;
+                uint32_t minIndex = 0, maxIndex = 0; // vertex indices the draw uses
+            };
+            bool Prepare(const PrepareArgs& args);
+            uint32_t UploadVertexMemory(uint32_t address, uint32_t words);
             WGPUShaderModule Module(const std::string& code);
             WGPUBindGroupLayout TextureLayout(uint32_t slots);
             WGPUPipelineLayout PipelineLayout(uint32_t slots);
@@ -349,7 +380,10 @@ namespace gpu
                 depthClipControl_ = true;
             }
             if (wgpuAdapterHasFeature(adapter_, WGPUFeatureName_Float32Filterable))
+            {
                 features.push_back(WGPUFeatureName_Float32Filterable);
+                float32Filterable_ = true;
+            }
 
             struct DeviceResult { WGPUDevice device = nullptr; bool done = false; } dr;
             WGPUDeviceDescriptor dd = WGPU_DEVICE_DESCRIPTOR_INIT;
@@ -392,26 +426,39 @@ namespace gpu
             bd.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
             bd.size = kVertexRingBytes;
             vertexRing_ = wgpuDeviceCreateBuffer(device_, &bd);
+            bd.label = Str("guest vertex memory");
+            bd.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
+            bd.size = kVertexMemoryBytes;
+            vertexMemory_ = wgpuDeviceCreateBuffer(device_, &bd);
+            bd.label = Str("indices");
+            bd.usage = WGPUBufferUsage_Index | WGPUBufferUsage_CopyDst;
+            bd.size = kIndexRingBytes;
+            indexRing_ = wgpuDeviceCreateBuffer(device_, &bd);
 
-            WGPUBindGroupLayoutEntry entry = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
-            entry.binding = 0;
-            entry.visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
-            entry.buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
-            entry.buffer.hasDynamicOffset = true;
-            entry.buffer.minBindingSize = 4112;
+            WGPUBindGroupLayoutEntry entries[2] = { WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT };
+            entries[0].binding = 0;
+            entries[0].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
+            entries[0].buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
+            entries[0].buffer.hasDynamicOffset = true;
+            entries[0].buffer.minBindingSize = kDrawDataBytes;
+            entries[1].binding = 1;
+            entries[1].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
+            entries[1].buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
             WGPUBindGroupLayoutDescriptor bld = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
-            bld.entryCount = 1;
-            bld.entries = &entry;
+            bld.entryCount = 2;
+            bld.entries = entries;
             drawLayout_ = wgpuDeviceCreateBindGroupLayout(device_, &bld);
-            WGPUBindGroupEntry bge = WGPU_BIND_GROUP_ENTRY_INIT;
-            bge.binding = 0;
-            bge.buffer = drawRing_;
-            bge.offset = 0;
-            bge.size = 4112;
+            WGPUBindGroupEntry bge[2] = { WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT };
+            bge[0].binding = 0;
+            bge[0].buffer = drawRing_;
+            bge[0].size = kDrawDataBytes;
+            bge[1].binding = 1;
+            bge[1].buffer = vertexMemory_;
+            bge[1].size = kVertexMemoryBytes;
             WGPUBindGroupDescriptor bgd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
             bgd.layout = drawLayout_;
-            bgd.entryCount = 1;
-            bgd.entries = &bge;
+            bgd.entryCount = 2;
+            bgd.entries = bge;
             drawBindGroup_ = wgpuDeviceCreateBindGroup(device_, &bgd);
 
             // 1x1 transparent black for slots whose texture could not be decoded.
@@ -432,9 +479,7 @@ namespace gpu
             wgpuQueueWriteTexture(queue_, &dst, &zero, 4, &layout, &one);
 
             // Clears: a full-screen triangle at depth D.c[0].x writing colour D.misc.
-            clearModule_ = Module(R"(
-struct DrawData { misc: vec4f, c: array<vec4f, 256>, }
-@group(0) @binding(0) var<storage, read> D: DrawData;
+            clearModule_ = Module(std::string(kWgslDrawData) + R"(
 @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
     let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u)) * 2.0 - 1.0;
     return vec4f(p, D.c[0].x, 1.0);
@@ -454,9 +499,7 @@ struct DrawData { misc: vec4f, c: array<vec4f, 256>, }
             sld.entryCount = 1;
             sld.entries = &src;
             resolveSourceLayout_ = wgpuDeviceCreateBindGroupLayout(device_, &sld);
-            resolveModule_ = Module(R"(
-struct DrawData { misc: vec4f, c: array<vec4f, 256>, }
-@group(0) @binding(0) var<storage, read> D: DrawData;
+            resolveModule_ = Module(std::string(kWgslDrawData) + R"(
 @group(1) @binding(0) var src: texture_2d<f32>;
 @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
     let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u)) * 2.0 - 1.0;
@@ -476,8 +519,23 @@ fn quantise(v: f32, bits: f32) -> f32 {
 }
 @fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
     let dims = vec2i(textureDimensions(src));
-    let at = clamp(vec2i(p.xy) + vec2i(i32(D.c[0].x), i32(D.c[0].y)), vec2i(0), dims - 1);
-    var v = textureLoad(src, at, 0);
+    let pixel = vec2i(p.xy) + vec2i(i32(D.c[0].x), i32(D.c[0].y));
+    let scale = vec2i(i32(D.c[1].z), i32(D.c[1].w));
+    var v = vec4f(0.0);
+    if (D.c[3].x > 0.5) {
+        // Average every sample of the pixel.
+        for (var j = 0; j < scale.y; j++) {
+            for (var i = 0; i < scale.x; i++) {
+                v += textureLoad(src, clamp(pixel * scale + vec2i(i, j), vec2i(0), dims - 1), 0);
+            }
+        }
+        v /= f32(scale.x * scale.y);
+    } else {
+        // One sample: 2x stacks samples vertically, 4x is 2x2.
+        let n = i32(D.c[3].y);
+        let s = select(vec2i(0, n), vec2i(n & 1, n >> 1), scale.x == 2);
+        v = textureLoad(src, clamp(pixel * scale + s, vec2i(0), dims - 1), 0);
+    }
     if (D.c[0].z > 0.5) { v = vec4f(pwl(v.x), pwl(v.y), pwl(v.z), v.w); }
     v = v * D.c[0].w;
     if (D.c[1].x > 0.5) { v = v.zyxw; }
@@ -629,21 +687,38 @@ fn quantise(v: f32, bits: f32) -> f32 {
                 return dummy_;
             GpuTexture& g = textures_[&tex];
 
-            // Texels within [0, 1] (most textures) upload as rgba8; others keep half floats.
+            // Precision from the source format: 8-bit formats stay 8-bit (if the decode
+            // stayed in [0, 1]: signed or exponent-adjusted ones need floats), depth and
+            // 16/32-bit formats keep full float precision, anything else half floats.
             const size_t count = size_t(tex.width) * tex.height;
-            std::atomic<bool> unorm{ true };
             const uint32_t chunks = uint32_t((count + 65535) / 65536);
-            SoftParallelFor(chunks, [&](uint32_t c) {
-                const size_t end = std::min(count, size_t(c + 1) * 65536);
-                for (size_t i = size_t(c) * 65536; i < end && unorm.load(std::memory_order_relaxed); i++)
-                    for (float v : tex.texels[i])
-                        if (!(v >= 0.0f && v <= 1.0f))
-                        {
-                            unorm = false;
-                            break;
-                        }
-            });
-            const WGPUTextureFormat format = unorm ? WGPUTextureFormat_RGBA8Unorm : WGPUTextureFormat_RGBA16Float;
+            bool eightBit = false, wide = false;
+            switch (tex.format)
+            {
+            case 0: case 1: case 2: case 3: case 4: case 5: case 6: case 8: case 9: case 10: case 11: case 12: case 14: case 15:
+            case 18: case 19: case 20: case 49: case 50: case 51: case 52: case 53: case 58: case 59: case 60: case 61:
+                eightBit = true;
+                break;
+            case 22: case 23: case 24: case 25: case 26: case 33: case 34: case 35: case 36: case 37: case 38: case 57:
+                wide = true;
+                break;
+            default:
+                break;
+            }
+            std::atomic<bool> unorm{ eightBit };
+            if (eightBit)
+                SoftParallelFor(chunks, [&](uint32_t c) {
+                    const size_t end = std::min(count, size_t(c + 1) * 65536);
+                    for (size_t i = size_t(c) * 65536; i < end && unorm.load(std::memory_order_relaxed); i++)
+                        for (float v : tex.texels[i])
+                            if (!(v >= 0.0f && v <= 1.0f))
+                            {
+                                unorm = false;
+                                break;
+                            }
+                });
+            const WGPUTextureFormat format = unorm ? WGPUTextureFormat_RGBA8Unorm
+                : (wide && float32Filterable_) ? WGPUTextureFormat_RGBA32Float : WGPUTextureFormat_RGBA16Float;
             if (!g.texture || g.width != tex.width || g.height != tex.height || g.format != format)
             {
                 if (g.view)
@@ -662,7 +737,7 @@ fn quantise(v: f32, bits: f32) -> f32 {
             }
             g.version = tex.version;
 
-            const uint32_t bpp = unorm ? 4 : 8;
+            const uint32_t bpp = unorm ? 4 : format == WGPUTextureFormat_RGBA32Float ? 16 : 8;
             static std::vector<uint8_t> staging;
             staging.resize(count * bpp);
             SoftParallelFor(chunks, [&](uint32_t c) {
@@ -673,6 +748,8 @@ fn quantise(v: f32, bits: f32) -> f32 {
                     if (unorm)
                         for (int k = 0; k < 4; k++)
                             staging[i * 4 + k] = uint8_t(t[k] * 255.0f + 0.5f);
+                    else if (bpp == 16)
+                        std::memcpy(&staging[i * 16], t.data(), 16);
                     else
                         for (int k = 0; k < 4; k++)
                         {
@@ -691,7 +768,8 @@ fn quantise(v: f32, bits: f32) -> f32 {
             ++stats_.textureUploads;
             // The GPU copy is what gets sampled from now on; the software cache keeps the
             // entry (its hash detects changes) without the float texels.
-            std::vector<F4>().swap(const_cast<Texture&>(tex).texels);
+            if (!g_softKeepTexels)
+                std::vector<F4>().swap(const_cast<Texture&>(tex).texels);
             return g;
         }
 
@@ -699,7 +777,10 @@ fn quantise(v: f32, bits: f32) -> f32 {
         {
             if (!s.pitch)
                 return nullptr;
-            const auto key = std::make_tuple(depth, s.baseTile, s.pitch, s.scaleX, s.scaleY, int(format));
+            // Keyed in sample space (pitch x MSAA width): an MSAA view and a 1x view of the
+            // same EDRAM share a texture, as they share memory on the console.
+            const uint32_t samplePitch = s.pitch * s.scaleX;
+            const auto key = std::make_tuple(depth, s.baseTile, samplePitch, 1u, 1u, int(format));
             auto& slot = targets_[key];
             if (slot)
                 return slot.get();
@@ -707,10 +788,10 @@ fn quantise(v: f32, bits: f32) -> f32 {
             rt->depth = depth;
             rt->format = format;
             rt->baseTile = s.baseTile;
-            rt->width = s.pitch;
-            // As many rows as EDRAM could hold at this pitch (2048 at 1280 wide, 1x).
-            const uint64_t rows = uint64_t(kEdramTiles) * kTileSamples / (uint64_t(s.pitch) * s.scaleX) / s.scaleY;
-            rt->height = uint32_t(std::clamp<uint64_t>(rows, 16, 2048));
+            rt->width = samplePitch;
+            // As many sample rows as EDRAM could hold at this pitch (2048 at 1280 wide).
+            const uint64_t rows = uint64_t(kEdramTiles) * kTileSamples / samplePitch;
+            rt->height = uint32_t(std::clamp<uint64_t>(rows, 16, 4096));
             WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
             td.label = Str(depth ? "depth target" : "colour target");
             td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc | WGPUTextureUsage_TextureBinding;
@@ -758,6 +839,9 @@ fn quantise(v: f32, bits: f32) -> f32 {
             }
             drawOffset_ = 0;
             vertexOffset_ = 0;
+            vertexMemoryOffset_ = 0;
+            indexOffset_ = 0;
+            vertexUploads_.clear();
         }
 
         void WebGpuBackend::BeginPass(RenderTarget* const color[4], RenderTarget* depth)
@@ -797,28 +881,128 @@ fn quantise(v: f32, bits: f32) -> f32 {
             passDepth_ = depth;
         }
 
-        uint32_t WebGpuBackend::WriteDrawData(const float misc[4], const F4* constants, uint32_t count)
+        uint32_t WebGpuBackend::WriteDrawData(const float misc[4], const F4* xf, const F4* constants, uint32_t first, uint32_t count,
+            const uint32_t (*vertexFetch)[4])
         {
             if (drawOffset_ + kDrawDataStride > kDrawRingBytes)
                 Submit();
             const uint32_t offset = uint32_t(drawOffset_);
-            float data[4 + 256 * 4] = {};
-            std::memcpy(data, misc, 16);
-            if (constants)
-                std::memcpy(data + 4, constants, size_t(count) * 16);
-            wgpuQueueWriteBuffer(queue_, drawRing_, offset, data, 16 + size_t(count) * 16);
+            static std::vector<uint8_t> image(kDrawDataBytes);
+            std::memset(image.data(), 0, image.size());
+            std::memcpy(image.data(), misc, 16);
+            if (xf)
+                std::memcpy(image.data() + 16, xf, 48);
+            if (constants && count)
+                std::memcpy(image.data() + 64 + size_t(first) * 16, constants, size_t(count) * 16);
+            if (vertexFetch)
+                std::memcpy(image.data() + 64 + 512 * 16, vertexFetch, 96 * 16);
+            wgpuQueueWriteBuffer(queue_, drawRing_, offset, image.data(), image.size());
             drawOffset_ += kDrawDataStride;
             return offset;
+        }
+
+        // Copies guest memory holding vertex data into the vertex memory buffer (once per
+        // submit for each range) and returns its word offset there.
+        uint32_t WebGpuBackend::UploadVertexMemory(uint32_t address, uint32_t words)
+        {
+            const uint64_t key = (uint64_t(address) << 32) | words;
+            auto it = vertexUploads_.find(key);
+            if (it != vertexUploads_.end())
+                return it->second;
+            const uint64_t bytes = uint64_t(words) * 4;
+            if (bytes > kVertexMemoryBytes / 2)
+                return 0;
+            if (vertexMemoryOffset_ + bytes > kVertexMemoryBytes)
+                Submit();
+            const uint32_t wordOffset = uint32_t(vertexMemoryOffset_ / 4);
+            wgpuQueueWriteBuffer(queue_, vertexMemory_, vertexMemoryOffset_, guest::ToHost<const uint8_t>(address), bytes);
+            vertexMemoryOffset_ = (vertexMemoryOffset_ + bytes + 255) & ~255ull;
+            vertexUploads_[key] = wordOffset;
+            return wordOffset;
         }
 
         // ---- draws ------------------------------------------------------------------------
 
         void WebGpuBackend::BeginDraw(const CaptureDraw& draw)
         {
+            PrepareArgs args;
+            args.rs = draw.rs;
+            args.ps = draw.ps;
+            args.constants = draw.psConstants;
+            args.fetch = draw.fetch;
+            args.texture = &draw.texture;
+            if (!Prepare(args))
+                skip_ = true;
+        }
+
+        bool WebGpuBackend::DrawGpu(const GpuDrawRequest& request)
+        {
+            static const bool disabled = [] { const char* v = std::getenv("TTT2_GPU_CPU_VERTEX"); return v && *v == '1'; }();
+            if (disabled)
+                return false;
+            const RasterState& rs = *request.rs;
+            if (request.indices->empty() || (rs.cullFront && rs.cullBack))
+                return true;
+            PrepareArgs args;
+            args.rs = request.rs;
+            args.vs = request.vs;
+            args.ps = request.ps;
+            args.constants = request.constants;
+            args.fetch = request.fetch;
+            args.texture = &request.texture;
+            const auto [lo, hi] = std::minmax_element(request.indices->begin(), request.indices->end());
+            args.minIndex = *lo;
+            args.maxIndex = *hi;
+            if (!Prepare(args))
+                return false; // e.g. an unsupported vertex format: shade on the CPU
+            if (skip_ || !drawPipeline_)
+                return true;
+
             const auto start = std::chrono::steady_clock::now();
-            const RasterState& rs = *draw.rs;
+            const uint64_t bytes = request.indices->size() * sizeof(uint32_t);
+            if (bytes > kIndexRingBytes)
+                return true;
+            if (indexOffset_ + bytes > kIndexRingBytes)
+                Submit();
+            const uint64_t offset = indexOffset_;
+            wgpuQueueWriteBuffer(queue_, indexRing_, offset, request.indices->data(), bytes);
+            indexOffset_ = (indexOffset_ + bytes + 255) & ~255ull;
+
+            BeginPass(drawColor_, drawDepth_);
+            const RenderTarget* rt = drawDepth_;
+            for (auto* t : drawColor_)
+                if (t && !rt)
+                    rt = t;
+            const int sx = int(scaleX_), sy = int(scaleY_);
+            const int x0 = std::clamp(rs.sx0 * sx, 0, int(rt->width)), y0 = std::clamp(rs.sy0 * sy, 0, int(rt->height));
+            const int x1 = std::clamp(rs.sx1 * sx, x0, int(rt->width)), y1 = std::clamp(rs.sy1 * sy, y0, int(rt->height));
+            if (x1 <= x0 || y1 <= y0)
+                return true;
+            wgpuRenderPassEncoderSetPipeline(pass_, drawPipeline_);
+            wgpuRenderPassEncoderSetBindGroup(pass_, 0, drawBindGroup_, 1, &drawDataOffset_);
+            wgpuRenderPassEncoderSetBindGroup(pass_, 1, drawTextures_, 0, nullptr);
+            wgpuRenderPassEncoderSetIndexBuffer(pass_, indexRing_, WGPUIndexFormat_Uint32, offset, bytes);
+            wgpuRenderPassEncoderSetViewport(pass_, 0, 0, float(rt->width), float(rt->height), 0.0f, 1.0f);
+            wgpuRenderPassEncoderSetScissorRect(pass_, uint32_t(x0), uint32_t(y0), uint32_t(x1 - x0), uint32_t(y1 - y0));
+            const WGPUColor blend = { rs.blendConstant[0], rs.blendConstant[1], rs.blendConstant[2], rs.blendConstant[3] };
+            wgpuRenderPassEncoderSetBlendConstant(pass_, &blend);
+            wgpuRenderPassEncoderSetStencilReference(pass_, rs.stencilFace[0].ref);
+            wgpuRenderPassEncoderDrawIndexed(pass_, uint32_t(request.indices->size()), 1, 0, 0, 0);
+            ++stats_.draws;
+            stats_.triangles += request.indices->size() / 3;
+            stats_.encodeNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+            return true;
+        }
+
+        bool WebGpuBackend::Prepare(const PrepareArgs& args)
+        {
+            const auto start = std::chrono::steady_clock::now();
+            const RasterState& rs = *args.rs;
             rs_ = &rs;
             skip_ = false;
+            gpuVertex_ = args.vs != nullptr;
+            scaleX_ = rs.color[0].scaleX;
+            scaleY_ = rs.color[0].scaleY;
             vertices_.clear();
             interpolatorMask_ = rs.interpolatorMask;
 
@@ -839,7 +1023,7 @@ fn quantise(v: f32, bits: f32) -> f32 {
             if (!any)
             {
                 skip_ = true;
-                return;
+                return true;
             }
             // All attachments of a pass must have the same size, and a target may be bound
             // once (unused colour slots often still point at RT0's base): drop the rest.
@@ -862,7 +1046,7 @@ fn quantise(v: f32, bits: f32) -> f32 {
             for (int k = 0; k < 4; k++)
                 if (drawColor_[k])
                     options.colorTargets |= 1u << k;
-            if (rs.mode == 4 && !draw.ps)
+            if (rs.mode == 4 && !args.ps)
             {
                 static bool warned = false;
                 if (!warned)
@@ -873,11 +1057,14 @@ fn quantise(v: f32, bits: f32) -> f32 {
             }
             // Slots whose texture is a GPU-resolved image: bound directly, swizzled in the shader.
             ResolvedImage* gpuSlot[32] = {};
-            for (uint32_t slot = 0; slot < 32 && draw.fetch; slot++)
-                if ((gpuSlot[slot] = ResolvedFor(draw.fetch + slot * 6)))
-                    options.slotSwizzle[slot] = uint16_t((draw.fetch[slot * 6 + 3] >> 1) & 0xFFF);
-            const bool hasFragment = rs.mode == 4 && options.colorTargets && draw.ps;
-            const WgslShader shader = TranslateToWgsl(hasFragment ? draw.ps : nullptr, options);
+            for (uint32_t slot = 0; slot < 32 && args.fetch; slot++)
+                if ((gpuSlot[slot] = ResolvedFor(args.fetch + slot * 6)))
+                    options.slotSwizzle[slot] = uint16_t((args.fetch[slot * 6 + 3] >> 1) & 0xFFF);
+            const bool hasFragment = rs.mode == 4 && options.colorTargets && args.ps;
+            const WgslShader shader = TranslateToWgsl(args.vs, hasFragment ? args.ps : nullptr, options);
+            if (shader.code.empty())
+                return false;
+            interpolatorMask_ = shader.interpolators;
             const WGPUShaderModule module = Module(shader.code);
             const uint32_t slots = hasFragment ? shader.textureSlots : 0;
 
@@ -891,7 +1078,7 @@ fn quantise(v: f32, bits: f32) -> f32 {
                 a.shaderLocation = 0;
                 attributes.push_back(a);
                 uint32_t location = 1;
-                for (uint32_t i = 0; i < 16; i++)
+                for (uint32_t i = 0; i < 16 && !gpuVertex_; i++)
                     if (rs.interpolatorMask & (1u << i))
                     {
                         a.offset = floatsPerVertex_ * 4;
@@ -906,6 +1093,8 @@ fn quantise(v: f32, bits: f32) -> f32 {
             add(Fnv(shader.code.data(), shader.code.size()));
             add(rs.interpolatorMask);
             add(hasFragment);
+            add(gpuVertex_);
+            add(gpuVertex_ ? (rs.cullFront | (rs.cullBack << 1) | (rs.frontCW << 2) | (rs.clip << 3)) : 0);
             for (int k = 0; k < 4; k++)
             {
                 add(drawColor_[k] ? uint64_t(drawColor_[k]->format) : 0);
@@ -941,12 +1130,22 @@ fn quantise(v: f32, bits: f32) -> f32 {
                 pd.layout = PipelineLayout(slots);
                 pd.vertex.module = module;
                 pd.vertex.entryPoint = Str("vs");
-                pd.vertex.bufferCount = 1;
-                pd.vertex.buffers = &vbl;
+                pd.vertex.bufferCount = gpuVertex_ ? 0 : 1;
+                pd.vertex.buffers = gpuVertex_ ? nullptr : &vbl;
                 pd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
-                pd.primitive.frontFace = WGPUFrontFace_CCW;
-                pd.primitive.cullMode = WGPUCullMode_None; // the front end culls
-                pd.primitive.unclippedDepth = depthClipControl_;
+                if (gpuVertex_)
+                {
+                    // Xenos faces: clockwise on screen are front when PA_SU_SC_MODE_CNTL.FACE.
+                    pd.primitive.frontFace = rs.frontCW ? WGPUFrontFace_CW : WGPUFrontFace_CCW;
+                    pd.primitive.cullMode = rs.cullFront ? WGPUCullMode_Front : rs.cullBack ? WGPUCullMode_Back : WGPUCullMode_None;
+                    pd.primitive.unclippedDepth = !rs.clip && depthClipControl_;
+                }
+                else
+                {
+                    pd.primitive.frontFace = WGPUFrontFace_CCW;
+                    pd.primitive.cullMode = WGPUCullMode_None; // the front end culls
+                    pd.primitive.unclippedDepth = depthClipControl_;
+                }
                 pd.multisample.count = 1;
                 pd.multisample.mask = 0xFFFFFFFF;
 
@@ -1024,9 +1223,52 @@ fn quantise(v: f32, bits: f32) -> f32 {
             }
             drawPipeline_ = pipeline;
 
-            // ---- constants and textures
+            // ---- constants, vertex memory and textures
             const float misc[4] = { rs.alphaRef, 0, 0, 0 };
-            drawDataOffset_ = WriteDrawData(misc, hasFragment ? draw.psConstants : nullptr, hasFragment ? 256 : 0);
+            if (gpuVertex_)
+            {
+                const RenderTarget* rt = drawDepth_;
+                for (auto* t : drawColor_)
+                    if (t && !rt)
+                        rt = t;
+                // Screen = position * scale + offset (+ window offset); WebGPU samples pixel
+                // centres at +0.5 where Xenos samples at +pixelCenter.
+                const float shift = 0.5f - rs.pixelCenter;
+                const float wx = rs.windowOffset ? rs.windowX : 0.0f, wy = rs.windowOffset ? rs.windowY : 0.0f;
+                const F4 xf[3] = {
+                    F4{ rs.scale[0] * float(scaleX_), (rs.offset[0] + wx + shift) * float(scaleX_),
+                        rs.scale[1] * float(scaleY_), (rs.offset[1] + wy + shift) * float(scaleY_) },
+                    F4{ rs.scale[2], rs.offset[2], float(rt->width), float(rt->height) },
+                    // VTX_W0_FMT only describes what the rasteriser receives: shaders export W,
+                    // so it is ignored, as in the software front end.
+                    F4{ (rs.vte >> 8) & 1 ? 1.0f : 0.0f, (rs.vte >> 9) & 1 ? 1.0f : 0.0f, 0.0f, 0.0f },
+                };
+                uint32_t vertexFetch[96][4] = {};
+                for (uint32_t slot = 0; slot < 96; slot++)
+                {
+                    if (!((shader.vertexSlots[slot / 64] >> (slot % 64)) & 1))
+                        continue;
+                    const uint32_t d0 = args.fetch[slot * 2], d1 = args.fetch[slot * 2 + 1];
+                    const uint32_t words = (d1 >> 2) & 0xFFFFFF;
+                    const auto& range = shader.slotRange[slot];
+                    if (!words || range.end <= range.first)
+                        continue;
+                    // Only the dwords this draw's indices reach, clipped to the buffer.
+                    const int64_t first = std::max<int64_t>(0, int64_t(args.minIndex) * range.stride + range.first);
+                    const int64_t end = std::min<int64_t>(words, int64_t(args.maxIndex) * range.stride + range.end);
+                    if (end <= first)
+                        continue;
+                    const uint32_t base = PhysicalToGuest(d0 & 0xFFFFFFFCu);
+                    const uint32_t uploaded = UploadVertexMemory(base + uint32_t(first) * 4, uint32_t(end - first));
+                    vertexFetch[slot][0] = uint32_t(int64_t(uploaded) - first); // where dword 0 would be
+                    vertexFetch[slot][1] = d1 & 3;
+                }
+                drawDataOffset_ = WriteDrawData(misc, xf, args.constants, 0, 512, vertexFetch);
+            }
+            else
+            {
+                drawDataOffset_ = WriteDrawData(misc, nullptr, hasFragment ? args.constants : nullptr, 256, hasFragment ? 256 : 0);
+            }
 
             if (drawTextures_)
             {
@@ -1044,14 +1286,14 @@ fn quantise(v: f32, bits: f32) -> f32 {
                 s.binding = slot * 2 + 1;
                 if (gpuSlot[slot])
                 {
-                    const uint32_t* f = draw.fetch + slot * 6;
+                    const uint32_t* f = args.fetch + slot * 6;
                     t.textureView = ResolvedView(*gpuSlot[slot], (f[2] & 0x1FFF) + 1, ((f[2] >> 13) & 0x1FFF) + 1);
                     s.sampler = Sampler((f[0] >> 10) & 7, (f[0] >> 13) & 7, ((f[3] >> 19) & 3) == 1);
                     ++stats_.gpuResolveBinds;
                 }
                 else
                 {
-                    const Texture& tex = draw.texture(slot);
+                    const Texture& tex = (*args.texture)(slot);
                     t.textureView = Upload(tex).view;
                     s.sampler = Sampler(tex);
                 }
@@ -1064,6 +1306,7 @@ fn quantise(v: f32, bits: f32) -> f32 {
             bgd.entries = entries.data();
             drawTextures_ = wgpuDeviceCreateBindGroup(device_, &bgd);
             stats_.encodeNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+            return true;
         }
 
         void WebGpuBackend::Triangle(const CaptureVertex& a, const CaptureVertex& b, const CaptureVertex& c, bool front)
@@ -1083,8 +1326,8 @@ fn quantise(v: f32, bits: f32) -> f32 {
             float ndc[3][2];
             for (int i = 0; i < 3; i++)
             {
-                ndc[i][0] = (v[i]->x + shift) / width * 2.0f - 1.0f;
-                ndc[i][1] = 1.0f - (v[i]->y + shift) / height * 2.0f;
+                ndc[i][0] = (v[i]->x + shift) * float(scaleX_) / width * 2.0f - 1.0f;
+                ndc[i][1] = 1.0f - (v[i]->y + shift) * float(scaleY_) / height * 2.0f;
             }
             // Front faces wind counter-clockwise in NDC for the pipeline (two-sided stencil).
             const float area = (ndc[1][0] - ndc[0][0]) * (ndc[2][1] - ndc[0][1]) - (ndc[2][0] - ndc[0][0]) * (ndc[1][1] - ndc[0][1]);
@@ -1133,8 +1376,9 @@ fn quantise(v: f32, bits: f32) -> f32 {
             wgpuRenderPassEncoderSetBindGroup(pass_, 1, drawTextures_, 0, nullptr);
             wgpuRenderPassEncoderSetVertexBuffer(pass_, 0, vertexRing_, offset, bytes);
             wgpuRenderPassEncoderSetViewport(pass_, 0, 0, float(rt->width), float(rt->height), 0.0f, 1.0f);
-            const int x0 = std::clamp(rs.sx0, 0, int(rt->width)), y0 = std::clamp(rs.sy0, 0, int(rt->height));
-            const int x1 = std::clamp(rs.sx1, x0, int(rt->width)), y1 = std::clamp(rs.sy1, y0, int(rt->height));
+            const int sx = int(scaleX_), sy = int(scaleY_);
+            const int x0 = std::clamp(rs.sx0 * sx, 0, int(rt->width)), y0 = std::clamp(rs.sy0 * sy, 0, int(rt->height));
+            const int x1 = std::clamp(rs.sx1 * sx, x0, int(rt->width)), y1 = std::clamp(rs.sy1 * sy, y0, int(rt->height));
             if (x1 <= x0 || y1 <= y0)
                 return;
             wgpuRenderPassEncoderSetScissorRect(pass_, uint32_t(x0), uint32_t(y0), uint32_t(x1 - x0), uint32_t(y1 - y0));
@@ -1214,28 +1458,62 @@ fn quantise(v: f32, bits: f32) -> f32 {
             RenderTarget* rt = Target(false, s, ColorFormat(s.format));
             if (!rt)
                 return;
-            const int cx1 = std::min(x1, int(rt->width)), cy1 = std::min(y1, int(rt->height));
-            if (cx1 <= x0 || cy1 <= y0)
+            const int sx = int(s.scaleX), sy = int(s.scaleY);
+            // Sample rectangle covering the pixels, clipped to the texture.
+            const int ax0 = x0 * sx, ay0 = y0 * sy;
+            const int ax1 = std::min(x1 * sx, int(rt->width)), ay1 = std::min(y1 * sy, int(rt->height));
+            if (ax1 <= ax0 || ay1 <= ay0)
                 return;
             const bool wide = rt->format == WGPUTextureFormat_RGBA32Float;
-            const uint32_t bpp = wide ? 16 : 8;
+            const bool unorm8 = rt->format == WGPUTextureFormat_RGBA8Unorm;
+            const bool unorm10 = rt->format == WGPUTextureFormat_RGB10A2Unorm;
+            const uint32_t bpp = wide ? 16 : (unorm8 || unorm10) ? 4 : 8;
             std::vector<uint8_t> data;
             uint32_t rowBytes = 0;
-            ReadTexture(rt->texture, WGPUTextureAspect_All, bpp, x0, y0, cx1 - x0, cy1 - y0, data, rowBytes);
-            SoftParallelFor(uint32_t(cy1 - y0), [&](uint32_t row) {
-                const uint8_t* line = data.data() + size_t(row) * rowBytes;
-                for (int x = 0; x < cx1 - x0; x++)
+            ReadTexture(rt->texture, WGPUTextureAspect_All, bpp, ax0, ay0, ax1 - ax0, ay1 - ay0, data, rowBytes);
+            auto sample = [&](int ax, int ay) {
+                const uint8_t* at = data.data() + size_t(ay - ay0) * rowBytes + size_t(ax - ax0) * bpp;
+                F4 c;
+                if (wide)
+                    std::memcpy(c.data(), at, 16);
+                else if (unorm8)
+                    for (int k = 0; k < 4; k++)
+                        c[k] = float(at[k]) / 255.0f;
+                else if (unorm10)
                 {
-                    F4& c = out[size_t(row) * w + x];
-                    if (wide)
-                        std::memcpy(c.data(), line + size_t(x) * 16, 16);
-                    else
-                        for (int k = 0; k < 4; k++)
+                    uint32_t v;
+                    std::memcpy(&v, at, 4);
+                    c = { float(v & 0x3FF) / 1023.0f, float((v >> 10) & 0x3FF) / 1023.0f, float((v >> 20) & 0x3FF) / 1023.0f, float(v >> 30) / 3.0f };
+                }
+                else
+                    for (int k = 0; k < 4; k++)
+                    {
+                        uint16_t hbits;
+                        std::memcpy(&hbits, at + k * 2, 2);
+                        c[k] = HalfToFloat(hbits);
+                    }
+                return c;
+            };
+            const int pw = (ax1 - ax0 + sx - 1) / sx, ph = (ay1 - ay0 + sy - 1) / sy;
+            SoftParallelFor(uint32_t(ph), [&](uint32_t row) {
+                for (int x = 0; x < pw; x++)
+                {
+                    F4 sum{ 0, 0, 0, 0 };
+                    int n = 0;
+                    for (int j = 0; j < sy; j++)
+                        for (int i = 0; i < sx; i++)
                         {
-                            uint16_t hbits;
-                            std::memcpy(&hbits, line + size_t(x) * 8 + k * 2, 2);
-                            c[k] = HalfToFloat(hbits);
+                            const int ax = (x0 + x) * sx + i, ay = (y0 + int(row)) * sy + j;
+                            if (ax >= ax1 || ay >= ay1)
+                                continue;
+                            const F4 c = sample(ax, ay);
+                            for (int k = 0; k < 4; k++)
+                                sum[k] += c[k];
+                            ++n;
                         }
+                    F4& c = out[size_t(row) * w + x];
+                    for (int k = 0; k < 4; k++)
+                        c[k] = n ? sum[k] / float(n) : 0.0f;
                     if (IsUnormColor(s.format))
                         for (float& v : c)
                             v = std::clamp(v, 0.0f, 1.0f);
@@ -1251,18 +1529,27 @@ fn quantise(v: f32, bits: f32) -> f32 {
             RenderTarget* rt = Target(true, rs.depth, WGPUTextureFormat_Depth32FloatStencil8);
             if (!rt)
                 return;
-            const int cx1 = std::min(x1, int(rt->width)), cy1 = std::min(y1, int(rt->height));
-            if (cx1 <= x0 || cy1 <= y0)
-                return;
-            // Depth/stencil formats only copy whole subresources: read it all, then crop.
+            const int sx = int(rs.depth.scaleX), sy = int(rs.depth.scaleY);
+            // Depth/stencil formats only copy whole subresources: read it all, then take
+            // sample 0 of each pixel.
             std::vector<uint8_t> data;
             uint32_t rowBytes = 0;
             ReadTexture(rt->texture, WGPUTextureAspect_DepthOnly, 4, 0, 0, int(rt->width), int(rt->height), data, rowBytes);
-            for (int y = 0; y < cy1 - y0; y++)
-                std::memcpy(&depth[size_t(y) * w], data.data() + size_t(y + y0) * rowBytes + size_t(x0) * 4, size_t(cx1 - x0) * 4);
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++)
+                {
+                    const int ax = (x0 + x) * sx, ay = (y0 + y) * sy;
+                    if (ax < int(rt->width) && ay < int(rt->height))
+                        std::memcpy(&depth[size_t(y) * w + x], data.data() + size_t(ay) * rowBytes + size_t(ax) * 4, 4);
+                }
             ReadTexture(rt->texture, WGPUTextureAspect_StencilOnly, 1, 0, 0, int(rt->width), int(rt->height), data, rowBytes);
-            for (int y = 0; y < cy1 - y0; y++)
-                std::memcpy(&stencil[size_t(y) * w], data.data() + size_t(y + y0) * rowBytes + size_t(x0), size_t(cx1 - x0));
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++)
+                {
+                    const int ax = (x0 + x) * sx, ay = (y0 + y) * sy;
+                    if (ax < int(rt->width) && ay < int(rt->height))
+                        stencil[size_t(y) * w + x] = data[size_t(ay) * rowBytes + size_t(ax)];
+                }
         }
 
         void WebGpuBackend::ClearRect(RenderTarget* rt, int x0, int y0, int x1, int y1, const F4& color, float depth, uint8_t stencil)
@@ -1314,7 +1601,7 @@ fn quantise(v: f32, bits: f32) -> f32 {
             }
 
             F4 constant{ depth, 0, 0, 0 };
-            const uint32_t offset = WriteDrawData(color.data(), &constant, 1);
+            const uint32_t offset = WriteDrawData(color.data(), nullptr, &constant, 0, 1);
             RenderTarget* color4[4] = { rt->depth ? nullptr : rt, nullptr, nullptr, nullptr };
             BeginPass(color4, rt->depth ? rt : nullptr);
             wgpuRenderPassEncoderSetPipeline(pass_, pipeline);
@@ -1338,7 +1625,7 @@ fn quantise(v: f32, bits: f32) -> f32 {
             // Clear every colour view of this EDRAM base (aliasing through other pitches).
             for (auto& [key, rt] : targets_)
                 if (!rt->depth && rt->baseTile == s.baseTile)
-                    ClearRect(rt.get(), x0, y0, x1, y1, color, 0.0f, 0);
+                    ClearRect(rt.get(), x0 * int(s.scaleX), y0 * int(s.scaleY), x1 * int(s.scaleX), y1 * int(s.scaleY), color, 0.0f, 0);
         }
 
         void WebGpuBackend::ClearDepth(const RasterState& rs, int x0, int y0, int x1, int y1, float depth, uint8_t stencil)
@@ -1346,13 +1633,14 @@ fn quantise(v: f32, bits: f32) -> f32 {
             Target(true, rs.depth, WGPUTextureFormat_Depth32FloatStencil8);
             for (auto& [key, rt] : targets_)
                 if (rt->depth && rt->baseTile == rs.depth.baseTile)
-                    ClearRect(rt.get(), x0, y0, x1, y1, F4{ 0, 0, 0, 0 }, depth, stencil);
+                    ClearRect(rt.get(), x0 * int(rs.depth.scaleX), y0 * int(rs.depth.scaleY), x1 * int(rs.depth.scaleX),
+                        y1 * int(rs.depth.scaleY), F4{ 0, 0, 0, 0 }, depth, stencil);
         }
 
         bool WebGpuBackend::ResolveToGpu(const ResolveRequest& r)
         {
             static const bool disabled = [] { const char* v = std::getenv("TTT2_GPU_CPU_RESOLVE"); return v && *v == '1'; }();
-            if (disabled || r.source >= 4 || !GpuResolvableFormat(r.destFormat))
+            if (disabled || g_softKeepTexels || r.source >= 4 || !GpuResolvableFormat(r.destFormat))
                 return false;
             const RasterState& rs = *r.rs;
             const Surface& surface = rs.color[r.source];
@@ -1410,13 +1698,15 @@ fn quantise(v: f32, bits: f32) -> f32 {
             case 25: case 26: bits = { 16, 16, 16, 16 }; break;
             default: break; // half floats: the image format rounds them
             }
-            const F4 constants[3] = {
+            const F4 constants[4] = {
                 F4{ float(r.offsetX), float(r.offsetY), surface.format == 1 ? 1.0f : 0.0f, std::ldexp(1.0f, r.expBias) },
-                F4{ r.swapRB ? 1.0f : 0.0f, layout, 0, 0 },
+                F4{ r.swapRB ? 1.0f : 0.0f, layout, float(surface.scaleX), float(surface.scaleY) },
                 bits,
+                F4{ (r.sampleSelect >= 4 && surface.scaleX * surface.scaleY > 1) ? 1.0f : 0.0f,
+                    float(r.sampleSelect < surface.scaleX * surface.scaleY ? r.sampleSelect : 0), 0, 0 },
             };
             const float misc[4] = {};
-            const uint32_t offset = WriteDrawData(misc, constants, 3);
+            const uint32_t offset = WriteDrawData(misc, nullptr, constants, 0, 4);
 
             EndPass();
             EnsureEncoder();
@@ -1450,7 +1740,7 @@ fn quantise(v: f32, bits: f32) -> f32 {
 
         ResolvedImage* WebGpuBackend::ResolvedFor(const uint32_t* fetch)
         {
-            if ((fetch[0] & 3) != 2 || resolved_.empty())
+            if ((fetch[0] & 3) != 2 || resolved_.empty() || g_softKeepTexels)
                 return nullptr;
             const uint32_t base = 0xA0000000u + ((fetch[1] & ~0xFFFu) & 0x1FFFFFFF);
             auto it = resolved_.find(base);
@@ -1564,7 +1854,7 @@ fn quantise(v: f32, bits: f32) -> f32 {
 
         bool WebGpuBackend::ReadFrontBuffer(const uint32_t fetch[6], std::vector<uint32_t>& bgra, uint32_t& width, uint32_t& height)
         {
-            ResolvedImage* image = ResolvedFor(fetch);
+            ResolvedImage* image = g_softKeepTexels ? nullptr : ResolvedFor(fetch);
             if (!image)
                 return false;
             width = (fetch[2] & 0x1FFF) + 1;
@@ -1590,6 +1880,22 @@ fn quantise(v: f32, bits: f32) -> f32 {
                 }
             });
             return true;
+        }
+
+        void WebGpuBackend::FlushAllResolves()
+        {
+            for (auto& [base, image] : resolved_)
+            {
+                FlushToMemory(base, image);
+                for (auto& [size, e] : image.exact)
+                {
+                    wgpuTextureViewRelease(e.texture.view);
+                    wgpuTextureRelease(e.texture.texture);
+                }
+                wgpuTextureViewRelease(image.view);
+                wgpuTextureRelease(image.texture);
+            }
+            resolved_.clear();
         }
 
         void WebGpuBackend::EndFrame()
@@ -1664,6 +1970,14 @@ fn quantise(v: f32, bits: f32) -> f32 {
     bool WebGpuReadFrontBuffer(const uint32_t fetch[6], std::vector<uint32_t>& bgra, uint32_t& width, uint32_t& height)
     {
         return g_backend && g_backend->ReadFrontBuffer(fetch, bgra, width, height);
+    }
+
+    bool WebGpuActive() { return g_backend != nullptr; }
+
+    void WebGpuFlushResolves()
+    {
+        if (g_backend)
+            g_backend->FlushAllResolves();
     }
 
     void WebGpuPrintStats()

@@ -73,6 +73,7 @@ namespace gpu
         uint64_t verifiedFrame = 0;
         bool stale = false; // a resolve overwrote the source: decode again on next use
         uint64_t version = 0; // changes on every decode (hardware backends re-upload on change)
+        uint32_t format = 0;  // texture format (hardware backends pick a precision from it)
     };
 
     struct AluOp
@@ -184,6 +185,18 @@ namespace gpu
         bool swapRB = false;
     };
 
+    // A draw whose vertices the backend shades itself (translated vertex shader).
+    struct GpuDrawRequest
+    {
+        const RasterState* rs = nullptr;
+        const CompiledShader* vs = nullptr;   // flattened vertex shader
+        const CompiledShader* ps = nullptr;   // flattened pixel shader (null: none)
+        const F4* constants = nullptr;        // c0..c511
+        const uint32_t* fetch = nullptr;      // fetch constants (32 slots x 6 dwords)
+        const std::vector<uint32_t>* indices = nullptr; // triangle list of vertex indices
+        std::function<const Texture&(uint32_t slot)> texture;
+    };
+
     class CaptureSink
     {
     public:
@@ -201,7 +214,14 @@ namespace gpu
         // binds it where the game samples that address). False: use ReadColor/ReadDepth
         // and write memory as usual.
         virtual bool ResolveToGpu(const ResolveRequest&) { return false; }
+        // Draws with GPU vertex shading. False: the software front end shades the vertices
+        // and calls BeginDraw/Triangle/EndDraw instead.
+        virtual bool DrawGpu(const GpuDrawRequest&) { return false; }
     };
 
     void SoftSetCaptureSink(CaptureSink* sink);
+
+    // Verification (TTT2_GPU_VERIFY_FRAME): while set, backends keep decoded texels (the
+    // software renderer samples them too) and do not keep resolves on the GPU.
+    extern bool g_softKeepTexels;
 }
