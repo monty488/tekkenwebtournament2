@@ -47,7 +47,7 @@ if (TTT2_HAVE_RECOMP)
         # ExTerminateThread unwinds through them (runtime/kernel/threads.cpp).
         add_compile_options(/EHc-)
     else()
-        add_compile_options(-include ${TTT2_INDIRECT_CALL_HEADER})
+        add_compile_options("SHELL:-include ${TTT2_INDIRECT_CALL_HEADER}")
     endif()
 
     add_subdirectory(recomp)

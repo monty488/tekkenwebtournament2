@@ -4,7 +4,23 @@
     {
       "name": "web-shell",
       "runtimeExecutable": "node",
-      "runtimeArgs": ["web/serve.mjs", "web/public", "8080"],
+      "runtimeArgs": [
+        "web/serve.mjs",
+        "web/public",
+        "8080"
+      ],
+      "port": 8080
+    },
+    {
+      "name": "web-game",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "web/serve.mjs",
+        "build/web-release/runtime",
+        "8080",
+        "--game",
+        "game"
+      ],
       "port": 8080
     }
   ]

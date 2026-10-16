@@ -1,0 +1,31 @@
+diff --git a/XenonUtils/ppc_context.h b/XenonUtils/ppc_context.h
+index 608f9e2..c9bc807 100644
+--- a/XenonUtils/ppc_context.h
++++ b/XenonUtils/ppc_context.h
+@@ -172,6 +172,18 @@ struct PPCCRRegister
+         eq = !un && (left == right);
+     }
+ 
++#if defined(__wasm__)
++    // simde__m128 and simde__m128i are the same type on wasm: the callers' masks tell a
++    // float compare (0xF, one bit per lane) from an integer one (0xFFFF, one bit per byte).
++    inline void setFromMask(simde__m128 mask, int imm) noexcept
++    {
++        int m = imm == 0xF ? simde_mm_movemask_ps(mask) : simde_mm_movemask_epi8(simde_mm_castps_si128(mask));
++        lt = m == imm; // all equal
++        gt = 0;
++        eq = m == 0; // none equal
++        so = 0;
++    }
++#else
+     inline void setFromMask(simde__m128 mask, int imm) noexcept
+     {
+         int m = simde_mm_movemask_ps(mask);
+@@ -189,6 +201,7 @@ struct PPCCRRegister
+         eq = m == 0; // none equal
+         so = 0;
+     }
++#endif
+ };
+ 
+ union alignas(0x10) PPCVRegister

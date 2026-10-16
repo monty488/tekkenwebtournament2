@@ -25,7 +25,8 @@ target_compile_options(TTT2Recomp PRIVATE
 if (MSVC)
     target_compile_options(TTT2Recomp PRIVATE /FI${CMAKE_CURRENT_SOURCE_DIR}/mmio.h)
 else()
-    target_compile_options(TTT2Recomp PRIVATE -include ${CMAKE_CURRENT_SOURCE_DIR}/mmio.h)
+    # SHELL: keeps "-include <file>" together (CMake de-duplicates repeated options).
+    target_compile_options(TTT2Recomp PRIVATE "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/mmio.h")
 endif()
 
 if (EMSCRIPTEN)

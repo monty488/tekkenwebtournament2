@@ -38,6 +38,7 @@ namespace guest
         const std::vector<std::shared_ptr<Waitable>>* objects = nullptr;
         bool waitAll = false;
         int satisfiedIndex = -1;
+        bool reported = false; // a long wait was logged
         std::condition_variable cv;
     };
 

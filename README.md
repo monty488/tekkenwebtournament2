@@ -65,6 +65,16 @@ node web\serve.mjs build\web-release
 
 Open http://localhost:8080, import your `game` folder, press **Launch**.
 
+For development, skip the ~7 GB import and stream the game folder from the dev server
+instead (files are read on demand, in 1 MiB ranges, and never leave your machine):
+
+```powershell
+node web\serve.mjs build\web-release 8080 --game game
+```
+
+then open http://localhost:8080/?stream (add `&autostart` to launch straight away;
+any `TTT2_*` switch can be passed in the URL too, e.g. `&TTT2_GPU_STATS=1`).
+
 You can build and serve the web target **before** you have the game: it then
 builds a placeholder runtime, which is a quick way to check the toolchain and
 browser support.

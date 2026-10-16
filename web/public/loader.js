@@ -130,6 +130,10 @@ async function clearImported() {
   await refreshImportStatus();
 }
 
+// ?stream: game data comes from the dev server (serve.mjs --game) instead of OPFS.
+const params = new URLSearchParams(location.search);
+const streaming = params.has('stream');
+
 async function launch() {
   $('launch').disabled = true;
   const canvas = $('screen');
@@ -137,6 +141,11 @@ async function launch() {
     const { default: createTTT2 } = await import('./ttt2.js');
     await createTTT2({
       canvas,
+      arguments: streaming ? ['--stream'] : [],
+      // TTT2_* switches from the page URL, e.g. ?stream&TTT2_GPU_STATS=1
+      preRun: [(module) => {
+        for (const [key, value] of params) if (key.startsWith('TTT2_')) module.ENV[key] = value;
+      }],
       print: (t) => log(t),
       printErr: (t) => log(t),
     });
@@ -154,5 +163,9 @@ $('fullscreen').addEventListener('click', () => $('screen').requestFullscreen())
 
 const supported = await runChecks();
 await refreshImportStatus().catch(() => {});
+if (streaming) {
+  $('import-status').textContent = 'Streaming game data from the dev server (?stream).';
+  if (params.has('autostart') && supported) launch();
+}
 // The placeholder runtime runs without game data, so only browser support gates launching.
 $('launch').disabled = !supported;
