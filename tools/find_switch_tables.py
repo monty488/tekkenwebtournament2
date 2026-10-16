@@ -93,6 +93,7 @@ def analyse(addr, word, base_addr):
     # and may copy the index to another register (mr) before the compare.
     start = None
     aliases = set()
+    recompute = None
     for k in range(2, WINDOW):
         a = addr - 4 * k
         i = word(a)
@@ -108,6 +109,19 @@ def analyse(addr, word, base_addr):
                     if any(dest_reg(word(x)) == f["ra"] for x in range(c + 4, a, 4)):
                         return None
                     start, idx_reg, count = a + 4, f["ra"], f["uimm"] + 1
+                    # The compiler may recompute the index after the branch (e.g.
+                    # `addi r11,r30,-90` both before the cmplwi and before the dispatch).
+                    # An identical recomputation from unchanged inputs keeps it the index.
+                    for m in range(1, 7):
+                        g = word(c - 4 * m)
+                        if dest_reg(g) == idx_reg:
+                            gf = fields(g)
+                            srcs = {gf["ra"]} if gf["op"] in (14, 15) and gf["ra"] else set()
+                            if gf["op"] in (14, 15) and gf["ra"] and gf["ra"] != idx_reg and not any(
+                                    dest_reg(word(x)) in srcs for x in range(c - 4 * m + 4, addr, 4)
+                                    if word(x) != g):
+                                recompute = g
+                            break
                     # mr rX, rIdx shortly before the compare
                     for m in range(1, 7):
                         g = word(c - 4 * m)
@@ -142,7 +156,7 @@ def analyse(addr, word, base_addr):
                 break
 
     if start is not None and count <= 4096:
-        return emulate(addr, word, start, idx_reg, aliases, count)
+        return emulate(addr, word, start, idx_reg, aliases, count, recompute)
 
     if start is None:
         # No bounds check and no byte load: the caller guarantees the range, and the index
@@ -164,7 +178,7 @@ def analyse(addr, word, base_addr):
     return None
 
 
-def emulate(addr, word, start, idx_reg, aliases, count):
+def emulate(addr, word, start, idx_reg, aliases, count, recompute=None):
     """Symbolically executes start..bctr with idx_reg holding the switch index."""
     regs = {r: ("idx", 0) for r in aliases | {idx_reg}}
     for a in range(start, addr - 4, 4):
@@ -172,7 +186,9 @@ def emulate(addr, word, start, idx_reg, aliases, count):
         f = fields(i)
         op = f["op"]
         val = None
-        if op == 15 and f["ra"] == 0:                                   # lis
+        if i == recompute:
+            val = ("idx", 0)
+        elif op == 15 and f["ra"] == 0:                                   # lis
             val = ("const", (f["uimm"] << 16) & 0xFFFFFFFF)
         elif op == 14:                                                  # addi / li
             if f["ra"] == 0:

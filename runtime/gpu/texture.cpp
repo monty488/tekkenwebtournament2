@@ -148,10 +148,59 @@ namespace gpu
         if (pitchBlocks < blocksX)
             pitchBlocks = blocksX;
 
-        out.assign(size_t(info.width) * info.height, 0);
+        out.resize(size_t(info.width) * info.height); // every texel is written below
         const uint8_t* base = guest::ToHost<const uint8_t>(info.base);
 
+        // Single-texel blocks of 1, 2 or 4 bytes, read as one value with the endian swap
+        // done arithmetically (same result as ReadBlock).
+        auto texelRow = [&]<uint32_t Bytes>(uint32_t by) {
+            uint32_t* row = out.data() + size_t(by) * info.width;
+            for (uint32_t bx = 0; bx < blocksX; bx++)
+            {
+                const uint32_t offset = info.tiled ? TiledOffset2D(bx, by, pitchBlocks, log2Bpb) : (by * pitchBlocks + bx) * Bytes;
+                const uint8_t* p = base + offset;
+                uint32_t c;
+                if constexpr (Bytes == 4)
+                {
+                    uint32_t v;
+                    std::memcpy(&v, p, 4);
+                    switch (info.endian)
+                    {
+                    case 1: v = ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu); break;
+                    case 2: v = (v >> 24) | ((v >> 8) & 0xFF00u) | ((v << 8) & 0xFF0000u) | (v << 24); break;
+                    case 3: v = (v << 16) | (v >> 16); break;
+                    default: break;
+                    }
+                    c = v;
+                }
+                else if constexpr (Bytes == 2)
+                {
+                    uint16_t v;
+                    std::memcpy(&v, p, 2);
+                    if (info.endian == 1)
+                        v = uint16_t((v >> 8) | (v << 8));
+                    if (info.format == k_5_6_5) c = From565(v);
+                    else if (info.format == k_4_4_4_4) c = Bgra(((v >> 8) & 15) * 17, ((v >> 4) & 15) * 17, (v & 15) * 17, ((v >> 12) & 15) * 17);
+                    else if (info.format == k_8_8) c = Bgra(v & 0xFF, v & 0xFF, v & 0xFF, v >> 8);
+                    else c = Bgra(((v >> 10) & 31) << 3, ((v >> 5) & 31) << 3, (v & 31) << 3, (v >> 15) ? 255 : 0);
+                }
+                else
+                {
+                    c = Bgra(p[0], p[0], p[0], 255);
+                }
+                if (bx < info.width && by < info.height)
+                    row[bx] = c;
+            }
+        };
+
         auto decodeRow = [&](uint32_t by) {
+            if (blockW == 1)
+            {
+                if (blockBytes == 4) texelRow.template operator()<4>(by);
+                else if (blockBytes == 2) texelRow.template operator()<2>(by);
+                else texelRow.template operator()<1>(by);
+                return;
+            }
             uint8_t block[16];
             uint32_t texels[16];
             for (uint32_t bx = 0; bx < blocksX; bx++)

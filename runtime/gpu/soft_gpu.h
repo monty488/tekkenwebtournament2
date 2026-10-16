@@ -9,6 +9,7 @@
 // packet order.
 
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace gpu
@@ -36,8 +37,25 @@ namespace gpu
     // = copy) perform a resolve instead of rasterising.
     void SoftDraw(const DrawCall& draw);
 
+    // Verification: renders a draw with the installed hardware backend and then with the
+    // software renderer, from the same inputs, and logs how far their colour targets differ
+    // (dumping both images for the first mismatches). SoftBeginVerify starts a frame of it.
+    void SoftBeginVerify(uint64_t frame);
+    void SoftVerifyDraw(const DrawCall& draw);
+    void SoftEndVerify();
+
     // Called on every swap: drops cached texture decodes (the CPU may rewrite textures).
     void SoftEndFrame();
+
+    // Debug: when set, SoftDraw prints every vertex's exported position and interpolators.
+    extern bool g_softLogVertices;
+    // Debug: when set, SoftDraw prints why pixels were rejected (culling, depth, stencil).
+    extern bool g_softLogDraw;
+    // Debug: when set, every texture decoded is also written to tex_<address>_<format>.bmp.
+    extern bool g_softDumpTextures;
+
+    // Runs fn(0..count-1) on the renderer's worker pool (rows of a conversion, etc.).
+    void SoftParallelFor(uint32_t count, const std::function<void(uint32_t)>& fn);
 
     // Debug counters.
     uint64_t SoftPixelsWritten();

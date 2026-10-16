@@ -39,8 +39,12 @@ Rough milestones, in order. Each depends on the previous one.
 - [x] NT wait semantics: FIFO waiter queues with direct hand-off; thread self-suspend;
       ExTerminateThread; non-trapping integer divides; fall-through across split functions
 - [ ] Some worker threads wait >2 s on locks the main thread holds: check for a leak
-- [ ] Remaining memory, I/O and XAM calls from the stub log (~208 still stubbed)
-- [ ] Content/save APIs (XContent*), profile/sign-in (currently: nobody signed in)
+- [x] XAM system UI, enumerators and content calls complete their XOVERLAPPED requests
+      (message boxes, device selector, achievement/content enumerators, content
+      create/close/delete; `runtime/kernel/xam_ui.cpp`)
+- [ ] Remaining memory, I/O and XAM calls from the stub log (145 still stubbed)
+- [ ] Save data backed by host files (content creation is rejected cleanly for now; with
+      nobody signed in the game does not save), profiles/sign-in (currently: nobody)
 
 ## M3: Pictures
 - [x] Decode draw/state PM4 packets: register, constant, fetch and shader state reach a
@@ -48,16 +52,46 @@ Rough milestones, in order. Each depends on the previous one.
       interpreter, triangle/rect/quad rasteriser with depth, blending and alpha test,
       EDRAM model, resolves (tiled, endian-swapped) with clears. The loading screen
       and the Bandai Namco splash render correctly in the native window
-- [ ] Software renderer speed: ~65 ms/frame on 16 threads (shader interpretation
-      dominates); points, lines, stencil, culling, MSAA resolve and several texture
-      formats (e.g. depth textures, format 23) are missing
-- [ ] The game stops submitting frames after a timing-dependent point (frame 8 to
-      ~600; happens with rendering off too): a guest-side race to find
-- [ ] Identify the game's statically linked D3D functions
-- [ ] WebGPU backend: device, swap chain, render targets, depth
-- [ ] XenosRecomp → HLSL → SPIR-V → WGSL shader cache
-- [ ] Texture untiling and format conversion (CPU version done for the common formats)
-- [ ] Menus render, then a stage plus characters
+- [x] Past the boot logos: the intro movie (YUV planes + subtitle strips), the title
+      screen and the attract-mode screens ("Get ready for the next battle", the VS
+      screen with character portraits) render correctly in dumped frames
+- [x] Stencil, face culling (PA_SU_SC_MODE_CNTL, strip winding), averaged MSAA resolves,
+      depth/stencil resolves (k_24_8, k_24_8_FLOAT), gamma render targets (PWL encode on
+      resolve), texture sign/gamma/exp_adjust, and float/16-bit/depth/DXN/DXT3A/DXT5A
+      texture formats. Culling is unverified until a 3D scene is reachable
+- [ ] Software renderer gaps: points and lines, mip levels/LOD (mip 0 only), cube and
+      3D textures, per-sample coverage (MSAA edges)
+- [ ] Software renderer speed: ~45-65 ms/frame on 16 threads (shader interpretation
+      dominates)
+- [ ] The bottom-corner "PRESS START" overlaps a "FREE PLAY" string: the game submits
+      both, fully opaque, in one strip draw (probably game-side state, e.g. a blink
+      timer or credit mode; not yet explained)
+- [x] The game stops submitting frames after a timing-dependent point: fixed in the
+      kernel HLE (audio callback argument, wakeup storms, critical sections)
+- [x] Menus and fights are reachable natively: title -> "not signed in" dialog -> main
+      menu; Offline > Arcade reaches the VS screen and a Stage 1 fight (HUD, timer, 3D
+      stage); Fight Lab loads a Combot match. Unattended:
+      `TTT2_AUTOPRESS=start,start,start,none,a,none,none,a,none,a,none,a,... TTT2_AUTOPRESS_DELAY=40000`
+- [x] The attract-mode fight crash (824B0DA4 was a missed switch-table case)
+- [x] WebGPU backend (`TTT2_GPU=webgpu`, wgpu-native natively): Xenos vertex and pixel
+      shaders translated to WGSL at runtime (`runtime/gpu/xenos_wgsl.cpp`, cached by
+      their flattened instructions), vertex fetch from guest memory with the viewport
+      transform in the shader, render targets keyed by EDRAM base in sample space
+      (MSAA views alias like on the console), unorm/float target formats, blending,
+      depth/stencil, culling; colour and depth resolves stay on the GPU; the front buffer
+      is presented straight to the window. Menus, character select, VS screens, fights
+      and post-fight screens render correctly; fights run at 60 fps with the command
+      processor busy ~11 of each 16.7 ms
+- [x] `TTT2_GPU_VERIFY_FRAME=n`: every draw of a frame rendered by both renderers from
+      the same inputs and compared (found the MSAA aliasing and precision bugs)
+- [ ] WebGPU gaps: pixel shaders with predicate-driven control flow (colour skipped,
+      logged once), rect lists still shaded on the CPU, points/lines, mip levels, cube and
+      3D textures, real MSAA (MSAA views are supersampled), 64bpp/32bpp aliasing of the
+      same EDRAM, Xenos 7e3 float colour precision
+- [ ] Check Kuma's dark face on the post-fight screen with the verifier (lighting or bug)
+- [ ] The game sometimes stops submitting at frame 4 when the GPU side is fast (WebGPU,
+      or `TTT2_SOFT_GPU=0`): a guest-side race, about one start in three
+- [ ] Browser: emdawnwebgpu build of the same backend, canvas presentation
 
 ## M4: Sound
 - [ ] Render-driver callback thread and AudioWorklet output

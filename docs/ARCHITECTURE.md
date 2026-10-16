@@ -140,14 +140,27 @@ one likely to hit frame rate. Plan:
    the page (`-sOFFSCREENCANVAS_SUPPORT`). Otherwise, proxy presentation to the main
    thread.
 
-**Current state: a low-level software reference.** Before the D3D hooks exist, the
-command processor (`runtime/gpu/video.cpp`) executes the PM4 stream itself and hands
-each draw to `runtime/gpu/soft_gpu.cpp`. That renderer interprets the Xenos shader
-microcode (semantics follow XenosRecomp), rasterises into an emulated 10 MiB EDRAM
-and performs resolves into guest memory, so `VdSwap` can present the real front
-buffer. It is slow (row bands on all cores; tens of ms per frame) and incomplete,
-but it is exact enough to check the WebGPU backend against, frame by frame
-(`TTT2_DUMP_FRAMES`).
+**Current state: low level, on WebGPU.** In practice the PM4 route won: the command
+processor (`runtime/gpu/video.cpp`) executes the stream, and draws go to one of two
+renderers that share a front end (`runtime/gpu/soft_gpu.cpp`: register decoding,
+control-flow flattening per draw, primitive assembly, resolve decoding, texture
+decoding with change detection):
+
+* **Software reference** (default): interprets the shader microcode and rasterises
+  into an emulated 10 MiB EDRAM. Slow, but the yardstick for the GPU path.
+* **WebGPU** (`TTT2_GPU=webgpu`, `runtime/gpu/webgpu_backend.cpp`): vertex and pixel
+  shaders are translated to WGSL at runtime (`xenos_wgsl.cpp`); vertex data is read
+  from guest memory in the shader; render targets are textures keyed by EDRAM base in
+  sample space, so differently-sized views of the same EDRAM share storage as on the
+  console; resolves are GPU passes into images bound wherever the game samples their
+  address (written back to memory only if the game stops resolving there); the front
+  buffer is presented straight to the window. Natively this is wgpu-native; the browser
+  build uses emdawnwebgpu with the same `webgpu.h`.
+
+`TTT2_GPU_VERIFY_FRAME=n` renders each draw of frame `n` with both renderers from the
+same inputs and reports the draws whose render targets differ, with images of both.
+The high-level D3D-hook plan above remains an option if CPU encoding cost ever
+dominates, but the low-level path already reaches 60 fps in fights natively.
 
 ## 7. Audio
 
@@ -156,12 +169,16 @@ The game's XAudio2 is statically linked. It mixes in software and hands 256-samp
 (`XAudioRegisterRenderDriverClient` / `XAudioSubmitRenderDriverFrame`, stubbed
 in `runtime/apu/audio.cpp`). The runtime must:
 
-* call the registered client callback every 256 samples (5.33 ms at 48 kHz),
-  from a dedicated guest thread;
+* call every registered client callback every 256 samples (5.33 ms at 48 kHz),
+  from a dedicated guest thread (TTT2 runs two XAudio2 engines, each with its own
+  client; an engine whose callback stops never drains its voices);
 * downmix 5.1 to stereo and push into a `SharedArrayBuffer` ring buffer read by an
   **AudioWorklet**;
-* decode **XMA**, the hardware decoder exposed through `XMA*` kernel calls.
-  FFmpeg's `xma2` decoder, compiled to wasm, is the most direct route.
+* decode **XMA**, the hardware decoder exposed through `XMA*` kernel calls and the
+  register file at 0x7FEA0000. `runtime/apu/xma.cpp` emulates the contexts (Xenia's
+  layout) and outputs silence; MMIO stores to the register file reach it through
+  `recomp/mmio.h`. FFmpeg's `xma2` decoder, compiled to wasm, is the most direct
+  route to real output.
 
 ## 8. Input
 

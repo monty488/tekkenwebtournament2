@@ -17,10 +17,12 @@
 #include "video.h"
 #include "presenter.h"
 #include "soft_gpu.h"
+#include "webgpu_backend.h"
 #include "texture.h"
 #include "../kernel/guest.h"
 #include "../kernel/threads.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -49,6 +51,17 @@ namespace gpu
     static std::atomic<uint32_t> g_ringDwords{ 0 };
     static std::atomic<uint32_t> g_rptrWriteback{ 0 }; // guest address, 0 = disabled
     static uint32_t g_rptr = 0;                         // command processor thread only
+
+    // ---- Stall diagnostics: TTT2_GPU_STALL=1 -------------------------------------
+    // Every 2 s logs D3D's fences (device = interrupt callback data; dev+11024 -> GPU-written
+    // fence, dev+11036 = last issued, dev+11088 = D3D's ring write pointer). If the fence stops
+    // short of the issued one for 3 s, dumps device state and the last 512 PM4 packets.
+    static const bool g_stallLog = [] { const char* v = std::getenv("TTT2_GPU_STALL"); return v && *v == '1'; }();
+    struct TraceEntry { uint32_t pos, header, d0, d1, d2, depth; };
+    static TraceEntry g_trace[512]; // CP thread only
+    static uint32_t g_traceNext = 0;
+    static uint32_t g_fenceAddr = 0;
+    static uint32_t g_fenceLastValue = 0;
 
     uint64_t PresentedFrames() { return g_frames.load(); }
 
@@ -81,6 +94,8 @@ namespace gpu
     static void GpuWrite(uint32_t address, uint32_t value)
     {
         const uint32_t target = PhysicalToGuest(address & ~3u);
+        if (g_stallLog && target == g_fenceAddr)
+            g_fenceLastValue = value;
         switch (address & 3)
         {
         case 0: *guest::ToHost<uint32_t>(target) = value; break;                          // no swap: host order
@@ -90,12 +105,16 @@ namespace gpu
         }
     }
 
-    static void DispatchInterrupt(const guest::GuestEnv& env, uint32_t source)
+    // Runs the interrupt callback as if on hardware thread `cpu`: D3D's handler reads
+    // PCR->CurrentCpu to pick which CPU's interrupt bit to acknowledge and which per-CPU
+    // queue (and worker thread) a command-stream callback goes to.
+    static void DispatchInterrupt(const guest::GuestEnv& env, uint32_t source, uint8_t cpu)
     {
         const uint32_t callback = g_interruptCallback.load();
         if (!callback)
             return;
         std::lock_guard lock(g_interruptMutex);
+        *guest::ToHost<uint8_t>(env.pcr + 0x10C) = cpu; // PCR->CurrentCpu
         guest::CallGuest(env, callback, { source, g_interruptData.load() });
     }
 
@@ -204,6 +223,8 @@ namespace gpu
         std::fprintf(stderr, "[gpu] wrote %s\n", name);
     }
 
+    static uint64_t g_cpBusyNs = 0, g_presentNs = 0; // TTT2_GPU_STATS timings (command processor thread)
+
     static void OnSwap(uint32_t frontBuffer, uint32_t width, uint32_t height, const std::array<uint32_t, 6>& fetch)
     {
         const uint64_t swaps = ++g_swapCount;
@@ -219,18 +240,43 @@ namespace gpu
             std::fprintf(stderr, "\n");
         }
         g_drawsThisFrame = 0;
+        WebGpuEndFrame();
         SoftEndFrame();
         if (g_gpuLog && (swaps <= 3 || (swaps & (swaps - 1)) == 0))
             std::fprintf(stderr, "[gpu]   soft renderer: %llu pixels, %llu resolves so far\n",
                 (unsigned long long)SoftPixelsWritten(), (unsigned long long)SoftResolves());
         static const bool softStats = [] { const char* v = std::getenv("TTT2_GPU_STATS"); return v && *v == '1'; }();
         if (softStats && swaps % 10 == 0)
+        {
+            // Command processor time per 10 swaps: executing packets (rendering included)
+            // and converting the front buffer for presentation.
+            static auto last = std::chrono::steady_clock::now();
+            const auto now = std::chrono::steady_clock::now();
+            std::fprintf(stderr, "[gpu] 10 swaps in %.1f ms: command processor busy %.1f ms, present %.1f ms\n",
+                std::chrono::duration<double, std::milli>(now - last).count(), g_cpBusyNs / 1e6, g_presentNs / 1e6);
+            last = now;
+            g_cpBusyNs = 0;
+            g_presentNs = 0;
             SoftPrintStats();
+            WebGpuPrintStats();
+        }
+        struct PresentTimer
+        {
+            std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+            ~PresentTimer() { g_presentNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()); }
+        } presentTimer;
 
         // Show the front buffer the game just swapped to.
-        const TextureInfo info = DecodeTextureFetch(fetch.data());
+        TextureInfo info = DecodeTextureFetch(fetch.data());
         static std::vector<uint32_t> pixels;
-        if (info.width > 1 && info.width <= 4096 && info.height <= 4096 && ConvertToBgra(info, pixels))
+        if (WebGpuPresentFrontBuffer(fetch.data()))
+        {
+            // Shown by the GPU; dumps still need the pixels.
+            if (ShouldDumpFrame(swaps) && WebGpuReadFrontBuffer(fetch.data(), pixels, info.width, info.height))
+                DumpBmp(swaps, pixels.data(), info.width, info.height);
+        }
+        else if (WebGpuReadFrontBuffer(fetch.data(), pixels, info.width, info.height) ||
+            (info.width > 1 && info.width <= 4096 && info.height <= 4096 && ConvertToBgra(info, pixels, SoftParallelFor)))
         {
             for (uint32_t& p : pixels)
                 p |= 0xFF000000u; // the window shows colour only
@@ -264,6 +310,16 @@ namespace gpu
     {
         if (!g_softGpu)
             return;
+        // TTT2_GPU=webgpu: rasterise and shade pixels on the GPU (falls back to the
+        // software renderer if no WebGPU adapter is available).
+        static const bool backendChosen = [] {
+            const char* v = std::getenv("TTT2_GPU");
+            if (v && std::strcmp(v, "webgpu") == 0)
+                if (CaptureSink* sink = CreateWebGpuBackend())
+                    SoftSetCaptureSink(sink);
+            return true;
+        }();
+        (void)backendChosen;
         static std::vector<uint32_t> vsStorage, psStorage;
         DrawCall call;
         call.primitive = initiator & 0x3F;
@@ -275,7 +331,37 @@ namespace gpu
         call.immediateIndices = std::move(immediate);
         call.vertexShader = StageCode(0, vsStorage);
         call.pixelShader = StageCode(1, psStorage);
-        SoftDraw(call);
+        static const bool logVertices = [] { const char* v = std::getenv("TTT2_GPU_LOG_VERTS"); return v && *v == '1'; }();
+        g_softLogVertices = logVertices && g_logFrame && g_swapCount + 1 == g_logFrame;
+        g_softLogDraw = g_logFrame && g_swapCount + 1 == g_logFrame;
+        static const bool dumpTextures = [] { const char* v = std::getenv("TTT2_GPU_DUMP_TEX"); return v && *v == '1'; }();
+        g_softDumpTextures = dumpTextures && g_logFrame && g_swapCount + 1 == g_logFrame;
+        const uint64_t pixelsBefore = SoftPixelsWritten();
+        // TTT2_GPU_VERIFY_FRAME=n: compare the hardware backend with the software renderer
+        // draw by draw during swap n.
+        static const uint64_t verifyFrame = [] { const char* v = std::getenv("TTT2_GPU_VERIFY_FRAME"); return v ? std::strtoull(v, nullptr, 10) : 0ull; }();
+        static bool verifying = false;
+        if (verifyFrame && WebGpuActive() && g_swapCount + 1 == verifyFrame)
+        {
+            if (!verifying)
+            {
+                verifying = true;
+                WebGpuFlushResolves();
+                SoftBeginVerify(verifyFrame);
+            }
+            SoftVerifyDraw(call);
+        }
+        else
+        {
+            if (verifying)
+            {
+                verifying = false;
+                SoftEndVerify();
+            }
+            SoftDraw(call);
+        }
+        if (g_logFrame && g_swapCount + 1 == g_logFrame)
+            std::fprintf(stderr, "[gpu]   -> %llu pixels written\n", (unsigned long long)(SoftPixelsWritten() - pixelsBefore));
     }
 
     static void LogDraw(uint32_t initiator, uint32_t indexBase, uint32_t indexBytes)
@@ -292,7 +378,29 @@ namespace gpu
             initiator & 0x3F, initiator >> 16, kSource[(initiator >> 6) & 3], (initiator >> 11) & 1, indexBase, indexBytes,
             ReadRegister(0x2208), ReadRegister(0x2000), ReadRegister(0x2001), ReadRegister(0x2002),
             g_shaders[0].address, g_shaders[0].dwords, g_shaders[1].address, g_shaders[1].dwords);
-        if (g_drawsLogged == 1)
+        if (frameLog)
+            std::fprintf(stderr, "[gpu]   depthctl=%08X stencil=%08X/%08X blend=%08X colorctl=%08X mask=%08X sc=%08X-%08X wsc=%08X-%08X su=%08X vte=%08X\n",
+                ReadRegister(0x2200), ReadRegister(0x210C), ReadRegister(0x210D), ReadRegister(0x2201), ReadRegister(0x2202),
+                ReadRegister(0x2104), ReadRegister(0x200E), ReadRegister(0x200F), ReadRegister(0x2081), ReadRegister(0x2082),
+                ReadRegister(0x2205), ReadRegister(0x2206));
+        // In frame-log mode, dump each distinct shader pair once, with the draw state.
+        bool dumpState = g_drawsLogged == 1 && !frameLog;
+        if (frameLog)
+        {
+            static std::vector<std::vector<uint32_t>> seen;
+            std::vector<uint32_t> key;
+            for (int stage = 0; stage < 2; stage++)
+            {
+                const ShaderSlot& sh = g_shaders[stage];
+                key.push_back(sh.dwords);
+                for (uint32_t i = 0; i < sh.dwords; i++)
+                    key.push_back(sh.address ? guest::Load<uint32_t>(sh.address + i * 4) : (i < sh.immediate.size() ? sh.immediate[i] : 0));
+            }
+            dumpState = std::find(seen.begin(), seen.end(), key) == seen.end();
+            if (dumpState)
+                seen.push_back(std::move(key));
+        }
+        if (dumpState)
         {
             // Full dump of the first draw: shaders, non-zero context registers, constants.
             for (int stage = 0; stage < 2; stage++)
@@ -362,6 +470,8 @@ namespace gpu
     static uint32_t ExecutePacket(const guest::GuestEnv& env, const Stream& s, uint32_t p, int depth)
     {
         const uint32_t header = s.Read(p);
+        if (g_stallLog)
+            g_trace[g_traceNext++ % 512] = { s.ring ? p : (s.base + p * 4), header, s.Read(p + 1), s.Read(p + 2), s.Read(p + 3), uint32_t(depth) };
         switch (header >> 30)
         {
         case 0: // type 0: write `count` registers starting at `base`
@@ -503,9 +613,20 @@ namespace gpu
             break;
         }
 
-        case PM4_INTERRUPT:
-            DispatchInterrupt(env, 1);
+        case PM4_INTERRUPT: // { cpu mask }: interrupt each selected hardware thread (as Xenia)
+        {
+            const uint32_t cpuMask = data(0);
+            static uint64_t masksSeen = 0;
+            if (g_stallLog && !(masksSeen & (1ull << (cpuMask & 63))))
+            {
+                masksSeen |= 1ull << (cpuMask & 63);
+                std::fprintf(stderr, "[gpu] interrupt cpu mask %02X (swap %llu)\n", cpuMask, (unsigned long long)g_swapCount);
+            }
+            for (uint8_t cpu = 0; cpu < 6; cpu++)
+                if (cpuMask & (1u << cpu))
+                    DispatchInterrupt(env, 1, cpu);
             break;
+        }
 
         case PM4_WAIT_REG_MEM:
             // Waits on values the CPU or this processor produce; everything here completes
@@ -536,9 +657,63 @@ namespace gpu
         }
     }
 
+    static void CheckStall()
+    {
+        const uint32_t dev = g_interruptData.load();
+        if (!dev)
+            return;
+        g_fenceAddr = guest::Load<uint32_t>(dev + 11024);
+        static auto since = std::chrono::steady_clock::now();
+        static uint32_t lastDone = 0;
+        static bool reported = false;
+        const uint32_t done = g_fenceAddr ? guest::Load<uint32_t>(g_fenceAddr) : 0;
+        const uint32_t issued = guest::Load<uint32_t>(dev + 11036);
+        const auto now = std::chrono::steady_clock::now();
+        static auto lastPrint = now;
+        if (now - lastPrint > std::chrono::seconds(2))
+        {
+            lastPrint = now;
+            std::fprintf(stderr, "[gpu] fences: swap %llu done=%08X issued=%08X rptr=%u wptr=%u soft=%u 13600=%08X\n",
+                (unsigned long long)g_swapCount, done, issued, g_rptr, ReadRegister(CP_RB_WPTR), guest::Load<uint32_t>(dev + 11088),
+                guest::Load<uint32_t>(dev + 13600));
+        }
+        if (done != lastDone || done == issued)
+        {
+            lastDone = done;
+            since = now;
+            reported = false;
+            return;
+        }
+        if (reported || now - since < std::chrono::seconds(3))
+            return;
+        reported = true;
+        std::fprintf(stderr, "[gpu] STALL: swap %llu fence %08X done=%08X issued=%08X lastGpuWrite=%08X rptr=%u wptr=%u softwptr=%u\n",
+            (unsigned long long)g_swapCount, g_fenceAddr, done, issued, g_fenceLastValue, g_rptr, ReadRegister(CP_RB_WPTR),
+            guest::Load<uint32_t>(dev + 11088));
+        std::fprintf(stderr, "[gpu]   dev+11024..: %08X %08X %08X %08X  11068: %08X %08X  13600: %08X %08X\n",
+            guest::Load<uint32_t>(g_fenceAddr + 4), guest::Load<uint32_t>(dev + 11028), guest::Load<uint32_t>(dev + 11032),
+            guest::Load<uint32_t>(dev + 11040), guest::Load<uint32_t>(dev + 11068), guest::Load<uint32_t>(dev + 11072),
+            guest::Load<uint32_t>(dev + 13600), guest::Load<uint32_t>(dev + 13604));
+        std::fprintf(stderr, "[gpu]   15300..15340:");
+        for (uint32_t o = 15300; o <= 15340; o += 4)
+            std::fprintf(stderr, " %08X", guest::Load<uint32_t>(dev + o));
+        const uint32_t blk = guest::Load<uint32_t>(dev + 11028);
+        std::fprintf(stderr, "\n[gpu]   intr block %08X:", blk);
+        for (uint32_t o = 0; o < 32; o += 4)
+            std::fprintf(stderr, " %08X", guest::Load<uint32_t>(blk + o));
+        std::fprintf(stderr, "\n[gpu]   last packets:\n");
+        for (uint32_t i = 0; i < 512; i++)
+        {
+            const TraceEntry& e = g_trace[(g_traceNext + i) % 512];
+            if (e.header)
+                std::fprintf(stderr, "[gpu]     %u %08X: %08X | %08X %08X %08X\n", e.depth, e.pos, e.header, e.d0, e.d1, e.d2);
+        }
+    }
+
     static void CommandProcessorThread()
     {
         guest::GuestEnv env = guest::CreateGuestEnv(/*cpu*/ 2);
+        auto lastWork = std::chrono::steady_clock::now();
         for (;;)
         {
             const uint32_t base = g_ringBase.load();
@@ -548,7 +723,10 @@ namespace gpu
                 const uint32_t wptr = ReadRegister(CP_RB_WPTR) % size;
                 if (wptr != g_rptr)
                 {
+                    const auto start = std::chrono::steady_clock::now();
                     ExecuteStream(env, Stream{ base, size, 1 }, g_rptr, wptr, 0);
+                    lastWork = std::chrono::steady_clock::now();
+                    g_cpBusyNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(lastWork - start).count());
                     g_rptr = wptr;
                     WriteRegister(CP_RB_RPTR, g_rptr);
                     if (const uint32_t writeback = g_rptrWriteback.load())
@@ -556,7 +734,15 @@ namespace gpu
                     continue;
                 }
             }
-            std::this_thread::sleep_for(std::chrono::microseconds(200));
+            if (g_stallLog)
+                CheckStall();
+            // The game flushes the GPU (fence + wait) dozens of times per frame, so new
+            // packets usually follow within microseconds: poll without sleeping for a while
+            // after the last work (a Windows sleep lasts at least ~1 ms).
+            if (std::chrono::steady_clock::now() - lastWork < std::chrono::milliseconds(4))
+                std::this_thread::yield();
+            else
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
         }
     }
 
@@ -571,7 +757,7 @@ namespace gpu
             std::this_thread::sleep_until(next);
             next += period;
             g_vblanks.fetch_add(1);
-            DispatchInterrupt(env, 0);
+            DispatchInterrupt(env, 0, 2);
         }
     }
 }

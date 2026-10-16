@@ -1,0 +1,2378 @@
+// WebGPU backend: see webgpu_backend.h.
+//
+// Render targets: one GPU texture per (EDRAM base tile, pitch, MSAA scale, format), in
+// pixel coordinates (MSAA is not emulated: one sample per pixel). Colour targets are
+// rgba16float (rgba32float for the 32-bit float formats), depth is depth32float-stencil8.
+// A clear through a resolve applies to every target sharing the EDRAM base, which covers
+// the common aliasing pattern (a target cleared through one view, drawn through another).
+//
+// Per draw: the pixel shader is translated to WGSL (cached by its text), a pipeline is
+// built for the render state (cached by key), the 256 pixel shader constants go into a
+// ring buffer bound with a dynamic offset, and the captured triangles into a vertex ring.
+// Work is submitted at resolves (which read targets back) and at the end of each frame.
+
+#include "webgpu_backend.h"
+#include "xenos_wgsl.h"
+#include "texture.h"
+#include "presenter.h"
+#include "../kernel/guest.h"
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+#include <webgpu/webgpu.h>
+#ifndef __EMSCRIPTEN__
+#include <webgpu/wgpu.h> // wgpuDevicePoll (wgpu-native)
+#endif
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <map>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace gpu
+{
+    void SoftParallelFor(uint32_t count, const std::function<void(uint32_t)>& fn);
+
+    namespace
+    {
+        WGPUStringView Str(const char* s) { return { s, WGPU_STRLEN }; }
+        WGPUStringView Str(const std::string& s) { return { s.data(), s.size() }; }
+        std::string FromView(WGPUStringView v)
+        {
+            if (!v.data)
+                return {};
+            return v.length == WGPU_STRLEN ? std::string(v.data) : std::string(v.data, v.length);
+        }
+
+        float HalfToFloat(uint16_t h)
+        {
+            const uint32_t sign = uint32_t(h >> 15) << 31;
+            const uint32_t exp = (h >> 10) & 0x1F, mant = h & 0x3FF;
+            uint32_t bits;
+            if (exp == 0)
+            {
+                const float v = std::ldexp(float(mant), -24);
+                return (h >> 15) ? -v : v;
+            }
+            if (exp == 31)
+                bits = sign | 0x7F800000u | (mant << 13);
+            else
+                bits = sign | ((exp + 112) << 23) | (mant << 13);
+            float f;
+            std::memcpy(&f, &bits, 4);
+            return f;
+        }
+
+        uint16_t FloatToHalf(float f)
+        {
+            uint32_t bits;
+            std::memcpy(&bits, &f, 4);
+            const uint16_t sign = uint16_t((bits >> 16) & 0x8000);
+            const uint32_t absBits = bits & 0x7FFFFFFF;
+            if (absBits >= 0x7F800000)
+                return uint16_t(sign | 0x7C00 | (absBits > 0x7F800000 ? 0x200 : 0));
+            const int exp = int(absBits >> 23) - 127 + 15;
+            if (exp >= 31)
+                return uint16_t(sign | 0x7BFF); // clamp to the largest finite half
+            if (exp <= 0)
+            {
+                if (exp < -10)
+                    return sign;
+                const uint32_t mant = (absBits & 0x7FFFFF) | 0x800000;
+                return uint16_t(sign | (mant >> (14 - exp)));
+            }
+            return uint16_t(sign | (exp << 10) | ((absBits >> 13) & 0x3FF));
+        }
+
+        uint64_t Fnv(const void* data, size_t bytes, uint64_t h = 1469598103934665603ull)
+        {
+            const uint8_t* p = static_cast<const uint8_t*>(data);
+            for (size_t i = 0; i < bytes; i++)
+                h = (h ^ p[i]) * 1099511628211ull;
+            return h;
+        }
+
+        // Cheap identity of a flattened shader: its instructions as decoded for this draw.
+        uint64_t Mix(uint64_t h, uint64_t v)
+        {
+            h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+            return h * 0xFF51AFD7ED558CCDull;
+        }
+
+        uint64_t HashShader(const CompiledShader* cs, uint64_t h)
+        {
+            if (!cs)
+                return Mix(h, 0x5A5A);
+            h = Mix(h, cs->ops.size());
+            for (const CompiledOp& op : cs->ops)
+            {
+                h = Mix(h, uint64_t(op.kind) | (uint64_t(uint8_t(op.clausePredicate)) << 8));
+                uint32_t raw[3] = {};
+                switch (op.kind)
+                {
+                case CompiledOp::Kind::Alu:
+                {
+                    std::memcpy(raw, &op.alu.a, 12);
+                    h = Mix(h, raw[0] | (uint64_t(raw[1]) << 32));
+                    h = Mix(h, raw[2] | (uint64_t(op.alu.vectorDest) << 32));
+                    h = Mix(h, op.alu.scalarDest | (uint64_t(op.alu.scalarGpr) << 16) | (uint64_t(op.alu.scalarGprComp) << 24) |
+                        (uint64_t(op.alu.scalarConstComp) << 32) | (uint64_t(op.alu.scalarConst) << 40));
+                    for (const AluOp::Source& src : op.alu.src)
+                    {
+                        uint32_t comps;
+                        std::memcpy(&comps, src.comp, 4);
+                        h = Mix(h, uint64_t(src.index) | (uint64_t(src.isRegister) << 32) | (uint64_t(src.relativeA0) << 33) |
+                            (uint64_t(src.abs) << 34) | (uint64_t(src.negate) << 35));
+                        h = Mix(h, comps);
+                    }
+                    break;
+                }
+                case CompiledOp::Kind::VertexFetch:
+                    std::memcpy(raw, &op.vertexFetch, 12);
+                    h = Mix(Mix(h, raw[0] | (uint64_t(raw[1]) << 32)), raw[2]);
+                    break;
+                case CompiledOp::Kind::TextureFetch:
+                    std::memcpy(raw, &op.textureFetch, 12);
+                    h = Mix(Mix(h, raw[0] | (uint64_t(raw[1]) << 32)), raw[2]);
+                    break;
+                default:
+                    break;
+                }
+            }
+            return h;
+        }
+
+        WGPUCompareFunction Compare(uint32_t func)
+        {
+            static constexpr WGPUCompareFunction k[8] = { WGPUCompareFunction_Never, WGPUCompareFunction_Less, WGPUCompareFunction_Equal,
+                WGPUCompareFunction_LessEqual, WGPUCompareFunction_Greater, WGPUCompareFunction_NotEqual,
+                WGPUCompareFunction_GreaterEqual, WGPUCompareFunction_Always };
+            return k[func & 7];
+        }
+
+        WGPUStencilOperation StencilOp(uint32_t op)
+        {
+            static constexpr WGPUStencilOperation k[8] = { WGPUStencilOperation_Keep, WGPUStencilOperation_Zero, WGPUStencilOperation_Replace,
+                WGPUStencilOperation_IncrementClamp, WGPUStencilOperation_DecrementClamp, WGPUStencilOperation_Invert,
+                WGPUStencilOperation_IncrementWrap, WGPUStencilOperation_DecrementWrap };
+            return k[op & 7];
+        }
+
+        WGPUBlendFactor BlendFactor(uint32_t f)
+        {
+            switch (f)
+            {
+            case 0: return WGPUBlendFactor_Zero;
+            case 1: return WGPUBlendFactor_One;
+            case 4: return WGPUBlendFactor_Src;
+            case 5: return WGPUBlendFactor_OneMinusSrc;
+            case 6: return WGPUBlendFactor_SrcAlpha;
+            case 7: return WGPUBlendFactor_OneMinusSrcAlpha;
+            case 8: return WGPUBlendFactor_Dst;
+            case 9: return WGPUBlendFactor_OneMinusDst;
+            case 10: return WGPUBlendFactor_DstAlpha;
+            case 11: return WGPUBlendFactor_OneMinusDstAlpha;
+            case 12: case 14: return WGPUBlendFactor_Constant;          // constant alpha approximated
+            case 13: case 15: return WGPUBlendFactor_OneMinusConstant;
+            case 16: return WGPUBlendFactor_SrcAlphaSaturated;
+            default: return WGPUBlendFactor_One;
+            }
+        }
+
+        WGPUBlendOperation BlendOp(uint32_t op)
+        {
+            switch (op)
+            {
+            case 1: return WGPUBlendOperation_Subtract;
+            case 2: return WGPUBlendOperation_Min;
+            case 3: return WGPUBlendOperation_Max;
+            case 4: return WGPUBlendOperation_ReverseSubtract;
+            default: return WGPUBlendOperation_Add;
+            }
+        }
+
+        bool BlendIsReplace(uint32_t control)
+        {
+            return (control & 0x1FFF) == 0x0001 && ((control >> 16) & 0x1FFF) == 0x0001;
+        }
+
+        // Unorm Xenos targets get unorm textures so that shader output and blending clamp to
+        // [0, 1] as on the console; float formats keep their range.
+        WGPUTextureFormat ColorFormat(uint32_t xenosFormat)
+        {
+            switch (xenosFormat)
+            {
+            case 0: case 1: case 10: return WGPUTextureFormat_RGBA8Unorm;  // 8_8_8_8 (gamma), 2_10_10_10_AS_10_10_10_10 approx.
+            case 2: return WGPUTextureFormat_RGB10A2Unorm;                  // 2_10_10_10
+            case 14: case 15: return WGPUTextureFormat_RGBA32Float;
+            default: return WGPUTextureFormat_RGBA16Float;
+            }
+        }
+
+        bool IsUnormColor(uint32_t format) { return format == 0 || format == 1 || format == 2 || format == 10; }
+
+        constexpr uint32_t kDrawDataStride = (kDrawDataBytes + 255) & ~255u;
+        constexpr uint64_t kDrawRingBytes = 32ull << 20;
+        constexpr uint64_t kVertexRingBytes = 64ull << 20;
+        constexpr uint64_t kVertexMemoryBytes = 128ull << 20; // guest vertex data (storage)
+        constexpr uint64_t kIndexRingBytes = 32ull << 20;
+
+        uint32_t PhysicalToGuest(uint32_t physical) { return 0xA0000000u + (physical & 0x1FFFFFFFu); }
+
+        struct RenderTarget
+        {
+            WGPUTexture texture = nullptr;
+            WGPUTextureView view = nullptr;
+            WGPUTextureFormat format = WGPUTextureFormat_Undefined;
+            uint32_t width = 0, height = 0;
+            uint32_t baseTile = 0;
+            bool depth = false;
+        };
+
+        struct GpuTexture
+        {
+            uint64_t version = 0;
+            WGPUTexture texture = nullptr;
+            WGPUTextureView view = nullptr;
+            uint32_t width = 0, height = 0;
+            WGPUTextureFormat format = WGPUTextureFormat_Undefined;
+        };
+
+        // A resolve kept on the GPU: the destination surface (dest pitch x height) for one
+        // guest address, plus exact-size copies for fetches that use a smaller extent.
+        struct ResolvedImage
+        {
+            WGPUTexture texture = nullptr;
+            WGPUTextureView view = nullptr;
+            uint32_t width = 0, height = 0;
+            uint32_t format = 0;          // destination texture format
+            uint32_t endian = 0;
+            uint64_t generation = 0;      // bumped by every resolve into it
+            uint64_t lastResolveFrame = 0;
+            struct Exact { uint64_t generation = 0; GpuTexture texture; };
+            std::map<std::pair<uint32_t, uint32_t>, Exact> exact;
+        };
+
+        // Texture formats a GPU resolve can produce, and the fetch formats that may sample them.
+        bool GpuResolvableFormat(uint32_t f) { return f == 2 || f == 4 || f == 6 || f == 7 || f == 10 || f == 25 || f == 26 || f == 31 || f == 32; }
+        bool SameTextureFormat(uint32_t a, uint32_t b)
+        {
+            auto family = [](uint32_t f) { return (f == 14 || f == 50) ? 6u : f; };
+            return family(a) == family(b);
+        }
+
+        struct Stats
+        {
+            uint64_t draws = 0, triangles = 0, pipelinesCreated = 0, shadersCreated = 0, readbacks = 0, clears = 0,
+                     textureUploads = 0, submits = 0, readbackNs = 0, encodeNs = 0, gpuResolves = 0, gpuResolveBinds = 0, flushes = 0,
+                     setupNs = 0, pipelineNs = 0, dataNs = 0, bindNs = 0, vertexBytes = 0, indexBytes = 0, drawDataBytes = 0;
+        };
+
+        class WebGpuBackend final : public CaptureSink
+        {
+        public:
+            bool Init();
+
+            void BeginDraw(const CaptureDraw& draw) override;
+            bool DrawGpu(const GpuDrawRequest& request) override;
+            void Triangle(const CaptureVertex& a, const CaptureVertex& b, const CaptureVertex& c, bool front) override;
+            void EndDraw() override;
+            void ReadColor(const RasterState& rs, uint32_t rt, int x0, int y0, int x1, int y1, std::vector<F4>& out) override;
+            void ReadDepth(const RasterState& rs, int x0, int y0, int x1, int y1, std::vector<float>& depth, std::vector<uint8_t>& stencil) override;
+            void ClearColor(const RasterState& rs, uint32_t rt, int x0, int y0, int x1, int y1, const F4& color) override;
+            void ClearDepth(const RasterState& rs, int x0, int y0, int x1, int y1, float depth, uint8_t stencil) override;
+
+            bool ResolveToGpu(const ResolveRequest& request) override;
+
+            void EndFrame();
+            void PrintStats();
+            bool ReadFrontBuffer(const uint32_t fetch[6], std::vector<uint32_t>& bgra, uint32_t& width, uint32_t& height);
+            bool PresentFrontBuffer(const uint32_t fetch[6]);
+            void FlushAllResolves();
+
+            // Texture bind groups are cached by their views and samplers; any view going away
+            // drops the cache (a later view could reuse the address).
+            std::unordered_map<uint64_t, WGPUBindGroup> bindGroups_;
+            bool bindGroupsDirty_ = false;
+            void ReleaseView(WGPUTextureView view)
+            {
+                wgpuTextureViewRelease(view);
+                bindGroupsDirty_ = true;
+            }
+
+        private:
+            // ---- device
+            WGPUInstance instance_ = nullptr;
+            WGPUAdapter adapter_ = nullptr;
+            WGPUDevice device_ = nullptr;
+            WGPUQueue queue_ = nullptr;
+            bool depthClipControl_ = false;
+            bool float32Filterable_ = false; // rgba32float textures can be sampled with filtering
+
+            // ---- recording
+            WGPUCommandEncoder encoder_ = nullptr;
+            WGPURenderPassEncoder pass_ = nullptr;
+            RenderTarget* passColor_[4] = {};
+            RenderTarget* passDepth_ = nullptr;
+
+            // ---- rings (offsets reset after every submit)
+            WGPUBuffer drawRing_ = nullptr, vertexRing_ = nullptr, vertexMemory_ = nullptr, indexRing_ = nullptr;
+            uint64_t drawOffset_ = 0, vertexOffset_ = 0, vertexMemoryOffset_ = 0, indexOffset_ = 0;
+            std::unordered_map<uint64_t, uint32_t> vertexUploads_; // (address, words) -> word offset, per submit
+
+            // ---- caches
+            std::map<std::tuple<bool, uint32_t, uint32_t, uint32_t, uint32_t, int>, std::unique_ptr<RenderTarget>> targets_;
+            std::unordered_map<uint64_t, WGPUShaderModule> modules_;
+            struct Translation { WgslShader shader; WGPUShaderModule module = nullptr; uint64_t key = 0; };
+            std::unordered_map<uint64_t, Translation> translations_; // by shader ops + options
+            std::unordered_map<std::string, WGPURenderPipeline> pipelines_;
+            std::unordered_map<uint32_t, WGPUBindGroupLayout> textureLayouts_;
+            std::unordered_map<uint32_t, WGPUPipelineLayout> pipelineLayouts_;
+            std::map<std::tuple<int, int, int>, WGPUSampler> samplers_;
+            std::unordered_map<const Texture*, GpuTexture> textures_;
+            WGPUBindGroupLayout drawLayout_ = nullptr;
+            WGPUBindGroup drawBindGroup_ = nullptr;
+            GpuTexture dummy_;
+            WGPUBuffer readback_ = nullptr;
+            uint64_t readbackSize_ = 0;
+            WGPUShaderModule clearModule_ = nullptr;
+            WGPUShaderModule resolveModule_ = nullptr;
+            WGPUBindGroupLayout resolveSourceLayout_ = nullptr;
+            WGPURenderPipeline resolvePipeline_ = nullptr;
+            WGPUBindGroupLayout resolveDepthLayout_ = nullptr;
+            WGPURenderPipeline resolveDepthPipeline_ = nullptr;
+            // Presentation straight to the window (no readback).
+            WGPUSurface surface_ = nullptr;
+            WGPUTextureFormat surfaceFormat_ = WGPUTextureFormat_Undefined;
+            WGPUPresentMode presentMode_ = WGPUPresentMode_Fifo;
+            uint32_t surfaceWidth_ = 0, surfaceHeight_ = 0;
+            bool surfaceFailed_ = false;
+            WGPUBindGroupLayout blitLayout_ = nullptr;
+            WGPURenderPipeline blitPipeline_ = nullptr;
+            WGPUSampler blitSampler_ = nullptr;
+            std::unordered_map<uint32_t, ResolvedImage> resolved_; // by guest address
+            uint64_t frame_ = 1;
+
+            // ---- current draw
+            const RasterState* rs_ = nullptr;
+            RenderTarget* drawColor_[4] = {};
+            RenderTarget* drawDepth_ = nullptr;
+            WGPURenderPipeline drawPipeline_ = nullptr;
+            WGPUBindGroup drawTextures_ = nullptr;
+            uint32_t drawDataOffset_ = 0;
+            uint32_t interpolatorMask_ = 0;
+            uint32_t floatsPerVertex_ = 4;
+            std::vector<float> vertices_;
+            bool skip_ = false;
+            bool gpuVertex_ = false;
+            uint32_t scaleX_ = 1, scaleY_ = 1; // MSAA view: samples per pixel horizontally/vertically
+
+            Stats stats_;
+
+            // ---- helpers
+            RenderTarget* Target(bool depth, const Surface& s, WGPUTextureFormat format);
+            void EnsureEncoder();
+            void EndPass();
+            void Submit();
+            void BeginPass(RenderTarget* const color[4], RenderTarget* depth);
+            uint32_t WriteDrawData(const float misc[4], const F4* xf, const F4* constants, uint32_t first, uint32_t count,
+                const uint32_t (*vertexFetch)[4] = nullptr);
+            struct PrepareArgs
+            {
+                const RasterState* rs = nullptr;
+                const CompiledShader* vs = nullptr;  // null: vertices come pre-shaded
+                const CompiledShader* ps = nullptr;
+                const F4* constants = nullptr;       // vs: c0..c511; otherwise c256..c511
+                const uint32_t* fetch = nullptr;
+                const std::function<const Texture&(uint32_t)>* texture = nullptr;
+                uint32_t minIndex = 0, maxIndex = 0; // vertex indices the draw uses
+            };
+            bool Prepare(const PrepareArgs& args);
+            uint32_t UploadVertexMemory(uint32_t address, uint32_t words);
+            WGPUShaderModule Module(const std::string& code);
+            WGPUBindGroupLayout TextureLayout(uint32_t slots);
+            WGPUPipelineLayout PipelineLayout(uint32_t slots);
+            WGPUSampler Sampler(const Texture& tex);
+            WGPUSampler Sampler(uint32_t clampX, uint32_t clampY, bool linear);
+            ResolvedImage* ResolvedFor(const uint32_t* fetch);
+            WGPUTextureView ResolvedView(ResolvedImage& image, uint32_t width, uint32_t height);
+            void FlushToMemory(uint32_t base, ResolvedImage& image);
+            const GpuTexture& Upload(const Texture& tex);
+            void ReadTexture(WGPUTexture texture, WGPUTextureAspect aspect, uint32_t bytesPerPixel, int x0, int y0, int w, int h,
+                std::vector<uint8_t>& out, uint32_t& rowBytes);
+            void ClearRect(RenderTarget* target, int x0, int y0, int x1, int y1, const F4& color, float depth, uint8_t stencil);
+        };
+
+        WebGpuBackend* g_backend = nullptr;
+
+        bool WebGpuBackend::Init()
+        {
+            instance_ = wgpuCreateInstance(nullptr);
+            if (!instance_)
+                return false;
+
+            struct AdapterResult { WGPUAdapter adapter = nullptr; bool done = false; } ar;
+            WGPURequestAdapterOptions options = WGPU_REQUEST_ADAPTER_OPTIONS_INIT;
+            options.powerPreference = WGPUPowerPreference_HighPerformance;
+            WGPURequestAdapterCallbackInfo acb = WGPU_REQUEST_ADAPTER_CALLBACK_INFO_INIT;
+            acb.mode = WGPUCallbackMode_AllowProcessEvents;
+            acb.callback = [](WGPURequestAdapterStatus status, WGPUAdapter adapter, WGPUStringView message, void* u1, void*) {
+                auto* r = static_cast<AdapterResult*>(u1);
+                r->adapter = status == WGPURequestAdapterStatus_Success ? adapter : nullptr;
+                r->done = true;
+                if (status != WGPURequestAdapterStatus_Success)
+                    std::fprintf(stderr, "[gpu] webgpu: no adapter: %s\n", FromView(message).c_str());
+            };
+            acb.userdata1 = &ar;
+            wgpuInstanceRequestAdapter(instance_, &options, acb);
+            while (!ar.done)
+                wgpuInstanceProcessEvents(instance_);
+            adapter_ = ar.adapter;
+            if (!adapter_)
+                return false;
+
+            WGPUAdapterInfo info = WGPU_ADAPTER_INFO_INIT;
+            if (wgpuAdapterGetInfo(adapter_, &info) == WGPUStatus_Success)
+            {
+                std::fprintf(stderr, "[gpu] webgpu: %s (%s)\n", FromView(info.device).c_str(), FromView(info.description).c_str());
+                wgpuAdapterInfoFreeMembers(info);
+            }
+
+            std::vector<WGPUFeatureName> features;
+            if (!wgpuAdapterHasFeature(adapter_, WGPUFeatureName_Depth32FloatStencil8))
+            {
+                std::fprintf(stderr, "[gpu] webgpu: adapter lacks depth32float-stencil8\n");
+                return false;
+            }
+            features.push_back(WGPUFeatureName_Depth32FloatStencil8);
+            if (wgpuAdapterHasFeature(adapter_, WGPUFeatureName_DepthClipControl))
+            {
+                features.push_back(WGPUFeatureName_DepthClipControl);
+                depthClipControl_ = true;
+            }
+            if (wgpuAdapterHasFeature(adapter_, WGPUFeatureName_Float32Filterable))
+            {
+                features.push_back(WGPUFeatureName_Float32Filterable);
+                float32Filterable_ = true;
+            }
+
+            struct DeviceResult { WGPUDevice device = nullptr; bool done = false; } dr;
+            WGPUDeviceDescriptor dd = WGPU_DEVICE_DESCRIPTOR_INIT;
+            dd.label = Str("ttt2");
+            dd.requiredFeatureCount = features.size();
+            dd.requiredFeatures = features.data();
+            dd.uncapturedErrorCallbackInfo.callback = [](WGPUDevice const*, WGPUErrorType type, WGPUStringView message, void*, void*) {
+                static std::atomic<int> reported{ 0 };
+                if (reported++ < 20)
+                    std::fprintf(stderr, "[gpu] webgpu error %d: %s\n", int(type), FromView(message).c_str());
+            };
+            dd.deviceLostCallbackInfo.callback = [](WGPUDevice const*, WGPUDeviceLostReason reason, WGPUStringView message, void*, void*) {
+                if (reason != WGPUDeviceLostReason_Destroyed)
+                    std::fprintf(stderr, "[gpu] webgpu device lost (%d): %s\n", int(reason), FromView(message).c_str());
+            };
+            WGPURequestDeviceCallbackInfo dcb = WGPU_REQUEST_DEVICE_CALLBACK_INFO_INIT;
+            dcb.mode = WGPUCallbackMode_AllowProcessEvents;
+            dcb.callback = [](WGPURequestDeviceStatus status, WGPUDevice device, WGPUStringView message, void* u1, void*) {
+                auto* r = static_cast<DeviceResult*>(u1);
+                r->device = status == WGPURequestDeviceStatus_Success ? device : nullptr;
+                r->done = true;
+                if (status != WGPURequestDeviceStatus_Success)
+                    std::fprintf(stderr, "[gpu] webgpu: no device: %s\n", FromView(message).c_str());
+            };
+            dcb.userdata1 = &dr;
+            wgpuAdapterRequestDevice(adapter_, &dd, dcb);
+            while (!dr.done)
+                wgpuInstanceProcessEvents(instance_);
+            device_ = dr.device;
+            if (!device_)
+                return false;
+            queue_ = wgpuDeviceGetQueue(device_);
+
+            WGPUBufferDescriptor bd = WGPU_BUFFER_DESCRIPTOR_INIT;
+            bd.label = Str("draw data");
+            bd.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
+            bd.size = kDrawRingBytes;
+            drawRing_ = wgpuDeviceCreateBuffer(device_, &bd);
+            bd.label = Str("vertices");
+            bd.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
+            bd.size = kVertexRingBytes;
+            vertexRing_ = wgpuDeviceCreateBuffer(device_, &bd);
+            bd.label = Str("guest vertex memory");
+            bd.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
+            bd.size = kVertexMemoryBytes;
+            vertexMemory_ = wgpuDeviceCreateBuffer(device_, &bd);
+            bd.label = Str("indices");
+            bd.usage = WGPUBufferUsage_Index | WGPUBufferUsage_CopyDst;
+            bd.size = kIndexRingBytes;
+            indexRing_ = wgpuDeviceCreateBuffer(device_, &bd);
+
+            WGPUBindGroupLayoutEntry entries[2] = { WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT };
+            entries[0].binding = 0;
+            entries[0].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
+            entries[0].buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
+            entries[0].buffer.hasDynamicOffset = true;
+            entries[0].buffer.minBindingSize = kDrawDataBytes;
+            entries[1].binding = 1;
+            entries[1].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
+            entries[1].buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
+            WGPUBindGroupLayoutDescriptor bld = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+            bld.entryCount = 2;
+            bld.entries = entries;
+            drawLayout_ = wgpuDeviceCreateBindGroupLayout(device_, &bld);
+            WGPUBindGroupEntry bge[2] = { WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT };
+            bge[0].binding = 0;
+            bge[0].buffer = drawRing_;
+            bge[0].size = kDrawDataBytes;
+            bge[1].binding = 1;
+            bge[1].buffer = vertexMemory_;
+            bge[1].size = kVertexMemoryBytes;
+            WGPUBindGroupDescriptor bgd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+            bgd.layout = drawLayout_;
+            bgd.entryCount = 2;
+            bgd.entries = bge;
+            drawBindGroup_ = wgpuDeviceCreateBindGroup(device_, &bgd);
+
+            // 1x1 transparent black for slots whose texture could not be decoded.
+            WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
+            td.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
+            td.size = { 1, 1, 1 };
+            td.format = WGPUTextureFormat_RGBA8Unorm;
+            dummy_.texture = wgpuDeviceCreateTexture(device_, &td);
+            dummy_.view = wgpuTextureCreateView(dummy_.texture, nullptr);
+            dummy_.width = dummy_.height = 1;
+            const uint32_t zero = 0;
+            WGPUTexelCopyTextureInfo dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+            dst.texture = dummy_.texture;
+            WGPUTexelCopyBufferLayout layout = WGPU_TEXEL_COPY_BUFFER_LAYOUT_INIT;
+            layout.bytesPerRow = 4;
+            layout.rowsPerImage = 1;
+            const WGPUExtent3D one = { 1, 1, 1 };
+            wgpuQueueWriteTexture(queue_, &dst, &zero, 4, &layout, &one);
+
+            // Clears: a full-screen triangle at depth D.c[0].x writing colour D.misc.
+            clearModule_ = Module(std::string(kWgslDrawData) + R"(
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+    let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u)) * 2.0 - 1.0;
+    return vec4f(p, D.c[0].x, 1.0);
+}
+@fragment fn fs() -> @location(0) vec4f { return D.misc; }
+)");
+
+            // Resolves: copy a render-target rectangle into a resolved image, applying what
+            // the copy unit does on the way to memory (gamma encode, exponent bias, red/blue
+            // swap, quantisation to the destination format).
+            WGPUBindGroupLayoutEntry src = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+            src.binding = 0;
+            src.visibility = WGPUShaderStage_Fragment;
+            src.texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
+            src.texture.viewDimension = WGPUTextureViewDimension_2D;
+            WGPUBindGroupLayoutDescriptor sld = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+            sld.entryCount = 1;
+            sld.entries = &src;
+            resolveSourceLayout_ = wgpuDeviceCreateBindGroupLayout(device_, &sld);
+            resolveModule_ = Module(std::string(kWgslDrawData) + R"(
+@group(1) @binding(0) var src: texture_2d<f32>;
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+    let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u)) * 2.0 - 1.0;
+    return vec4f(p, 0.0, 1.0);
+}
+fn pwl(x: f32) -> f32 {
+    let v = clamp(x, 0.0, 1.0);
+    if (v < 0.0625) { return v * 4.0; }
+    if (v < 0.125) { return v * 2.0 + 0.125; }
+    if (v < 0.5) { return v + 0.25; }
+    return v * 0.5 + 0.5;
+}
+fn quantise(v: f32, bits: f32) -> f32 {
+    if (bits <= 0.0) { return v; }
+    let m = exp2(bits) - 1.0;
+    return round(clamp(v, 0.0, 1.0) * m) / m;
+}
+@fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
+    let dims = vec2i(textureDimensions(src));
+    let pixel = vec2i(p.xy) + vec2i(i32(D.c[0].x), i32(D.c[0].y));
+    let scale = vec2i(i32(D.c[1].z), i32(D.c[1].w));
+    var v = vec4f(0.0);
+    if (D.c[3].x > 0.5) {
+        // Average every sample of the pixel.
+        for (var j = 0; j < scale.y; j++) {
+            for (var i = 0; i < scale.x; i++) {
+                v += textureLoad(src, clamp(pixel * scale + vec2i(i, j), vec2i(0), dims - 1), 0);
+            }
+        }
+        v /= f32(scale.x * scale.y);
+    } else {
+        // One sample: 2x stacks samples vertically, 4x is 2x2.
+        let n = i32(D.c[3].y);
+        let s = select(vec2i(0, n), vec2i(n & 1, n >> 1), scale.x == 2);
+        v = textureLoad(src, clamp(pixel * scale + s, vec2i(0), dims - 1), 0);
+    }
+    if (D.c[0].z > 0.5) { v = vec4f(pwl(v.x), pwl(v.y), pwl(v.z), v.w); }
+    v = v * D.c[0].w;
+    if (D.c[1].x > 0.5) { v = v.zyxw; }
+    let bits = D.c[2];
+    v = vec4f(quantise(v.x, bits.x), quantise(v.y, bits.y), quantise(v.z, bits.z), quantise(v.w, bits.w));
+    // What a fetch of the destination format decodes into components 0-3.
+    let decodeAs = i32(D.c[1].y);
+    if (decodeAs == 1) { v = vec4f(v.x, v.x, v.x, 1.0); }      // k_8
+    else if (decodeAs == 2) { v = vec4f(v.xy, 0.0, 0.0); }    // k_8_8
+    else if (decodeAs == 3) { v = vec4f(v.xyz, 1.0); }        // k_5_6_5
+    return v;
+}
+)");
+            {
+                WGPUBindGroupLayout layouts[2] = { drawLayout_, resolveSourceLayout_ };
+                WGPUPipelineLayoutDescriptor pld = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+                pld.bindGroupLayoutCount = 2;
+                pld.bindGroupLayouts = layouts;
+                WGPUPipelineLayout layout = wgpuDeviceCreatePipelineLayout(device_, &pld);
+                WGPUColorTargetState target = WGPU_COLOR_TARGET_STATE_INIT;
+                target.format = WGPUTextureFormat_RGBA16Float;
+                WGPUFragmentState fs = WGPU_FRAGMENT_STATE_INIT;
+                fs.module = resolveModule_;
+                fs.entryPoint = Str("fs");
+                fs.targetCount = 1;
+                fs.targets = &target;
+                WGPURenderPipelineDescriptor pd = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+                pd.layout = layout;
+                pd.vertex.module = resolveModule_;
+                pd.vertex.entryPoint = Str("vs");
+                pd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+                pd.multisample.count = 1;
+                pd.multisample.mask = 0xFFFFFFFF;
+                pd.fragment = &fs;
+                resolvePipeline_ = wgpuDeviceCreateRenderPipeline(device_, &pd);
+            }
+
+            // Depth resolves into a colour format: the raw depth/stencil word as bytes.
+            {
+                WGPUBindGroupLayoutEntry e[2] = { WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT };
+                e[0].binding = 0;
+                e[0].visibility = WGPUShaderStage_Fragment;
+                e[0].texture.sampleType = WGPUTextureSampleType_Depth;
+                e[0].texture.viewDimension = WGPUTextureViewDimension_2D;
+                e[1].binding = 1;
+                e[1].visibility = WGPUShaderStage_Fragment;
+                e[1].texture.sampleType = WGPUTextureSampleType_Uint;
+                e[1].texture.viewDimension = WGPUTextureViewDimension_2D;
+                WGPUBindGroupLayoutDescriptor d = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+                d.entryCount = 2;
+                d.entries = e;
+                resolveDepthLayout_ = wgpuDeviceCreateBindGroupLayout(device_, &d);
+                WGPUShaderModule module = Module(std::string(kWgslDrawData) + R"(
+@group(1) @binding(0) var depthTex: texture_depth_2d;
+@group(1) @binding(1) var stencilTex: texture_2d<u32>;
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+    let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u)) * 2.0 - 1.0;
+    return vec4f(p, 0.0, 1.0);
+}
+fn to20e4(f: f32) -> u32 {
+    var bits = bitcast<u32>(f);
+    if (bitcast<i32>(bits) <= 0) { return 0u; }
+    if (bits >= 0x40000000u) { return 0xFFFFFFu; }
+    if (bits < 0x38800000u) {
+        let shift = min(113u - (bits >> 23u), 24u);
+        bits = (0x800000u | (bits & 0x7FFFFFu)) >> shift;
+    } else {
+        bits = bits - 0x38000000u;
+    }
+    return ((bits + 3u + ((bits >> 3u) & 1u)) >> 3u) & 0xFFFFFFu;
+}
+@fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
+    let dims = vec2i(textureDimensions(depthTex));
+    let pixel = vec2i(p.xy) + vec2i(i32(D.c[0].x), i32(D.c[0].y));
+    let scale = vec2i(i32(D.c[1].z), i32(D.c[1].w));
+    let at = clamp(pixel * scale, vec2i(0), dims - 1);
+    let d = textureLoad(depthTex, at, 0);
+    let st = textureLoad(stencilTex, at, 0).x;
+    let bits = select(u32(round(clamp(d, 0.0, 1.0) * 16777215.0)), to20e4(d), D.c[1].x > 0.5);
+    let raw = (bits << 8u) | (st & 0xFFu);
+    return vec4f(f32(raw & 0xFFu), f32((raw >> 8u) & 0xFFu), f32((raw >> 16u) & 0xFFu), f32(raw >> 24u)) / 255.0;
+}
+)");
+                WGPUBindGroupLayout layouts[2] = { drawLayout_, resolveDepthLayout_ };
+                WGPUPipelineLayoutDescriptor pld = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+                pld.bindGroupLayoutCount = 2;
+                pld.bindGroupLayouts = layouts;
+                WGPUPipelineLayout layout = wgpuDeviceCreatePipelineLayout(device_, &pld);
+                WGPUColorTargetState target = WGPU_COLOR_TARGET_STATE_INIT;
+                target.format = WGPUTextureFormat_RGBA16Float;
+                WGPUFragmentState fs = WGPU_FRAGMENT_STATE_INIT;
+                fs.module = module;
+                fs.entryPoint = Str("fs");
+                fs.targetCount = 1;
+                fs.targets = &target;
+                WGPURenderPipelineDescriptor pd = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+                pd.layout = layout;
+                pd.vertex.module = module;
+                pd.vertex.entryPoint = Str("vs");
+                pd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+                pd.multisample.count = 1;
+                pd.multisample.mask = 0xFFFFFFFF;
+                pd.fragment = &fs;
+                resolveDepthPipeline_ = wgpuDeviceCreateRenderPipeline(device_, &pd);
+            }
+            return true;
+        }
+
+        WGPUShaderModule WebGpuBackend::Module(const std::string& code)
+        {
+            const uint64_t key = Fnv(code.data(), code.size());
+            auto it = modules_.find(key);
+            if (it != modules_.end())
+                return it->second;
+            WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+            source.code = Str(code);
+            WGPUShaderModuleDescriptor md = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+            md.nextInChain = &source.chain;
+            WGPUShaderModule module = wgpuDeviceCreateShaderModule(device_, &md);
+            ++stats_.shadersCreated;
+            static const bool dumpShaders = [] { const char* v = std::getenv("TTT2_WGSL_DUMP"); return v && *v == '1'; }();
+            if (dumpShaders)
+            {
+                char name[64];
+                std::snprintf(name, sizeof(name), "shader_%016llx.wgsl", (unsigned long long)key);
+                if (std::FILE* f = std::fopen(name, "wb"))
+                {
+                    std::fwrite(code.data(), 1, code.size(), f);
+                    std::fclose(f);
+                }
+            }
+            modules_[key] = module;
+            return module;
+        }
+
+        WGPUBindGroupLayout WebGpuBackend::TextureLayout(uint32_t slots)
+        {
+            auto it = textureLayouts_.find(slots);
+            if (it != textureLayouts_.end())
+                return it->second;
+            std::vector<WGPUBindGroupLayoutEntry> entries;
+            for (uint32_t slot = 0; slot < 32; slot++)
+            {
+                if (!(slots & (1u << slot)))
+                    continue;
+                WGPUBindGroupLayoutEntry t = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+                t.binding = slot * 2;
+                t.visibility = WGPUShaderStage_Fragment;
+                t.texture.sampleType = WGPUTextureSampleType_Float;
+                t.texture.viewDimension = WGPUTextureViewDimension_2D;
+                entries.push_back(t);
+                WGPUBindGroupLayoutEntry s = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+                s.binding = slot * 2 + 1;
+                s.visibility = WGPUShaderStage_Fragment;
+                s.sampler.type = WGPUSamplerBindingType_Filtering;
+                entries.push_back(s);
+            }
+            WGPUBindGroupLayoutDescriptor d = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+            d.entryCount = entries.size();
+            d.entries = entries.data();
+            WGPUBindGroupLayout layout = wgpuDeviceCreateBindGroupLayout(device_, &d);
+            textureLayouts_[slots] = layout;
+            return layout;
+        }
+
+        WGPUPipelineLayout WebGpuBackend::PipelineLayout(uint32_t slots)
+        {
+            auto it = pipelineLayouts_.find(slots);
+            if (it != pipelineLayouts_.end())
+                return it->second;
+            WGPUBindGroupLayout layouts[2] = { drawLayout_, TextureLayout(slots) };
+            WGPUPipelineLayoutDescriptor d = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+            d.bindGroupLayoutCount = 2;
+            d.bindGroupLayouts = layouts;
+            WGPUPipelineLayout layout = wgpuDeviceCreatePipelineLayout(device_, &d);
+            pipelineLayouts_[slots] = layout;
+            return layout;
+        }
+
+        WGPUSampler WebGpuBackend::Sampler(uint32_t clampX, uint32_t clampY, bool linear)
+        {
+            Texture t;
+            t.clampX = clampX;
+            t.clampY = clampY;
+            t.magFilter = linear ? 1 : 0;
+            return Sampler(t);
+        }
+
+        WGPUSampler WebGpuBackend::Sampler(const Texture& tex)
+        {
+            auto address = [](uint32_t mode) {
+                return mode == 0 ? WGPUAddressMode_Repeat : mode == 1 ? WGPUAddressMode_MirrorRepeat : WGPUAddressMode_ClampToEdge;
+            };
+            const int u = int(tex.clampX), v = int(tex.clampY), linear = tex.magFilter == 1 ? 1 : 0;
+            const auto key = std::make_tuple(u, v, linear);
+            auto it = samplers_.find(key);
+            if (it != samplers_.end())
+                return it->second;
+            WGPUSamplerDescriptor d = WGPU_SAMPLER_DESCRIPTOR_INIT;
+            d.addressModeU = address(tex.clampX);
+            d.addressModeV = address(tex.clampY);
+            d.addressModeW = WGPUAddressMode_ClampToEdge;
+            d.magFilter = d.minFilter = linear ? WGPUFilterMode_Linear : WGPUFilterMode_Nearest;
+            d.mipmapFilter = WGPUMipmapFilterMode_Nearest;
+            WGPUSampler sampler = wgpuDeviceCreateSampler(device_, &d);
+            samplers_[key] = sampler;
+            return sampler;
+        }
+
+        const GpuTexture& WebGpuBackend::Upload(const Texture& tex)
+        {
+            if (!tex.ok || !tex.width || !tex.height)
+                return dummy_;
+            auto cached = textures_.find(&tex);
+            if (cached != textures_.end() && cached->second.texture && cached->second.version == tex.version)
+                return cached->second;
+            if (tex.texels.size() < size_t(tex.width) * tex.height)
+                return dummy_;
+            GpuTexture& g = textures_[&tex];
+
+            // Precision from the source format: 8-bit formats stay 8-bit (if the decode
+            // stayed in [0, 1]: signed or exponent-adjusted ones need floats), depth and
+            // 16/32-bit formats keep full float precision, anything else half floats.
+            const size_t count = size_t(tex.width) * tex.height;
+            const uint32_t chunks = uint32_t((count + 65535) / 65536);
+            bool eightBit = false, wide = false;
+            switch (tex.format)
+            {
+            case 0: case 1: case 2: case 3: case 4: case 5: case 6: case 8: case 9: case 10: case 11: case 12: case 14: case 15:
+            case 18: case 19: case 20: case 49: case 50: case 51: case 52: case 53: case 58: case 59: case 60: case 61:
+                eightBit = true;
+                break;
+            case 22: case 23: case 24: case 25: case 26: case 33: case 34: case 35: case 36: case 37: case 38: case 57:
+                wide = true;
+                break;
+            default:
+                break;
+            }
+            std::atomic<bool> unorm{ eightBit };
+            if (eightBit)
+                SoftParallelFor(chunks, [&](uint32_t c) {
+                    const size_t end = std::min(count, size_t(c + 1) * 65536);
+                    for (size_t i = size_t(c) * 65536; i < end && unorm.load(std::memory_order_relaxed); i++)
+                        for (float v : tex.texels[i])
+                            if (!(v >= 0.0f && v <= 1.0f))
+                            {
+                                unorm = false;
+                                break;
+                            }
+                });
+            const WGPUTextureFormat format = unorm ? WGPUTextureFormat_RGBA8Unorm
+                : (wide && float32Filterable_) ? WGPUTextureFormat_RGBA32Float : WGPUTextureFormat_RGBA16Float;
+            if (!g.texture || g.width != tex.width || g.height != tex.height || g.format != format)
+            {
+                if (g.view)
+                    ReleaseView(g.view);
+                if (g.texture)
+                    wgpuTextureRelease(g.texture);
+                WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
+                td.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
+                td.size = { tex.width, tex.height, 1 };
+                td.format = format;
+                g.texture = wgpuDeviceCreateTexture(device_, &td);
+                g.view = wgpuTextureCreateView(g.texture, nullptr);
+                g.width = tex.width;
+                g.height = tex.height;
+                g.format = format;
+            }
+            g.version = tex.version;
+
+            const uint32_t bpp = unorm ? 4 : format == WGPUTextureFormat_RGBA32Float ? 16 : 8;
+            static std::vector<uint8_t> staging;
+            staging.resize(count * bpp);
+            SoftParallelFor(chunks, [&](uint32_t c) {
+                const size_t end = std::min(count, size_t(c + 1) * 65536);
+                for (size_t i = size_t(c) * 65536; i < end; i++)
+                {
+                    const F4& t = tex.texels[i];
+                    if (unorm)
+                        for (int k = 0; k < 4; k++)
+                            staging[i * 4 + k] = uint8_t(t[k] * 255.0f + 0.5f);
+                    else if (bpp == 16)
+                        std::memcpy(&staging[i * 16], t.data(), 16);
+                    else
+                        for (int k = 0; k < 4; k++)
+                        {
+                            const uint16_t h = FloatToHalf(t[k]);
+                            std::memcpy(&staging[i * 8 + k * 2], &h, 2);
+                        }
+                }
+            });
+            WGPUTexelCopyTextureInfo dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+            dst.texture = g.texture;
+            WGPUTexelCopyBufferLayout layout = WGPU_TEXEL_COPY_BUFFER_LAYOUT_INIT;
+            layout.bytesPerRow = tex.width * bpp;
+            layout.rowsPerImage = tex.height;
+            const WGPUExtent3D size = { tex.width, tex.height, 1 };
+            wgpuQueueWriteTexture(queue_, &dst, staging.data(), staging.size(), &layout, &size);
+            ++stats_.textureUploads;
+            // The GPU copy is what gets sampled from now on; the software cache keeps the
+            // entry (its hash detects changes) without the float texels.
+            if (!g_softKeepTexels)
+                std::vector<F4>().swap(const_cast<Texture&>(tex).texels);
+            return g;
+        }
+
+        RenderTarget* WebGpuBackend::Target(bool depth, const Surface& s, WGPUTextureFormat format)
+        {
+            if (!s.pitch)
+                return nullptr;
+            // Keyed in sample space (pitch x MSAA width): an MSAA view and a 1x view of the
+            // same EDRAM share a texture, as they share memory on the console.
+            const uint32_t samplePitch = s.pitch * s.scaleX;
+            const auto key = std::make_tuple(depth, s.baseTile, samplePitch, 1u, 1u, int(format));
+            auto& slot = targets_[key];
+            if (slot)
+                return slot.get();
+            auto rt = std::make_unique<RenderTarget>();
+            rt->depth = depth;
+            rt->format = format;
+            rt->baseTile = s.baseTile;
+            rt->width = samplePitch;
+            // As many sample rows as EDRAM could hold at this pitch (2048 at 1280 wide).
+            const uint64_t rows = uint64_t(kEdramTiles) * kTileSamples / samplePitch;
+            rt->height = uint32_t(std::clamp<uint64_t>(rows, 16, 4096));
+            WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
+            td.label = Str(depth ? "depth target" : "colour target");
+            td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc | WGPUTextureUsage_TextureBinding;
+            td.size = { rt->width, rt->height, 1 };
+            td.format = format;
+            rt->texture = wgpuDeviceCreateTexture(device_, &td);
+            rt->view = wgpuTextureCreateView(rt->texture, nullptr);
+            slot = std::move(rt);
+            return slot.get();
+        }
+
+        void WebGpuBackend::EnsureEncoder()
+        {
+            if (!encoder_)
+            {
+                WGPUCommandEncoderDescriptor d = WGPU_COMMAND_ENCODER_DESCRIPTOR_INIT;
+                encoder_ = wgpuDeviceCreateCommandEncoder(device_, &d);
+            }
+        }
+
+        void WebGpuBackend::EndPass()
+        {
+            if (pass_)
+            {
+                wgpuRenderPassEncoderEnd(pass_);
+                wgpuRenderPassEncoderRelease(pass_);
+                pass_ = nullptr;
+            }
+            std::fill(std::begin(passColor_), std::end(passColor_), nullptr);
+            passDepth_ = nullptr;
+        }
+
+        void WebGpuBackend::Submit()
+        {
+            EndPass();
+            if (encoder_)
+            {
+                WGPUCommandBufferDescriptor d = WGPU_COMMAND_BUFFER_DESCRIPTOR_INIT;
+                WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder_, &d);
+                wgpuQueueSubmit(queue_, 1, &commands);
+                wgpuCommandBufferRelease(commands);
+                wgpuCommandEncoderRelease(encoder_);
+                encoder_ = nullptr;
+                ++stats_.submits;
+            }
+            drawOffset_ = 0;
+            vertexOffset_ = 0;
+            vertexMemoryOffset_ = 0;
+            indexOffset_ = 0;
+            vertexUploads_.clear();
+        }
+
+        void WebGpuBackend::BeginPass(RenderTarget* const color[4], RenderTarget* depth)
+        {
+            if (pass_ && std::equal(color, color + 4, passColor_) && depth == passDepth_)
+                return;
+            EndPass();
+            EnsureEncoder();
+            WGPURenderPassColorAttachment attachments[4];
+            uint32_t count = 0;
+            for (int k = 0; k < 4; k++)
+            {
+                attachments[k] = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+                if (color[k])
+                {
+                    attachments[k].view = color[k]->view;
+                    attachments[k].loadOp = WGPULoadOp_Load;
+                    attachments[k].storeOp = WGPUStoreOp_Store;
+                    count = uint32_t(k + 1);
+                }
+            }
+            WGPURenderPassDepthStencilAttachment ds = WGPU_RENDER_PASS_DEPTH_STENCIL_ATTACHMENT_INIT;
+            if (depth)
+            {
+                ds.view = depth->view;
+                ds.depthLoadOp = WGPULoadOp_Load;
+                ds.depthStoreOp = WGPUStoreOp_Store;
+                ds.stencilLoadOp = WGPULoadOp_Load;
+                ds.stencilStoreOp = WGPUStoreOp_Store;
+            }
+            WGPURenderPassDescriptor d = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+            d.colorAttachmentCount = count;
+            d.colorAttachments = attachments;
+            d.depthStencilAttachment = depth ? &ds : nullptr;
+            pass_ = wgpuCommandEncoderBeginRenderPass(encoder_, &d);
+            std::copy(color, color + 4, passColor_);
+            passDepth_ = depth;
+        }
+
+        uint32_t WebGpuBackend::WriteDrawData(const float misc[4], const F4* xf, const F4* constants, uint32_t first, uint32_t count,
+            const uint32_t (*vertexFetch)[4])
+        {
+            if (drawOffset_ + kDrawDataStride > kDrawRingBytes)
+                Submit();
+            const uint32_t offset = uint32_t(drawOffset_);
+            static std::vector<uint8_t> image(kDrawDataBytes);
+            std::memset(image.data(), 0, image.size());
+            std::memcpy(image.data(), misc, 16);
+            if (xf)
+                std::memcpy(image.data() + 16, xf, 48);
+            if (constants && count)
+                std::memcpy(image.data() + 64 + size_t(first) * 16, constants, size_t(count) * 16);
+            if (vertexFetch)
+                std::memcpy(image.data() + 64 + 512 * 16, vertexFetch, 96 * 16);
+            wgpuQueueWriteBuffer(queue_, drawRing_, offset, image.data(), image.size());
+            stats_.drawDataBytes += image.size();
+            drawOffset_ += kDrawDataStride;
+            return offset;
+        }
+
+        // Copies guest memory holding vertex data into the vertex memory buffer (once per
+        // submit for each range) and returns its word offset there.
+        uint32_t WebGpuBackend::UploadVertexMemory(uint32_t address, uint32_t words)
+        {
+            const uint64_t key = (uint64_t(address) << 32) | words;
+            auto it = vertexUploads_.find(key);
+            if (it != vertexUploads_.end())
+                return it->second;
+            const uint64_t bytes = uint64_t(words) * 4;
+            if (bytes > kVertexMemoryBytes / 2)
+                return 0;
+            if (vertexMemoryOffset_ + bytes > kVertexMemoryBytes)
+                Submit();
+            const uint32_t wordOffset = uint32_t(vertexMemoryOffset_ / 4);
+            wgpuQueueWriteBuffer(queue_, vertexMemory_, vertexMemoryOffset_, guest::ToHost<const uint8_t>(address), bytes);
+            stats_.vertexBytes += bytes;
+            vertexMemoryOffset_ = (vertexMemoryOffset_ + bytes + 255) & ~255ull;
+            vertexUploads_[key] = wordOffset;
+            return wordOffset;
+        }
+
+        // ---- draws ------------------------------------------------------------------------
+
+        void WebGpuBackend::BeginDraw(const CaptureDraw& draw)
+        {
+            PrepareArgs args;
+            args.rs = draw.rs;
+            args.ps = draw.ps;
+            args.constants = draw.psConstants;
+            args.fetch = draw.fetch;
+            args.texture = &draw.texture;
+            if (!Prepare(args))
+                skip_ = true;
+        }
+
+        bool WebGpuBackend::DrawGpu(const GpuDrawRequest& request)
+        {
+            static const bool disabled = [] { const char* v = std::getenv("TTT2_GPU_CPU_VERTEX"); return v && *v == '1'; }();
+            if (disabled)
+                return false;
+            const RasterState& rs = *request.rs;
+            if (request.indices->empty() || (rs.cullFront && rs.cullBack))
+                return true;
+            PrepareArgs args;
+            args.rs = request.rs;
+            args.vs = request.vs;
+            args.ps = request.ps;
+            args.constants = request.constants;
+            args.fetch = request.fetch;
+            args.texture = &request.texture;
+            const auto [lo, hi] = std::minmax_element(request.indices->begin(), request.indices->end());
+            args.minIndex = *lo;
+            args.maxIndex = *hi;
+            if (!Prepare(args))
+                return false; // e.g. an unsupported vertex format: shade on the CPU
+            if (skip_ || !drawPipeline_)
+                return true;
+
+            const auto start = std::chrono::steady_clock::now();
+            const uint64_t bytes = request.indices->size() * sizeof(uint32_t);
+            if (bytes > kIndexRingBytes)
+                return true;
+            if (indexOffset_ + bytes > kIndexRingBytes)
+                Submit();
+            const uint64_t offset = indexOffset_;
+            wgpuQueueWriteBuffer(queue_, indexRing_, offset, request.indices->data(), bytes);
+            stats_.indexBytes += bytes;
+            indexOffset_ = (indexOffset_ + bytes + 255) & ~255ull;
+
+            BeginPass(drawColor_, drawDepth_);
+            const RenderTarget* rt = drawDepth_;
+            for (auto* t : drawColor_)
+                if (t && !rt)
+                    rt = t;
+            const int sx = int(scaleX_), sy = int(scaleY_);
+            const int x0 = std::clamp(rs.sx0 * sx, 0, int(rt->width)), y0 = std::clamp(rs.sy0 * sy, 0, int(rt->height));
+            const int x1 = std::clamp(rs.sx1 * sx, x0, int(rt->width)), y1 = std::clamp(rs.sy1 * sy, y0, int(rt->height));
+            if (x1 <= x0 || y1 <= y0)
+                return true;
+            wgpuRenderPassEncoderSetPipeline(pass_, drawPipeline_);
+            wgpuRenderPassEncoderSetBindGroup(pass_, 0, drawBindGroup_, 1, &drawDataOffset_);
+            wgpuRenderPassEncoderSetBindGroup(pass_, 1, drawTextures_, 0, nullptr);
+            wgpuRenderPassEncoderSetIndexBuffer(pass_, indexRing_, WGPUIndexFormat_Uint32, offset, bytes);
+            wgpuRenderPassEncoderSetViewport(pass_, 0, 0, float(rt->width), float(rt->height), 0.0f, 1.0f);
+            wgpuRenderPassEncoderSetScissorRect(pass_, uint32_t(x0), uint32_t(y0), uint32_t(x1 - x0), uint32_t(y1 - y0));
+            const WGPUColor blend = { rs.blendConstant[0], rs.blendConstant[1], rs.blendConstant[2], rs.blendConstant[3] };
+            wgpuRenderPassEncoderSetBlendConstant(pass_, &blend);
+            wgpuRenderPassEncoderSetStencilReference(pass_, rs.stencilFace[0].ref);
+            wgpuRenderPassEncoderDrawIndexed(pass_, uint32_t(request.indices->size()), 1, 0, 0, 0);
+            ++stats_.draws;
+            stats_.triangles += request.indices->size() / 3;
+            stats_.encodeNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+            return true;
+        }
+
+        bool WebGpuBackend::Prepare(const PrepareArgs& args)
+        {
+            const auto start = std::chrono::steady_clock::now();
+            const RasterState& rs = *args.rs;
+            rs_ = &rs;
+            skip_ = false;
+            gpuVertex_ = args.vs != nullptr;
+            scaleX_ = rs.color[0].scaleX;
+            scaleY_ = rs.color[0].scaleY;
+            vertices_.clear();
+            interpolatorMask_ = rs.interpolatorMask;
+
+            // Targets: colour for mode 4 (where a write mask is set), depth when tested,
+            // written or stencilled.
+            std::fill(std::begin(drawColor_), std::end(drawColor_), nullptr);
+            drawDepth_ = nullptr;
+            if (rs.mode == 4)
+                for (int k = 0; k < 4; k++)
+                    if ((rs.colorMask >> (k * 4)) & 0xF)
+                        drawColor_[k] = Target(false, rs.color[k], ColorFormat(rs.color[k].format));
+            if (rs.depthTest || rs.stencil)
+                drawDepth_ = Target(true, rs.depth, WGPUTextureFormat_Depth32FloatStencil8);
+            const RenderTarget* any = drawDepth_;
+            for (auto* c : drawColor_)
+                if (c && !any)
+                    any = c;
+            if (!any)
+            {
+                skip_ = true;
+                return true;
+            }
+            // All attachments of a pass must have the same size, and a target may be bound
+            // once (unused colour slots often still point at RT0's base): drop the rest.
+            for (int k = 0; k < 4; k++)
+            {
+                auto*& c = drawColor_[k];
+                if (c && (c->width != any->width || c->height != any->height))
+                    c = nullptr;
+                for (int j = 0; j < k && c; j++)
+                    if (drawColor_[j] == c)
+                        c = nullptr;
+            }
+
+            // ---- shader
+            WgslOptions options;
+            options.interpolatorMask = rs.interpolatorMask;
+            options.paramGen = rs.paramGen;
+            options.paramGenRegister = rs.paramGenRegister;
+            options.alphaFunc = rs.alphaTest ? rs.alphaFunc : 7;
+            for (int k = 0; k < 4; k++)
+                if (drawColor_[k])
+                    options.colorTargets |= 1u << k;
+            if (rs.mode == 4 && !args.ps)
+            {
+                static bool warned = false;
+                if (!warned)
+                {
+                    warned = true;
+                    std::fprintf(stderr, "[gpu] webgpu: pixel shader with predicate-driven flow not translated (colour skipped)\n");
+                }
+            }
+            // Slots whose texture is a GPU-resolved image: bound directly, swizzled in the shader.
+            ResolvedImage* gpuSlot[32] = {};
+            for (uint32_t slot = 0; slot < 32 && args.fetch; slot++)
+                if ((gpuSlot[slot] = ResolvedFor(args.fetch + slot * 6)))
+                    options.slotSwizzle[slot] = uint16_t((args.fetch[slot * 6 + 3] >> 1) & 0xFFF);
+            const bool hasFragment = rs.mode == 4 && options.colorTargets && args.ps;
+            // Translations are cached by the flattened instructions and the options that
+            // shape the generated code (building and hashing WGSL text per draw is costly).
+            uint64_t translationKey = HashShader(hasFragment ? args.ps : nullptr, HashShader(args.vs, 0x1234));
+            translationKey = Mix(translationKey, uint64_t(options.interpolatorMask) | (uint64_t(options.colorTargets) << 16) |
+                (uint64_t(options.alphaFunc) << 20) | (uint64_t(options.paramGen) << 24) | (uint64_t(options.paramGenRegister) << 32));
+            for (uint32_t k = 0; k < 32; k += 4)
+                translationKey = Mix(translationKey, options.slotSwizzle[k] | (uint64_t(options.slotSwizzle[k + 1]) << 16) |
+                    (uint64_t(options.slotSwizzle[k + 2]) << 32) | (uint64_t(options.slotSwizzle[k + 3]) << 48));
+            const auto tSetup = std::chrono::steady_clock::now();
+            stats_.setupNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(tSetup - start).count());
+            Translation& translation = translations_[translationKey];
+            if (!translation.key)
+            {
+                translation.shader = TranslateToWgsl(args.vs, hasFragment ? args.ps : nullptr, options);
+                translation.module = translation.shader.code.empty() ? nullptr : Module(translation.shader.code);
+                translation.key = translationKey | 1;
+                translation.shader.code.clear(); // only the module is needed from now on
+            }
+            if (!translation.module)
+                return false;
+            const WgslShader& shader = translation.shader;
+            interpolatorMask_ = shader.interpolators;
+            const WGPUShaderModule module = translation.module;
+            const uint32_t slots = hasFragment ? shader.textureSlots : 0;
+
+            // ---- pipeline
+            floatsPerVertex_ = 4;
+            std::vector<WGPUVertexAttribute> attributes;
+            {
+                WGPUVertexAttribute a = WGPU_VERTEX_ATTRIBUTE_INIT;
+                a.format = WGPUVertexFormat_Float32x4;
+                a.offset = 0;
+                a.shaderLocation = 0;
+                attributes.push_back(a);
+                uint32_t location = 1;
+                for (uint32_t i = 0; i < 16 && !gpuVertex_; i++)
+                    if (rs.interpolatorMask & (1u << i))
+                    {
+                        a.offset = floatsPerVertex_ * 4;
+                        a.shaderLocation = location++;
+                        attributes.push_back(a);
+                        floatsPerVertex_ += 4;
+                    }
+            }
+
+            std::string key;
+            auto add = [&](uint64_t v) { key.append(reinterpret_cast<const char*>(&v), sizeof(v)); };
+            add(translationKey);
+            add(rs.interpolatorMask);
+            add(hasFragment);
+            add(gpuVertex_);
+            add(gpuVertex_ ? (rs.cullFront | (rs.cullBack << 1) | (rs.frontCW << 2) | (rs.clip << 3)) : 0);
+            for (int k = 0; k < 4; k++)
+            {
+                add(drawColor_[k] ? uint64_t(drawColor_[k]->format) : 0);
+                add(drawColor_[k] && (shader.colorExports & (1u << k)) ? (rs.colorMask >> (k * 4)) & 0xF : 0);
+                add(drawColor_[k] ? rs.blend[k] : 0);
+                add(drawColor_[k] ? rs.color[k].format : 0);
+            }
+            add(drawDepth_ != nullptr);
+            add(rs.depthTest);
+            add(rs.depthWrite);
+            add(rs.depthFunc);
+            add(rs.stencil);
+            for (const auto& f : rs.stencilFace)
+            {
+                add(f.func);
+                add(f.fail);
+                add(f.zpass);
+                add(f.zfail);
+            }
+            add(rs.stencilFace[0].mask);
+            add(rs.stencilFace[0].writeMask);
+
+            WGPURenderPipeline& pipeline = pipelines_[key];
+            if (!pipeline)
+            {
+                WGPUVertexBufferLayout vbl = WGPU_VERTEX_BUFFER_LAYOUT_INIT;
+                vbl.stepMode = WGPUVertexStepMode_Vertex;
+                vbl.arrayStride = floatsPerVertex_ * 4;
+                vbl.attributeCount = attributes.size();
+                vbl.attributes = attributes.data();
+
+                WGPURenderPipelineDescriptor pd = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+                pd.layout = PipelineLayout(slots);
+                pd.vertex.module = module;
+                pd.vertex.entryPoint = Str("vs");
+                pd.vertex.bufferCount = gpuVertex_ ? 0 : 1;
+                pd.vertex.buffers = gpuVertex_ ? nullptr : &vbl;
+                pd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+                if (gpuVertex_)
+                {
+                    // Xenos faces: clockwise on screen are front when PA_SU_SC_MODE_CNTL.FACE.
+                    pd.primitive.frontFace = rs.frontCW ? WGPUFrontFace_CW : WGPUFrontFace_CCW;
+                    pd.primitive.cullMode = rs.cullFront ? WGPUCullMode_Front : rs.cullBack ? WGPUCullMode_Back : WGPUCullMode_None;
+                    pd.primitive.unclippedDepth = !rs.clip && depthClipControl_;
+                }
+                else
+                {
+                    pd.primitive.frontFace = WGPUFrontFace_CCW;
+                    pd.primitive.cullMode = WGPUCullMode_None; // the front end culls
+                    pd.primitive.unclippedDepth = depthClipControl_;
+                }
+                pd.multisample.count = 1;
+                pd.multisample.mask = 0xFFFFFFFF;
+
+                WGPUDepthStencilState dss = WGPU_DEPTH_STENCIL_STATE_INIT;
+                if (drawDepth_)
+                {
+                    dss.format = drawDepth_->format;
+                    dss.depthWriteEnabled = rs.depthWrite ? WGPUOptionalBool_True : WGPUOptionalBool_False;
+                    dss.depthCompare = rs.depthTest ? Compare(rs.depthFunc) : WGPUCompareFunction_Always;
+                    auto face = [&](const RasterState::StencilFace& f) {
+                        WGPUStencilFaceState s = WGPU_STENCIL_FACE_STATE_INIT;
+                        if (rs.stencil)
+                        {
+                            s.compare = Compare(f.func);
+                            s.failOp = StencilOp(f.fail);
+                            s.depthFailOp = StencilOp(f.zfail);
+                            s.passOp = StencilOp(f.zpass);
+                        }
+                        else
+                        {
+                            s.compare = WGPUCompareFunction_Always;
+                            s.failOp = s.depthFailOp = s.passOp = WGPUStencilOperation_Keep;
+                        }
+                        return s;
+                    };
+                    dss.stencilFront = face(rs.stencilFace[0]);
+                    dss.stencilBack = face(rs.stencilFace[1]);
+                    dss.stencilReadMask = rs.stencil ? rs.stencilFace[0].mask : 0xFF;
+                    dss.stencilWriteMask = rs.stencil ? rs.stencilFace[0].writeMask : 0;
+                    pd.depthStencil = &dss;
+                }
+
+                WGPUColorTargetState targets[4];
+                WGPUBlendState blends[4];
+                uint32_t targetCount = 0;
+                for (int k = 0; k < 4; k++)
+                {
+                    targets[k] = WGPU_COLOR_TARGET_STATE_INIT;
+                    if (!drawColor_[k])
+                    {
+                        targets[k].format = WGPUTextureFormat_Undefined;
+                        continue;
+                    }
+                    targetCount = uint32_t(k + 1);
+                    targets[k].format = drawColor_[k]->format;
+                    targets[k].writeMask = (shader.colorExports & (1u << k)) ? WGPUColorWriteMask((rs.colorMask >> (k * 4)) & 0xF) : WGPUColorWriteMask_None;
+                    const bool floatTarget = drawColor_[k]->format == WGPUTextureFormat_RGBA32Float;
+                    if (!BlendIsReplace(rs.blend[k]) && !floatTarget)
+                    {
+                        const uint32_t c = rs.blend[k];
+                        blends[k].color = { BlendOp((c >> 5) & 7), BlendFactor(c & 0x1F), BlendFactor((c >> 8) & 0x1F) };
+                        blends[k].alpha = { BlendOp((c >> 21) & 7), BlendFactor((c >> 16) & 0x1F), BlendFactor((c >> 24) & 0x1F) };
+                        // min/max ignore their factors on Xenos; WebGPU requires One.
+                        for (WGPUBlendComponent* bc : { &blends[k].color, &blends[k].alpha })
+                            if (bc->operation == WGPUBlendOperation_Min || bc->operation == WGPUBlendOperation_Max)
+                                bc->srcFactor = bc->dstFactor = WGPUBlendFactor_One;
+                        targets[k].blend = &blends[k];
+                    }
+                }
+                WGPUFragmentState fs = WGPU_FRAGMENT_STATE_INIT;
+                fs.module = module;
+                fs.entryPoint = Str("fs");
+                fs.targetCount = targetCount;
+                fs.targets = targets;
+                pd.fragment = (hasFragment || shader.depthExport) ? &fs : nullptr;
+                if (!pd.fragment && targetCount)
+                {
+                    // Colour targets bound without a pixel shader: write nothing to them.
+                    for (uint32_t k = 0; k < targetCount; k++)
+                        targets[k].writeMask = WGPUColorWriteMask_None;
+                    pd.fragment = &fs;
+                }
+                pipeline = wgpuDeviceCreateRenderPipeline(device_, &pd);
+                ++stats_.pipelinesCreated;
+            }
+            drawPipeline_ = pipeline;
+
+            const auto tPipeline = std::chrono::steady_clock::now();
+            stats_.pipelineNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(tPipeline - tSetup).count());
+            // ---- constants, vertex memory and textures
+            const float misc[4] = { rs.alphaRef, 0, 0, 0 };
+            if (gpuVertex_)
+            {
+                const RenderTarget* rt = drawDepth_;
+                for (auto* t : drawColor_)
+                    if (t && !rt)
+                        rt = t;
+                // Screen = position * scale + offset (+ window offset); WebGPU samples pixel
+                // centres at +0.5 where Xenos samples at +pixelCenter.
+                const float shift = 0.5f - rs.pixelCenter;
+                const float wx = rs.windowOffset ? rs.windowX : 0.0f, wy = rs.windowOffset ? rs.windowY : 0.0f;
+                const F4 xf[3] = {
+                    F4{ rs.scale[0] * float(scaleX_), (rs.offset[0] + wx + shift) * float(scaleX_),
+                        rs.scale[1] * float(scaleY_), (rs.offset[1] + wy + shift) * float(scaleY_) },
+                    F4{ rs.scale[2], rs.offset[2], float(rt->width), float(rt->height) },
+                    // VTX_W0_FMT only describes what the rasteriser receives: shaders export W,
+                    // so it is ignored, as in the software front end.
+                    F4{ (rs.vte >> 8) & 1 ? 1.0f : 0.0f, (rs.vte >> 9) & 1 ? 1.0f : 0.0f, 0.0f, 0.0f },
+                };
+                uint32_t vertexFetch[96][4] = {};
+                for (uint32_t slot = 0; slot < 96; slot++)
+                {
+                    if (!((shader.vertexSlots[slot / 64] >> (slot % 64)) & 1))
+                        continue;
+                    const uint32_t d0 = args.fetch[slot * 2], d1 = args.fetch[slot * 2 + 1];
+                    const uint32_t words = (d1 >> 2) & 0xFFFFFF;
+                    const auto& range = shader.slotRange[slot];
+                    if (!words || range.end <= range.first)
+                        continue;
+                    // Only the dwords this draw's indices reach, clipped to the buffer.
+                    const int64_t first = std::max<int64_t>(0, int64_t(args.minIndex) * range.stride + range.first);
+                    const int64_t end = std::min<int64_t>(words, int64_t(args.maxIndex) * range.stride + range.end);
+                    if (end <= first)
+                        continue;
+                    const uint32_t base = PhysicalToGuest(d0 & 0xFFFFFFFCu);
+                    const uint32_t uploaded = UploadVertexMemory(base + uint32_t(first) * 4, uint32_t(end - first));
+                    vertexFetch[slot][0] = uint32_t(int64_t(uploaded) - first); // where dword 0 would be
+                    vertexFetch[slot][1] = d1 & 3;
+                }
+                drawDataOffset_ = WriteDrawData(misc, xf, args.constants, 0, 512, vertexFetch);
+            }
+            else
+            {
+                drawDataOffset_ = WriteDrawData(misc, nullptr, hasFragment ? args.constants : nullptr, 256, hasFragment ? 256 : 0);
+            }
+
+            const auto tData = std::chrono::steady_clock::now();
+            stats_.dataNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(tData - tPipeline).count());
+            if (bindGroupsDirty_)
+            {
+                for (auto& [k, group] : bindGroups_)
+                    wgpuBindGroupRelease(group);
+                bindGroups_.clear();
+                bindGroupsDirty_ = false;
+            }
+            drawTextures_ = nullptr;
+            std::vector<WGPUBindGroupEntry> entries;
+            for (uint32_t slot = 0; slot < 32; slot++)
+            {
+                if (!(slots & (1u << slot)))
+                    continue;
+                WGPUBindGroupEntry t = WGPU_BIND_GROUP_ENTRY_INIT;
+                t.binding = slot * 2;
+                WGPUBindGroupEntry s = WGPU_BIND_GROUP_ENTRY_INIT;
+                s.binding = slot * 2 + 1;
+                if (gpuSlot[slot])
+                {
+                    const uint32_t* f = args.fetch + slot * 6;
+                    t.textureView = ResolvedView(*gpuSlot[slot], (f[2] & 0x1FFF) + 1, ((f[2] >> 13) & 0x1FFF) + 1);
+                    s.sampler = Sampler((f[0] >> 10) & 7, (f[0] >> 13) & 7, ((f[3] >> 19) & 3) == 1);
+                    ++stats_.gpuResolveBinds;
+                }
+                else
+                {
+                    const Texture& tex = (*args.texture)(slot);
+                    t.textureView = Upload(tex).view;
+                    s.sampler = Sampler(tex);
+                }
+                entries.push_back(t);
+                entries.push_back(s);
+            }
+            WGPUBindGroupDescriptor bgd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+            bgd.layout = TextureLayout(slots);
+            bgd.entryCount = entries.size();
+            bgd.entries = entries.data();
+            uint64_t groupKey = Mix(0x77, slots);
+            for (const WGPUBindGroupEntry& entry : entries)
+                groupKey = Mix(groupKey, reinterpret_cast<uintptr_t>(entry.textureView ? static_cast<void*>(entry.textureView)
+                                                                                          : static_cast<void*>(entry.sampler)));
+            WGPUBindGroup& group = bindGroups_[groupKey];
+            if (!group)
+                group = wgpuDeviceCreateBindGroup(device_, &bgd);
+            drawTextures_ = group;
+            stats_.bindNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tData).count());
+            stats_.encodeNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+            return true;
+        }
+
+        void WebGpuBackend::Triangle(const CaptureVertex& a, const CaptureVertex& b, const CaptureVertex& c, bool front)
+        {
+            if (skip_)
+                return;
+            const RasterState& rs = *rs_;
+            const RenderTarget* rt = drawDepth_;
+            for (auto* t : drawColor_)
+                if (t && !rt)
+                    rt = t;
+            const float width = float(rt->width), height = float(rt->height);
+            // Xenos samples pixel p at p + pixelCenter, WebGPU at p + 0.5.
+            const float shift = 0.5f - rs.pixelCenter;
+
+            const CaptureVertex* v[3] = { &a, &b, &c };
+            float ndc[3][2];
+            for (int i = 0; i < 3; i++)
+            {
+                ndc[i][0] = (v[i]->x + shift) * float(scaleX_) / width * 2.0f - 1.0f;
+                ndc[i][1] = 1.0f - (v[i]->y + shift) * float(scaleY_) / height * 2.0f;
+            }
+            // Front faces wind counter-clockwise in NDC for the pipeline (two-sided stencil).
+            const float area = (ndc[1][0] - ndc[0][0]) * (ndc[2][1] - ndc[0][1]) - (ndc[2][0] - ndc[0][0]) * (ndc[1][1] - ndc[0][1]);
+            int order[3] = { 0, 1, 2 };
+            if ((area > 0.0f) != front)
+                std::swap(order[1], order[2]);
+
+            for (int o = 0; o < 3; o++)
+            {
+                const int i = order[o];
+                const CaptureVertex& cv = *v[i];
+                const float w = (cv.invW != 0.0f && std::isfinite(cv.invW)) ? 1.0f / cv.invW : 1.0f;
+                vertices_.push_back(ndc[i][0] * w);
+                vertices_.push_back(ndc[i][1] * w);
+                vertices_.push_back(cv.z * w);
+                vertices_.push_back(w);
+                for (uint32_t k = 0; k < 16; k++)
+                    if (interpolatorMask_ & (1u << k))
+                        vertices_.insert(vertices_.end(), cv.interpolators[k].begin(), cv.interpolators[k].end());
+            }
+            ++stats_.triangles;
+        }
+
+        void WebGpuBackend::EndDraw()
+        {
+            if (skip_ || vertices_.empty() || !drawPipeline_)
+                return;
+            const auto start = std::chrono::steady_clock::now();
+            const RasterState& rs = *rs_;
+            const uint64_t bytes = vertices_.size() * sizeof(float);
+            if (bytes > kVertexRingBytes)
+                return;
+            if (vertexOffset_ + bytes > kVertexRingBytes)
+                Submit();
+            const uint64_t offset = vertexOffset_;
+            wgpuQueueWriteBuffer(queue_, vertexRing_, offset, vertices_.data(), bytes);
+            vertexOffset_ = (vertexOffset_ + bytes + 255) & ~255ull;
+
+            BeginPass(drawColor_, drawDepth_);
+            const RenderTarget* rt = drawDepth_;
+            for (auto* t : drawColor_)
+                if (t && !rt)
+                    rt = t;
+            wgpuRenderPassEncoderSetPipeline(pass_, drawPipeline_);
+            wgpuRenderPassEncoderSetBindGroup(pass_, 0, drawBindGroup_, 1, &drawDataOffset_);
+            wgpuRenderPassEncoderSetBindGroup(pass_, 1, drawTextures_, 0, nullptr);
+            wgpuRenderPassEncoderSetVertexBuffer(pass_, 0, vertexRing_, offset, bytes);
+            wgpuRenderPassEncoderSetViewport(pass_, 0, 0, float(rt->width), float(rt->height), 0.0f, 1.0f);
+            const int sx = int(scaleX_), sy = int(scaleY_);
+            const int x0 = std::clamp(rs.sx0 * sx, 0, int(rt->width)), y0 = std::clamp(rs.sy0 * sy, 0, int(rt->height));
+            const int x1 = std::clamp(rs.sx1 * sx, x0, int(rt->width)), y1 = std::clamp(rs.sy1 * sy, y0, int(rt->height));
+            if (x1 <= x0 || y1 <= y0)
+                return;
+            wgpuRenderPassEncoderSetScissorRect(pass_, uint32_t(x0), uint32_t(y0), uint32_t(x1 - x0), uint32_t(y1 - y0));
+            const WGPUColor blend = { rs.blendConstant[0], rs.blendConstant[1], rs.blendConstant[2], rs.blendConstant[3] };
+            wgpuRenderPassEncoderSetBlendConstant(pass_, &blend);
+            wgpuRenderPassEncoderSetStencilReference(pass_, rs.stencilFace[0].ref);
+            wgpuRenderPassEncoderDraw(pass_, uint32_t(vertices_.size() / floatsPerVertex_), 1, 0, 0);
+            ++stats_.draws;
+            stats_.encodeNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+        }
+
+        // ---- resolves -------------------------------------------------------------------------
+
+        void WebGpuBackend::ReadTexture(WGPUTexture texture, WGPUTextureAspect aspect, uint32_t bytesPerPixel, int x0, int y0, int w, int h,
+            std::vector<uint8_t>& out, uint32_t& rowBytes)
+        {
+            const auto start = std::chrono::steady_clock::now();
+            rowBytes = (uint32_t(w) * bytesPerPixel + 255) & ~255u;
+            const uint64_t size = uint64_t(rowBytes) * uint32_t(h);
+            if (size > readbackSize_)
+            {
+                if (readback_)
+                    wgpuBufferRelease(readback_);
+                WGPUBufferDescriptor bd = WGPU_BUFFER_DESCRIPTOR_INIT;
+                bd.label = Str("readback");
+                bd.usage = WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst;
+                bd.size = (size + 0xFFFF) & ~0xFFFFull;
+                readback_ = wgpuDeviceCreateBuffer(device_, &bd);
+                readbackSize_ = bd.size;
+            }
+            EndPass();
+            EnsureEncoder();
+            WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+            src.texture = texture;
+            src.origin = { uint32_t(x0), uint32_t(y0), 0 };
+            src.aspect = aspect;
+            WGPUTexelCopyBufferInfo dst = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
+            dst.buffer = readback_;
+            dst.layout.bytesPerRow = rowBytes;
+            dst.layout.rowsPerImage = uint32_t(h);
+            const WGPUExtent3D extent = { uint32_t(w), uint32_t(h), 1 };
+            wgpuCommandEncoderCopyTextureToBuffer(encoder_, &src, &dst, &extent);
+            Submit();
+
+            struct MapResult { bool done = false; bool ok = false; } mr;
+            WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
+            cb.mode = WGPUCallbackMode_AllowProcessEvents;
+            cb.callback = [](WGPUMapAsyncStatus status, WGPUStringView, void* u1, void*) {
+                auto* r = static_cast<MapResult*>(u1);
+                r->ok = status == WGPUMapAsyncStatus_Success;
+                r->done = true;
+            };
+            cb.userdata1 = &mr;
+            wgpuBufferMapAsync(readback_, WGPUMapMode_Read, 0, size_t(size), cb);
+            while (!mr.done)
+            {
+#ifndef __EMSCRIPTEN__
+                wgpuDevicePoll(device_, true, nullptr);
+#endif
+                wgpuInstanceProcessEvents(instance_);
+            }
+            out.resize(size_t(size));
+            if (mr.ok)
+            {
+                std::memcpy(out.data(), wgpuBufferGetConstMappedRange(readback_, 0, size_t(size)), size_t(size));
+                wgpuBufferUnmap(readback_);
+            }
+            ++stats_.readbacks;
+            stats_.readbackNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+        }
+
+        void WebGpuBackend::ReadColor(const RasterState& rs, uint32_t rtIndex, int x0, int y0, int x1, int y1, std::vector<F4>& out)
+        {
+            const int w = x1 - x0, h = y1 - y0;
+            out.assign(size_t(w) * h, F4{ 0, 0, 0, 0 });
+            const Surface& s = rs.color[rtIndex & 3];
+            RenderTarget* rt = Target(false, s, ColorFormat(s.format));
+            if (!rt)
+                return;
+            const int sx = int(s.scaleX), sy = int(s.scaleY);
+            // Sample rectangle covering the pixels, clipped to the texture.
+            const int ax0 = x0 * sx, ay0 = y0 * sy;
+            const int ax1 = std::min(x1 * sx, int(rt->width)), ay1 = std::min(y1 * sy, int(rt->height));
+            if (ax1 <= ax0 || ay1 <= ay0)
+                return;
+            const bool wide = rt->format == WGPUTextureFormat_RGBA32Float;
+            const bool unorm8 = rt->format == WGPUTextureFormat_RGBA8Unorm;
+            const bool unorm10 = rt->format == WGPUTextureFormat_RGB10A2Unorm;
+            const uint32_t bpp = wide ? 16 : (unorm8 || unorm10) ? 4 : 8;
+            std::vector<uint8_t> data;
+            uint32_t rowBytes = 0;
+            ReadTexture(rt->texture, WGPUTextureAspect_All, bpp, ax0, ay0, ax1 - ax0, ay1 - ay0, data, rowBytes);
+            auto sample = [&](int ax, int ay) {
+                const uint8_t* at = data.data() + size_t(ay - ay0) * rowBytes + size_t(ax - ax0) * bpp;
+                F4 c;
+                if (wide)
+                    std::memcpy(c.data(), at, 16);
+                else if (unorm8)
+                    for (int k = 0; k < 4; k++)
+                        c[k] = float(at[k]) / 255.0f;
+                else if (unorm10)
+                {
+                    uint32_t v;
+                    std::memcpy(&v, at, 4);
+                    c = { float(v & 0x3FF) / 1023.0f, float((v >> 10) & 0x3FF) / 1023.0f, float((v >> 20) & 0x3FF) / 1023.0f, float(v >> 30) / 3.0f };
+                }
+                else
+                    for (int k = 0; k < 4; k++)
+                    {
+                        uint16_t hbits;
+                        std::memcpy(&hbits, at + k * 2, 2);
+                        c[k] = HalfToFloat(hbits);
+                    }
+                return c;
+            };
+            const int pw = (ax1 - ax0 + sx - 1) / sx, ph = (ay1 - ay0 + sy - 1) / sy;
+            SoftParallelFor(uint32_t(ph), [&](uint32_t row) {
+                for (int x = 0; x < pw; x++)
+                {
+                    F4 sum{ 0, 0, 0, 0 };
+                    int n = 0;
+                    for (int j = 0; j < sy; j++)
+                        for (int i = 0; i < sx; i++)
+                        {
+                            const int ax = (x0 + x) * sx + i, ay = (y0 + int(row)) * sy + j;
+                            if (ax >= ax1 || ay >= ay1)
+                                continue;
+                            const F4 c = sample(ax, ay);
+                            for (int k = 0; k < 4; k++)
+                                sum[k] += c[k];
+                            ++n;
+                        }
+                    F4& c = out[size_t(row) * w + x];
+                    for (int k = 0; k < 4; k++)
+                        c[k] = n ? sum[k] / float(n) : 0.0f;
+                    if (IsUnormColor(s.format))
+                        for (float& v : c)
+                            v = std::clamp(v, 0.0f, 1.0f);
+                }
+            });
+        }
+
+        void WebGpuBackend::ReadDepth(const RasterState& rs, int x0, int y0, int x1, int y1, std::vector<float>& depth, std::vector<uint8_t>& stencil)
+        {
+            const int w = x1 - x0, h = y1 - y0;
+            depth.assign(size_t(w) * h, 0.0f);
+            stencil.assign(size_t(w) * h, 0);
+            RenderTarget* rt = Target(true, rs.depth, WGPUTextureFormat_Depth32FloatStencil8);
+            if (!rt)
+                return;
+            const int sx = int(rs.depth.scaleX), sy = int(rs.depth.scaleY);
+            // Depth/stencil formats only copy whole subresources: read it all, then take
+            // sample 0 of each pixel.
+            std::vector<uint8_t> data;
+            uint32_t rowBytes = 0;
+            ReadTexture(rt->texture, WGPUTextureAspect_DepthOnly, 4, 0, 0, int(rt->width), int(rt->height), data, rowBytes);
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++)
+                {
+                    const int ax = (x0 + x) * sx, ay = (y0 + y) * sy;
+                    if (ax < int(rt->width) && ay < int(rt->height))
+                        std::memcpy(&depth[size_t(y) * w + x], data.data() + size_t(ay) * rowBytes + size_t(ax) * 4, 4);
+                }
+            ReadTexture(rt->texture, WGPUTextureAspect_StencilOnly, 1, 0, 0, int(rt->width), int(rt->height), data, rowBytes);
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++)
+                {
+                    const int ax = (x0 + x) * sx, ay = (y0 + y) * sy;
+                    if (ax < int(rt->width) && ay < int(rt->height))
+                        stencil[size_t(y) * w + x] = data[size_t(ay) * rowBytes + size_t(ax)];
+                }
+        }
+
+        void WebGpuBackend::ClearRect(RenderTarget* rt, int x0, int y0, int x1, int y1, const F4& color, float depth, uint8_t stencil)
+        {
+            x0 = std::clamp(x0, 0, int(rt->width));
+            x1 = std::clamp(x1, x0, int(rt->width));
+            y0 = std::clamp(y0, 0, int(rt->height));
+            y1 = std::clamp(y1, y0, int(rt->height));
+            if (x1 <= x0 || y1 <= y0)
+                return;
+
+            std::string key = rt->depth ? "clear depth" : "clear colour";
+            key += std::to_string(int(rt->format));
+            WGPURenderPipeline& pipeline = pipelines_[key];
+            if (!pipeline)
+            {
+                WGPURenderPipelineDescriptor pd = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+                pd.layout = PipelineLayout(0);
+                pd.vertex.module = clearModule_;
+                pd.vertex.entryPoint = Str("vs");
+                pd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+                pd.multisample.count = 1;
+                pd.multisample.mask = 0xFFFFFFFF;
+                WGPUDepthStencilState dss = WGPU_DEPTH_STENCIL_STATE_INIT;
+                WGPUColorTargetState target = WGPU_COLOR_TARGET_STATE_INIT;
+                WGPUFragmentState fs = WGPU_FRAGMENT_STATE_INIT;
+                if (rt->depth)
+                {
+                    dss.format = rt->format;
+                    dss.depthWriteEnabled = WGPUOptionalBool_True;
+                    dss.depthCompare = WGPUCompareFunction_Always;
+                    dss.stencilFront.compare = dss.stencilBack.compare = WGPUCompareFunction_Always;
+                    dss.stencilFront.passOp = dss.stencilBack.passOp = WGPUStencilOperation_Replace;
+                    dss.stencilReadMask = 0xFF;
+                    dss.stencilWriteMask = 0xFF;
+                    pd.depthStencil = &dss;
+                }
+                else
+                {
+                    target.format = rt->format;
+                    fs.module = clearModule_;
+                    fs.entryPoint = Str("fs");
+                    fs.targetCount = 1;
+                    fs.targets = &target;
+                    pd.fragment = &fs;
+                }
+                pipeline = wgpuDeviceCreateRenderPipeline(device_, &pd);
+                ++stats_.pipelinesCreated;
+            }
+
+            F4 constant{ depth, 0, 0, 0 };
+            const uint32_t offset = WriteDrawData(color.data(), nullptr, &constant, 0, 1);
+            RenderTarget* color4[4] = { rt->depth ? nullptr : rt, nullptr, nullptr, nullptr };
+            BeginPass(color4, rt->depth ? rt : nullptr);
+            wgpuRenderPassEncoderSetPipeline(pass_, pipeline);
+            wgpuRenderPassEncoderSetBindGroup(pass_, 0, drawBindGroup_, 1, &offset);
+            WGPUBindGroupDescriptor bgd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+            bgd.layout = TextureLayout(0);
+            WGPUBindGroup empty = wgpuDeviceCreateBindGroup(device_, &bgd);
+            wgpuRenderPassEncoderSetBindGroup(pass_, 1, empty, 0, nullptr);
+            wgpuRenderPassEncoderSetViewport(pass_, 0, 0, float(rt->width), float(rt->height), 0.0f, 1.0f);
+            wgpuRenderPassEncoderSetScissorRect(pass_, uint32_t(x0), uint32_t(y0), uint32_t(x1 - x0), uint32_t(y1 - y0));
+            wgpuRenderPassEncoderSetStencilReference(pass_, stencil);
+            wgpuRenderPassEncoderDraw(pass_, 3, 1, 0, 0);
+            wgpuBindGroupRelease(empty);
+            ++stats_.clears;
+        }
+
+        void WebGpuBackend::ClearColor(const RasterState& rs, uint32_t rtIndex, int x0, int y0, int x1, int y1, const F4& color)
+        {
+            const Surface& s = rs.color[rtIndex & 3];
+            Target(false, s, ColorFormat(s.format));
+            // Clear every colour view of this EDRAM base (aliasing through other pitches).
+            for (auto& [key, rt] : targets_)
+                if (!rt->depth && rt->baseTile == s.baseTile)
+                    ClearRect(rt.get(), x0 * int(s.scaleX), y0 * int(s.scaleY), x1 * int(s.scaleX), y1 * int(s.scaleY), color, 0.0f, 0);
+        }
+
+        void WebGpuBackend::ClearDepth(const RasterState& rs, int x0, int y0, int x1, int y1, float depth, uint8_t stencil)
+        {
+            Target(true, rs.depth, WGPUTextureFormat_Depth32FloatStencil8);
+            for (auto& [key, rt] : targets_)
+                if (rt->depth && rt->baseTile == rs.depth.baseTile)
+                    ClearRect(rt.get(), x0 * int(rs.depth.scaleX), y0 * int(rs.depth.scaleY), x1 * int(rs.depth.scaleX),
+                        y1 * int(rs.depth.scaleY), F4{ 0, 0, 0, 0 }, depth, stencil);
+        }
+
+        bool WebGpuBackend::ResolveToGpu(const ResolveRequest& r)
+        {
+            static const bool disabled = [] { const char* v = std::getenv("TTT2_GPU_CPU_RESOLVE"); return v && *v == '1'; }();
+            const bool depthSource = r.source >= 4;
+            if (disabled || g_softKeepTexels || !GpuResolvableFormat(r.destFormat) || (depthSource && r.destFormat != 6))
+            {
+                // TTT2_GPU_STATS: say once which kinds of resolve still go through the CPU.
+                static std::map<std::pair<uint32_t, uint32_t>, bool> reported;
+                static const bool log = [] { const char* v = std::getenv("TTT2_GPU_STATS"); return v && *v == '1'; }();
+                if (log && !reported[{ r.source, r.destFormat }])
+                {
+                    reported[{ r.source, r.destFormat }] = true;
+                    std::fprintf(stderr, "[gpu] webgpu: CPU resolve: source %u (format %u) -> texture format %u, %ux%u\n", r.source,
+                        r.source < 4 ? r.rs->color[r.source].format : 0u, r.destFormat, r.destPitch, r.destHeight);
+                }
+                return false;
+            }
+            const RasterState& rs = *r.rs;
+            const Surface& surface = depthSource ? rs.depth : rs.color[r.source];
+            RenderTarget* rt = depthSource ? Target(true, rs.depth, WGPUTextureFormat_Depth32FloatStencil8)
+                                           : Target(false, surface, ColorFormat(surface.format));
+            if (!rt)
+                return false;
+            const uint32_t width = r.destPitch;
+            const uint32_t height = r.destHeight ? r.destHeight : uint32_t(std::max(0, r.y1 - r.offsetY));
+            if (!width || !height || width > 8192 || height > 8192)
+                return false;
+
+            ResolvedImage& image = resolved_[r.destBase];
+            if (!image.texture || image.width != width || image.height != height)
+            {
+                if (image.view)
+                    ReleaseView(image.view);
+                if (image.texture)
+                    wgpuTextureRelease(image.texture);
+                for (auto& [size, e] : image.exact)
+                {
+                    ReleaseView(e.texture.view);
+                    wgpuTextureRelease(e.texture.texture);
+                }
+                image.exact.clear();
+                WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
+                td.label = Str("resolved image");
+                td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopySrc | WGPUTextureUsage_CopyDst;
+                td.size = { width, height, 1 };
+                td.format = WGPUTextureFormat_RGBA16Float;
+                image.texture = wgpuDeviceCreateTexture(device_, &td);
+                image.view = wgpuTextureCreateView(image.texture, nullptr);
+                image.width = width;
+                image.height = height;
+            }
+            image.format = r.destFormat;
+            image.endian = r.endian;
+            ++image.generation;
+            image.lastResolveFrame = frame_;
+
+            const int dx0 = std::clamp(r.x0 - r.offsetX, 0, int(width)), dy0 = std::clamp(r.y0 - r.offsetY, 0, int(height));
+            const int dx1 = std::clamp(r.x1 - r.offsetX, dx0, int(width)), dy1 = std::clamp(r.y1 - r.offsetY, dy0, int(height));
+            if (dx1 <= dx0 || dy1 <= dy0)
+                return true;
+
+            // Per-channel bits and the component layout a fetch of this format decodes.
+            F4 bits{ 0, 0, 0, 0 };
+            float layout = 0.0f;
+            switch (r.destFormat)
+            {
+            case 2: bits = { 8, 0, 0, 0 }; layout = 1.0f; break;
+            case 4: bits = { 5, 6, 5, 0 }; layout = 3.0f; break;
+            case 6: bits = { 8, 8, 8, 8 }; break;
+            case 7: bits = { 10, 10, 10, 2 }; break;
+            case 10: bits = { 8, 8, 0, 0 }; layout = 2.0f; break;
+            case 25: case 26: bits = { 16, 16, 16, 16 }; break;
+            default: break; // half floats: the image format rounds them
+            }
+            const F4 constants[4] = {
+                F4{ float(r.offsetX), float(r.offsetY), (!depthSource && surface.format == 1) ? 1.0f : 0.0f, std::ldexp(1.0f, r.expBias) },
+                F4{ depthSource ? (r.floatDepth ? 1.0f : 0.0f) : (r.swapRB ? 1.0f : 0.0f), layout, float(surface.scaleX), float(surface.scaleY) },
+                bits,
+                F4{ (r.sampleSelect >= 4 && surface.scaleX * surface.scaleY > 1) ? 1.0f : 0.0f,
+                    float(r.sampleSelect < surface.scaleX * surface.scaleY ? r.sampleSelect : 0), 0, 0 },
+            };
+            const float misc[4] = {};
+            const uint32_t offset = WriteDrawData(misc, nullptr, constants, 0, 4);
+
+            EndPass();
+            EnsureEncoder();
+            WGPURenderPassColorAttachment attachment = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+            attachment.view = image.view;
+            attachment.loadOp = WGPULoadOp_Load;
+            attachment.storeOp = WGPUStoreOp_Store;
+            WGPURenderPassDescriptor pd = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+            pd.colorAttachmentCount = 1;
+            pd.colorAttachments = &attachment;
+            WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(encoder_, &pd);
+            WGPUBindGroupEntry e[2] = { WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT };
+            WGPUTextureView aspectViews[2] = {};
+            WGPUBindGroupDescriptor bgd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+            if (depthSource)
+            {
+                WGPUTextureViewDescriptor vd = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+                vd.aspect = WGPUTextureAspect_DepthOnly;
+                aspectViews[0] = wgpuTextureCreateView(rt->texture, &vd);
+                vd.aspect = WGPUTextureAspect_StencilOnly;
+                aspectViews[1] = wgpuTextureCreateView(rt->texture, &vd);
+                e[0].binding = 0;
+                e[0].textureView = aspectViews[0];
+                e[1].binding = 1;
+                e[1].textureView = aspectViews[1];
+                bgd.layout = resolveDepthLayout_;
+                bgd.entryCount = 2;
+            }
+            else
+            {
+                e[0].binding = 0;
+                e[0].textureView = rt->view;
+                bgd.layout = resolveSourceLayout_;
+                bgd.entryCount = 1;
+            }
+            bgd.entries = e;
+            WGPUBindGroup source = wgpuDeviceCreateBindGroup(device_, &bgd);
+            wgpuRenderPassEncoderSetPipeline(pass, depthSource ? resolveDepthPipeline_ : resolvePipeline_);
+            wgpuRenderPassEncoderSetBindGroup(pass, 0, drawBindGroup_, 1, &offset);
+            wgpuRenderPassEncoderSetBindGroup(pass, 1, source, 0, nullptr);
+            wgpuRenderPassEncoderSetScissorRect(pass, uint32_t(dx0), uint32_t(dy0), uint32_t(dx1 - dx0), uint32_t(dy1 - dy0));
+            wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
+            wgpuRenderPassEncoderEnd(pass);
+            wgpuRenderPassEncoderRelease(pass);
+            wgpuBindGroupRelease(source);
+            for (WGPUTextureView v : aspectViews)
+                if (v)
+                    wgpuTextureViewRelease(v);
+            ++stats_.gpuResolves;
+            return true;
+        }
+
+        ResolvedImage* WebGpuBackend::ResolvedFor(const uint32_t* fetch)
+        {
+            if ((fetch[0] & 3) != 2 || resolved_.empty() || g_softKeepTexels)
+                return nullptr;
+            const uint32_t base = 0xA0000000u + ((fetch[1] & ~0xFFFu) & 0x1FFFFFFF);
+            auto it = resolved_.find(base);
+            if (it == resolved_.end() || !SameTextureFormat(fetch[1] & 0x3F, it->second.format))
+                return nullptr;
+            return &it->second;
+        }
+
+        WGPUTextureView WebGpuBackend::ResolvedView(ResolvedImage& image, uint32_t width, uint32_t height)
+        {
+            if (width == image.width && height == image.height)
+                return image.view;
+            // The fetch covers part of the destination: keep an exact-size copy so that
+            // normalised coordinates and wrapping match the texture the game describes.
+            auto& e = image.exact[{ width, height }];
+            if (!e.texture.texture)
+            {
+                WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
+                td.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
+                td.size = { width, height, 1 };
+                td.format = WGPUTextureFormat_RGBA16Float;
+                e.texture.texture = wgpuDeviceCreateTexture(device_, &td);
+                e.texture.view = wgpuTextureCreateView(e.texture.texture, nullptr);
+            }
+            if (e.generation != image.generation)
+            {
+                EndPass();
+                EnsureEncoder();
+                WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+                src.texture = image.texture;
+                WGPUTexelCopyTextureInfo dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+                dst.texture = e.texture.texture;
+                const WGPUExtent3D extent = { std::min(width, image.width), std::min(height, image.height), 1 };
+                wgpuCommandEncoderCopyTextureToTexture(encoder_, &src, &dst, &extent);
+                e.generation = image.generation;
+            }
+            return e.texture.view;
+        }
+
+        // Writes a resolved image to guest memory the way the copy unit would have (tiled,
+        // packed, endian-swapped), so CPU-side readers and later decodes see it.
+        void WebGpuBackend::FlushToMemory(uint32_t base, ResolvedImage& image)
+        {
+            std::vector<uint8_t> data;
+            uint32_t rowBytes = 0;
+            ReadTexture(image.texture, WGPUTextureAspect_All, 8, 0, 0, int(image.width), int(image.height), data, rowBytes);
+            const uint32_t bpp = image.format == 2 ? 1 : (image.format == 4 || image.format == 10) ? 2 : (image.format == 26 || image.format == 32) ? 8 : 4;
+            const uint32_t log2 = bpp == 1 ? 0 : bpp == 2 ? 1 : bpp == 4 ? 2 : 3;
+            const uint32_t pitch = (image.width + 31) & ~31u;
+            auto unorm = [](float v, uint32_t b) { return uint32_t(std::lround(std::clamp(v, 0.0f, 1.0f) * float((1u << b) - 1))); };
+            for (uint32_t y = 0; y < image.height; y++)
+                for (uint32_t x = 0; x < image.width; x++)
+                {
+                    float c[4];
+                    for (int k = 0; k < 4; k++)
+                    {
+                        uint16_t h;
+                        std::memcpy(&h, data.data() + size_t(y) * rowBytes + size_t(x) * 8 + k * 2, 2);
+                        c[k] = HalfToFloat(h);
+                    }
+                    uint32_t w[2] = {};
+                    switch (image.format)
+                    {
+                    case 2: w[0] = unorm(c[0], 8); break;
+                    case 4: w[0] = (unorm(c[0], 5) << 11) | (unorm(c[1], 6) << 5) | unorm(c[2], 5); break;
+                    case 6: w[0] = unorm(c[0], 8) | (unorm(c[1], 8) << 8) | (unorm(c[2], 8) << 16) | (unorm(c[3], 8) << 24); break;
+                    case 7: w[0] = unorm(c[0], 10) | (unorm(c[1], 10) << 10) | (unorm(c[2], 10) << 20) | (unorm(c[3], 2) << 30); break;
+                    case 10: w[0] = unorm(c[0], 8) | (unorm(c[1], 8) << 8); break;
+                    case 25: w[0] = unorm(c[0], 16) | (unorm(c[1], 16) << 16); break;
+                    case 26: w[0] = unorm(c[0], 16) | (unorm(c[1], 16) << 16); w[1] = unorm(c[2], 16) | (unorm(c[3], 16) << 16); break;
+                    case 31: w[0] = FloatToHalf(c[0]) | (uint32_t(FloatToHalf(c[1])) << 16); break;
+                    case 32: w[0] = FloatToHalf(c[0]) | (uint32_t(FloatToHalf(c[1])) << 16); w[1] = FloatToHalf(c[2]) | (uint32_t(FloatToHalf(c[3])) << 16); break;
+                    default: break;
+                    }
+                    const uint32_t address = base + TiledOffset2D(x, y, pitch, log2);
+                    auto swap32 = [&](uint32_t v) {
+                        switch (image.endian & 3)
+                        {
+                        case 1: return ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
+                        case 2: return (v >> 24) | ((v >> 8) & 0xFF00u) | ((v << 8) & 0xFF0000u) | (v << 24);
+                        case 3: return (v << 16) | (v >> 16);
+                        default: return v;
+                        }
+                    };
+                    if (bpp >= 4)
+                    {
+                        for (uint32_t i = 0; i < bpp / 4; i++)
+                            *guest::ToHost<uint32_t>(address + i * 4) = swap32(w[i]);
+                    }
+                    else if (bpp == 2)
+                    {
+                        uint16_t v = uint16_t(w[0]);
+                        uint32_t at = address;
+                        if (image.endian == 1 || image.endian == 2)
+                            v = uint16_t((v >> 8) | (v << 8));
+                        if (image.endian == 2 || image.endian == 3)
+                            at ^= 2;
+                        *guest::ToHost<uint16_t>(at) = v;
+                    }
+                    else
+                    {
+                        uint32_t at = address;
+                        if (image.endian == 1) at ^= 1;
+                        else if (image.endian == 2) at ^= 3;
+                        else if (image.endian == 3) at ^= 2;
+                        *guest::ToHost<uint8_t>(at) = uint8_t(w[0]);
+                    }
+                }
+            ++stats_.flushes;
+        }
+
+        bool WebGpuBackend::PresentFrontBuffer(const uint32_t fetch[6])
+        {
+            static const bool disabled = [] { const char* v = std::getenv("TTT2_GPU_PRESENT_CPU"); return v && *v == '1'; }();
+            ResolvedImage* image = ResolvedFor(fetch);
+            if (!image || disabled || surfaceFailed_)
+                return false;
+#ifdef _WIN32
+            HWND hwnd = static_cast<HWND>(PresenterWindow());
+            if (!surface_)
+            {
+                WGPUSurfaceSourceWindowsHWND source = WGPU_SURFACE_SOURCE_WINDOWS_HWND_INIT;
+                source.hinstance = GetModuleHandleW(nullptr);
+                source.hwnd = hwnd;
+                WGPUSurfaceDescriptor sd = WGPU_SURFACE_DESCRIPTOR_INIT;
+                sd.nextInChain = &source.chain;
+                surface_ = wgpuInstanceCreateSurface(instance_, &sd);
+                WGPUSurfaceCapabilities caps = WGPU_SURFACE_CAPABILITIES_INIT;
+                if (!surface_ || wgpuSurfaceGetCapabilities(surface_, adapter_, &caps) != WGPUStatus_Success || !caps.formatCount)
+                {
+                    surfaceFailed_ = true;
+                    std::fprintf(stderr, "[gpu] webgpu: no window surface, presenting through the CPU\n");
+                    return false;
+                }
+                surfaceFormat_ = caps.formats[0];
+                for (size_t i = 0; i < caps.formatCount; i++)
+                    if (caps.formats[i] == WGPUTextureFormat_BGRA8Unorm)
+                        surfaceFormat_ = caps.formats[i];
+                // Mailbox/immediate: the command processor must not block on vsync (the
+                // game paces itself on the vblank interrupt).
+                for (size_t i = 0; i < caps.presentModeCount; i++)
+                    if (caps.presentModes[i] == WGPUPresentMode_Mailbox)
+                        presentMode_ = WGPUPresentMode_Mailbox;
+                if (presentMode_ != WGPUPresentMode_Mailbox)
+                    for (size_t i = 0; i < caps.presentModeCount; i++)
+                        if (caps.presentModes[i] == WGPUPresentMode_Immediate)
+                            presentMode_ = WGPUPresentMode_Immediate;
+                wgpuSurfaceCapabilitiesFreeMembers(caps);
+
+                WGPUBindGroupLayoutEntry e[2] = { WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT, WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT };
+                e[0].binding = 0;
+                e[0].visibility = WGPUShaderStage_Fragment;
+                e[0].texture.sampleType = WGPUTextureSampleType_Float;
+                e[0].texture.viewDimension = WGPUTextureViewDimension_2D;
+                e[1].binding = 1;
+                e[1].visibility = WGPUShaderStage_Fragment;
+                e[1].sampler.type = WGPUSamplerBindingType_Filtering;
+                WGPUBindGroupLayoutDescriptor ld = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+                ld.entryCount = 2;
+                ld.entries = e;
+                blitLayout_ = wgpuDeviceCreateBindGroupLayout(device_, &ld);
+                WGPUPipelineLayoutDescriptor pld = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+                pld.bindGroupLayoutCount = 1;
+                pld.bindGroupLayouts = &blitLayout_;
+                WGPUPipelineLayout layout = wgpuDeviceCreatePipelineLayout(device_, &pld);
+                // The front buffer holds 8_8_8_8 components; the display shows component 0
+                // as blue and 2 as red (D3D's ARGB), as the CPU presenter does.
+                WGPUShaderModule module = Module(R"(
+@group(0) @binding(0) var image: texture_2d<f32>;
+@group(0) @binding(1) var linearSampler: sampler;
+struct VsOut { @builtin(position) pos: vec4f, @location(0) uv: vec2f, }
+@vertex fn vs(@builtin(vertex_index) i: u32) -> VsOut {
+    let uv = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
+    var o: VsOut;
+    o.pos = vec4f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+    o.uv = uv;
+    return o;
+}
+@fragment fn fs(input: VsOut) -> @location(0) vec4f {
+    let c = textureSampleLevel(image, linearSampler, input.uv, 0.0);
+    return vec4f(clamp(c.zyx, vec3f(0.0), vec3f(1.0)), 1.0);
+}
+)");
+                WGPUColorTargetState target = WGPU_COLOR_TARGET_STATE_INIT;
+                target.format = surfaceFormat_;
+                WGPUFragmentState fs = WGPU_FRAGMENT_STATE_INIT;
+                fs.module = module;
+                fs.entryPoint = Str("fs");
+                fs.targetCount = 1;
+                fs.targets = &target;
+                WGPURenderPipelineDescriptor pd = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+                pd.layout = layout;
+                pd.vertex.module = module;
+                pd.vertex.entryPoint = Str("vs");
+                pd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+                pd.multisample.count = 1;
+                pd.multisample.mask = 0xFFFFFFFF;
+                pd.fragment = &fs;
+                blitPipeline_ = wgpuDeviceCreateRenderPipeline(device_, &pd);
+                WGPUSamplerDescriptor sdesc = WGPU_SAMPLER_DESCRIPTOR_INIT;
+                sdesc.magFilter = sdesc.minFilter = WGPUFilterMode_Linear;
+                blitSampler_ = wgpuDeviceCreateSampler(device_, &sdesc);
+                PresenterSetGpu(true);
+            }
+
+            RECT client{};
+            GetClientRect(hwnd, &client);
+            const uint32_t w = uint32_t(client.right - client.left), h = uint32_t(client.bottom - client.top);
+            if (!w || !h)
+                return true; // minimised: nothing to show
+            if (w != surfaceWidth_ || h != surfaceHeight_)
+            {
+                WGPUSurfaceConfiguration config = WGPU_SURFACE_CONFIGURATION_INIT;
+                config.device = device_;
+                config.format = surfaceFormat_;
+                config.usage = WGPUTextureUsage_RenderAttachment;
+                config.width = w;
+                config.height = h;
+                config.presentMode = presentMode_;
+                config.alphaMode = WGPUCompositeAlphaMode_Auto;
+                wgpuSurfaceConfigure(surface_, &config);
+                surfaceWidth_ = w;
+                surfaceHeight_ = h;
+            }
+            WGPUSurfaceTexture st = WGPU_SURFACE_TEXTURE_INIT;
+            wgpuSurfaceGetCurrentTexture(surface_, &st);
+            if (st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal &&
+                st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal)
+            {
+                if (st.texture)
+                    wgpuTextureRelease(st.texture);
+                surfaceWidth_ = surfaceHeight_ = 0; // reconfigure next time
+                return true;
+            }
+            WGPUTextureView target = wgpuTextureCreateView(st.texture, nullptr);
+            const uint32_t width = (fetch[2] & 0x1FFF) + 1, height = ((fetch[2] >> 13) & 0x1FFF) + 1;
+            WGPUBindGroupEntry be[2] = { WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT };
+            be[0].binding = 0;
+            be[0].textureView = ResolvedView(*image, width, height);
+            be[1].binding = 1;
+            be[1].sampler = blitSampler_;
+            WGPUBindGroupDescriptor bgd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+            bgd.layout = blitLayout_;
+            bgd.entryCount = 2;
+            bgd.entries = be;
+            WGPUBindGroup bind = wgpuDeviceCreateBindGroup(device_, &bgd);
+
+            EndPass();
+            EnsureEncoder();
+            WGPURenderPassColorAttachment ca = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+            ca.view = target;
+            ca.loadOp = WGPULoadOp_Clear;
+            ca.storeOp = WGPUStoreOp_Store;
+            ca.clearValue = { 0, 0, 0, 1 };
+            WGPURenderPassDescriptor rpd = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+            rpd.colorAttachmentCount = 1;
+            rpd.colorAttachments = &ca;
+            WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(encoder_, &rpd);
+            wgpuRenderPassEncoderSetPipeline(pass, blitPipeline_);
+            wgpuRenderPassEncoderSetBindGroup(pass, 0, bind, 0, nullptr);
+            wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
+            wgpuRenderPassEncoderEnd(pass);
+            wgpuRenderPassEncoderRelease(pass);
+            Submit();
+            wgpuSurfacePresent(surface_);
+            wgpuBindGroupRelease(bind);
+            wgpuTextureViewRelease(target);
+            wgpuTextureRelease(st.texture);
+            PresenterCountFrame();
+            return true;
+#else
+            return false;
+#endif
+        }
+
+        bool WebGpuBackend::ReadFrontBuffer(const uint32_t fetch[6], std::vector<uint32_t>& bgra, uint32_t& width, uint32_t& height)
+        {
+            ResolvedImage* image = g_softKeepTexels ? nullptr : ResolvedFor(fetch);
+            if (!image)
+                return false;
+            width = (fetch[2] & 0x1FFF) + 1;
+            height = ((fetch[2] >> 13) & 0x1FFF) + 1;
+            const int w = int(std::min(width, image->width)), h = int(std::min(height, image->height));
+            std::vector<uint8_t> data;
+            uint32_t rowBytes = 0;
+            ReadTexture(image->texture, WGPUTextureAspect_All, 8, 0, 0, w, h, data, rowBytes);
+            bgra.assign(size_t(width) * height, 0xFF000000u);
+            // As ConvertToBgra presents 8_8_8_8: component k in byte k.
+            SoftParallelFor(uint32_t(h), [&](uint32_t y) {
+                const uint8_t* line = data.data() + size_t(y) * rowBytes;
+                for (int x = 0; x < w; x++)
+                {
+                    uint32_t p = 0xFF000000u;
+                    for (int k = 0; k < 3; k++)
+                    {
+                        uint16_t hb;
+                        std::memcpy(&hb, line + size_t(x) * 8 + k * 2, 2);
+                        p |= uint32_t(std::lround(std::clamp(HalfToFloat(hb), 0.0f, 1.0f) * 255.0f)) << (8 * k);
+                    }
+                    bgra[size_t(y) * width + x] = p;
+                }
+            });
+            return true;
+        }
+
+        void WebGpuBackend::FlushAllResolves()
+        {
+            for (auto& [base, image] : resolved_)
+            {
+                FlushToMemory(base, image);
+                for (auto& [size, e] : image.exact)
+                {
+                    ReleaseView(e.texture.view);
+                    wgpuTextureRelease(e.texture.texture);
+                }
+                ReleaseView(image.view);
+                wgpuTextureRelease(image.texture);
+            }
+            resolved_.clear();
+        }
+
+        void WebGpuBackend::EndFrame()
+        {
+            // Images the game stopped resolving into may be read from memory later (or the
+            // memory reused): write them back and forget them.
+            for (auto it = resolved_.begin(); it != resolved_.end();)
+            {
+                if (frame_ - it->second.lastResolveFrame > 4)
+                {
+                    FlushToMemory(it->first, it->second);
+                    ResolvedImage& image = it->second;
+                    for (auto& [size, e] : image.exact)
+                    {
+                        ReleaseView(e.texture.view);
+                        wgpuTextureRelease(e.texture.texture);
+                    }
+                    ReleaseView(image.view);
+                    wgpuTextureRelease(image.texture);
+                    it = resolved_.erase(it);
+                }
+                else
+                    ++it;
+            }
+            ++frame_;
+            Submit();
+#ifndef __EMSCRIPTEN__
+            wgpuDevicePoll(device_, false, nullptr);
+#endif
+            if (textures_.size() > 4096)
+            {
+                for (auto& [tex, g] : textures_)
+                {
+                    ReleaseView(g.view);
+                    wgpuTextureRelease(g.texture);
+                }
+                textures_.clear();
+            }
+        }
+
+        void WebGpuBackend::PrintStats()
+        {
+            std::fprintf(stderr,
+                "[gpu]   webgpu: %llu draws, %llu triangles, %llu clears, %llu readbacks (%.1f ms), encode %.1f ms, %llu uploads, %llu submits, %llu pipelines / %llu shaders created\n",
+                (unsigned long long)stats_.draws, (unsigned long long)stats_.triangles, (unsigned long long)stats_.clears,
+                (unsigned long long)stats_.readbacks, stats_.readbackNs / 1e6, stats_.encodeNs / 1e6, (unsigned long long)stats_.textureUploads,
+                (unsigned long long)stats_.submits, (unsigned long long)stats_.pipelinesCreated, (unsigned long long)stats_.shadersCreated);
+            std::fprintf(stderr, "[gpu]   webgpu: prepare = setup %.1f + pipeline %.1f + data/vertices %.1f + textures %.1f ms; uploads: vertices %.1f MB, indices %.1f MB, draw data %.1f MB\n",
+                stats_.setupNs / 1e6, stats_.pipelineNs / 1e6, stats_.dataNs / 1e6, stats_.bindNs / 1e6,
+                stats_.vertexBytes / 1e6, stats_.indexBytes / 1e6, stats_.drawDataBytes / 1e6);
+            std::fprintf(stderr, "[gpu]   webgpu: %llu GPU resolves, %llu resolved-image binds, %llu flushed to memory\n",
+                (unsigned long long)stats_.gpuResolves, (unsigned long long)stats_.gpuResolveBinds, (unsigned long long)stats_.flushes);
+            stats_ = {};
+        }
+    }
+
+    CaptureSink* CreateWebGpuBackend()
+    {
+        auto backend = std::make_unique<WebGpuBackend>();
+        if (!backend->Init())
+        {
+            std::fprintf(stderr, "[gpu] webgpu: initialisation failed, keeping the software renderer\n");
+            return nullptr;
+        }
+        g_backend = backend.release();
+        return g_backend;
+    }
+
+    void WebGpuEndFrame()
+    {
+        if (g_backend)
+            g_backend->EndFrame();
+    }
+
+    bool WebGpuPresentFrontBuffer(const uint32_t fetch[6])
+    {
+        return g_backend && g_backend->PresentFrontBuffer(fetch);
+    }
+
+    bool WebGpuReadFrontBuffer(const uint32_t fetch[6], std::vector<uint32_t>& bgra, uint32_t& width, uint32_t& height)
+    {
+        return g_backend && g_backend->ReadFrontBuffer(fetch, bgra, width, height);
+    }
+
+    bool WebGpuActive() { return g_backend != nullptr; }
+
+    void WebGpuFlushResolves()
+    {
+        if (g_backend)
+            g_backend->FlushAllResolves();
+    }
+
+    void WebGpuPrintStats()
+    {
+        if (g_backend)
+            g_backend->PrintStats();
+    }
+}

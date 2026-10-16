@@ -7,6 +7,7 @@ if (TTT2_HAVE_RECOMP)
         kernel/sync.cpp
         kernel/xconfig.cpp
         kernel/xam.cpp
+        kernel/xam_ui.cpp
         kernel/dpc.cpp
         kernel/objects.cpp
         kernel/threads.cpp
@@ -16,8 +17,11 @@ if (TTT2_HAVE_RECOMP)
         gpu/video.cpp
         gpu/texture.cpp
         gpu/soft_gpu.cpp
+        gpu/xenos_wgsl.cpp
+        gpu/webgpu_backend.cpp
         gpu/presenter_win.cpp
         apu/audio.cpp
+        apu/xma.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../recomp/generated/import_stubs.cpp
     )
     target_include_directories(ttt2 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -30,8 +34,24 @@ if (WIN32)
     target_compile_definitions(ttt2 PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 endif()
 
+# WebGPU: wgpu-native natively (scripts/fetch-wgpu.ps1), emdawnwebgpu in the browser.
+if (TTT2_HAVE_RECOMP AND NOT EMSCRIPTEN)
+    set(WGPU_NATIVE_DIR ${CMAKE_SOURCE_DIR}/.tools/wgpu-native)
+    if (NOT EXISTS ${WGPU_NATIVE_DIR}/include/webgpu/webgpu.h)
+        message(FATAL_ERROR "wgpu-native not found in ${WGPU_NATIVE_DIR}: run scripts\fetch-wgpu.ps1")
+    endif()
+    target_include_directories(ttt2 PRIVATE ${WGPU_NATIVE_DIR}/include)
+    target_link_libraries(ttt2 PRIVATE ${WGPU_NATIVE_DIR}/lib/wgpu_native.dll.lib)
+    add_custom_command(TARGET ttt2 POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${WGPU_NATIVE_DIR}/lib/wgpu_native.dll $<TARGET_FILE_DIR:ttt2>
+    )
+endif()
+
 if (MSVC AND TTT2_HAVE_RECOMP)
     target_compile_options(ttt2 PRIVATE -msse4.1 -mavx)
+    # RelWithDebInfo defaults to /Ob1 (only explicitly inline functions), which leaves the
+    # software renderer's small per-pixel helpers as calls; inline like Release does.
+    target_compile_options(ttt2 PRIVATE $<$<CONFIG:RelWithDebInfo>:/Ob2>)
 endif()
 
 if (EMSCRIPTEN)

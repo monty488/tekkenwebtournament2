@@ -1,6 +1,9 @@
 // Bring-up diagnostics.
 //
 //   TTT2_TRACE=1        log every kernel/XAM import call (thread, name, r3-r6, return address)
+//   TTT2_TRACE_RANGE=<lo>-<hi>  the same, only for calls made from guest code in [lo, hi) (hex)
+//   TTT2_TRACE_NEW=1    log each (thread, import, return address) the first time it is seen,
+//                       with the time since start: a cheap timeline of new call sites
 //   TTT2_WATCHDOG=<s>   if no import is called for <s> seconds (default 5), print each guest
 //                       thread's last import and, on Windows, the recompiled functions it is
 //                       executing right now (symbolised from ttt2.pdb). 0 disables it.
@@ -16,6 +19,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -83,7 +87,26 @@ namespace guest
         t_info->lastLr.store(lr, std::memory_order_relaxed);
         t_info->calls.fetch_add(1, std::memory_order_relaxed);
         const uint32_t tid = CurrentThreadId();
-        if (g_trace)
+        // TTT2_TRACE_RANGE=<lo>-<hi> (hex): trace only imports called from that code range.
+        static const auto range = [] {
+            std::pair<uint64_t, uint64_t> r{ 0, 0 };
+            if (const char* v = std::getenv("TTT2_TRACE_RANGE"))
+                std::sscanf(v, "%llx-%llx", (unsigned long long*)&r.first, (unsigned long long*)&r.second);
+            return r;
+        }();
+        static const bool traceNew = [] { const char* v = std::getenv("TTT2_TRACE_NEW"); return v && *v == '1'; }();
+        if (traceNew)
+        {
+            static const auto start = std::chrono::steady_clock::now();
+            thread_local std::unordered_set<uint64_t> seen;
+            if (seen.insert((lr << 32) ^ uint64_t(uintptr_t(name))).second)
+            {
+                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+                std::fprintf(stderr, "[new] %lld ms T%u %s(%08X, %08X, %08X, %08X) lr=%08llX\n", (long long)ms, tid, name,
+                    ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, (unsigned long long)lr);
+            }
+        }
+        if (g_trace || (range.second && lr >= range.first && lr < range.second))
         {
             std::fprintf(stderr, "[trace] T%u %s(%08X, %08X, %08X, %08X) lr=%08llX\n", tid, name,
                 ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, (unsigned long long)lr);
