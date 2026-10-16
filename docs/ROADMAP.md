@@ -72,16 +72,26 @@ Rough milestones, in order. Each depends on the previous one.
       menu; Offline > Arcade reaches the VS screen and a Stage 1 fight (HUD, timer, 3D
       stage); Fight Lab loads a Combot match. Unattended:
       `TTT2_AUTOPRESS=start,start,start,none,a,none,none,a,none,a,none,a,... TTT2_AUTOPRESS_DELAY=40000`
-- [ ] Fights run at roughly 15-30 fps on the software renderer
-      the main thread in the sound-player teardown (XAudio2 voices never drain; XMA is
-      unimplemented, see M4). The movie also freezes or ends early for the same reason
-- [ ] The attract-mode fight crashes on an indirect call to 824B0DA4, which is not a
-      recompiled function (missing function boundary, see M1)
-- [ ] Identify the game's statically linked D3D functions
-- [ ] WebGPU backend: device, swap chain, render targets, depth
-- [ ] XenosRecomp → HLSL → SPIR-V → WGSL shader cache
-- [ ] Texture untiling and format conversion (CPU version done for the common formats)
-- [ ] Menus render (blocked on audio, above), then a stage plus characters
+- [x] The attract-mode fight crash (824B0DA4 was a missed switch-table case)
+- [x] WebGPU backend (`TTT2_GPU=webgpu`, wgpu-native natively): Xenos vertex and pixel
+      shaders translated to WGSL at runtime (`runtime/gpu/xenos_wgsl.cpp`, cached by
+      their flattened instructions), vertex fetch from guest memory with the viewport
+      transform in the shader, render targets keyed by EDRAM base in sample space
+      (MSAA views alias like on the console), unorm/float target formats, blending,
+      depth/stencil, culling; colour and depth resolves stay on the GPU; the front buffer
+      is presented straight to the window. Menus, character select, VS screens, fights
+      and post-fight screens render correctly; fights run at 60 fps with the command
+      processor busy ~11 of each 16.7 ms
+- [x] `TTT2_GPU_VERIFY_FRAME=n`: every draw of a frame rendered by both renderers from
+      the same inputs and compared (found the MSAA aliasing and precision bugs)
+- [ ] WebGPU gaps: pixel shaders with predicate-driven control flow (colour skipped,
+      logged once), rect lists still shaded on the CPU, points/lines, mip levels, cube and
+      3D textures, real MSAA (MSAA views are supersampled), 64bpp/32bpp aliasing of the
+      same EDRAM, Xenos 7e3 float colour precision
+- [ ] Check Kuma's dark face on the post-fight screen with the verifier (lighting or bug)
+- [ ] The game sometimes stops submitting at frame 4 when the GPU side is fast (WebGPU,
+      or `TTT2_SOFT_GPU=0`): a guest-side race, about one start in three
+- [ ] Browser: emdawnwebgpu build of the same backend, canvas presentation
 
 ## M4: Sound
 - [ ] Render-driver callback thread and AudioWorklet output
