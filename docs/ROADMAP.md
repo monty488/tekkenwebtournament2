@@ -101,9 +101,17 @@ Rough milestones, in order. Each depends on the previous one.
 - [x] wasm64 build runs in Chrome/Edge: boots from game data streamed off the dev server
       (`serve.mjs --game game`, page `?stream`), intro and logos on a 2D canvas with the
       software renderer at ~18 fps (CPU texture decoding is ~10x slower than native)
-- [ ] WebGPU in the browser: request the adapter/device asynchronously, keep the device on
-      the command-processor worker (or proxy), present to the page canvas
-- [ ] A thread of the game polls a wait in a tight loop (~7 M calls/s): costly in the browser
+- [x] WebGPU in the browser (`?stream&TTT2_GPU=webgpu`): the canvas is transferred to the
+      command-processor worker as an OffscreenCanvas, the adapter/device arrive through
+      spontaneous callbacks (software rendering until then), and the processor runs in
+      event-loop slices so frames are shown. The processor is busy ~0.4 ms per frame;
+      the intro runs at ~26 swaps/s (native: 60), bound by the game's own threads in wasm
+- [ ] GPU readbacks in the browser (resolves the CPU reads, front-buffer screenshots): they
+      need an async map, which a synchronous resolve cannot wait for; they return zeros now
+- [ ] A thread of the game polls a wait in a tight loop: `sub_82ABFDE8` sets its own event
+      (`NtSetEvent`) and SignalAndWaits on it until a 64-bit counter changes (~7 M calls/s);
+      costly in the browser
+- [ ] Profile the game threads in wasm (why ~26 swaps/s with the CP nearly idle)
 - [ ] Stable 60 fps in matches (profile; enable XenonRecomp's local-register optimisations)
 - [ ] Input latency pass (fighting games are sensitive to it)
 - [ ] Saves persist in OPFS

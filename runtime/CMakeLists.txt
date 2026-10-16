@@ -79,6 +79,11 @@ if (EMSCRIPTEN)
         -sSUPPORT_LONGJMP=wasm
         -sWASM_BIGINT=1
         --use-port=emdawnwebgpu
+        # WebGPU renders on the command processor's worker: the page canvas is transferred
+        # to it at thread creation (not to main()'s thread), which needs the GL bookkeeping.
+        -sOFFSCREENCANVAS_SUPPORT=1
+        "-sOFFSCREENCANVASES_TO_PTHREAD=''"
+        "-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=$GL"
     )
 
     # Stage the web shell next to the build output so `node web/serve.mjs <build dir>` just works.

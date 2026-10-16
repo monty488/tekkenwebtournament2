@@ -33,6 +33,12 @@
 #include <mutex>
 #include <thread>
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#include <emscripten/threading.h>
+#include <pthread.h>
+#endif
+
 namespace gpu
 {
     // GPU register file is memory-mapped at 0x7FC80000 (one dword per register).
@@ -306,15 +312,18 @@ namespace gpu
         return { storage.data(), slot.dwords };
     }
 
+    static bool WebGpuRequested(); // TTT2_GPU=webgpu
+
     static void Draw(uint32_t initiator, uint32_t indexBase, uint32_t indexSize, std::vector<uint32_t> immediate)
     {
         if (!g_softGpu)
             return;
         // TTT2_GPU=webgpu: rasterise and shade pixels on the GPU (falls back to the
         // software renderer if no WebGPU adapter is available).
+        // (In the browser the device arrives asynchronously: the backend installs itself
+        // as the capture sink when it is ready, and draws until then stay in software.)
         static const bool backendChosen = [] {
-            const char* v = std::getenv("TTT2_GPU");
-            if (v && std::strcmp(v, "webgpu") == 0)
+            if (WebGpuRequested())
                 if (CaptureSink* sink = CreateWebGpuBackend())
                     SoftSetCaptureSink(sink);
             return true;
@@ -746,6 +755,97 @@ namespace gpu
         }
     }
 
+#ifdef __EMSCRIPTEN__
+    // Browser: a canvas only shows a frame when the thread that drew it returns to its
+    // event loop, and WebGPU promises (adapter, device) also resolve there. So the command
+    // processor runs in slices: each keeps polling the ring while work arrives (the game
+    // waits on dozens of fences per frame) and yields after a swap or once idle, then
+    // reschedules itself through a MessageChannel (setTimeout would clamp to 4 ms).
+    static guest::GuestEnv* g_cpEnv = nullptr;
+
+    static void ScheduleCommandProcessorSlice();
+
+    extern "C" EMSCRIPTEN_KEEPALIVE void ttt2_cp_slice()
+    {
+        const uint64_t swapsBefore = g_swapCount;
+        auto lastWork = std::chrono::steady_clock::now();
+        const auto sliceStart = lastWork;
+        for (;;)
+        {
+            const uint32_t base = g_ringBase.load();
+            const uint32_t size = g_ringDwords.load();
+            const auto now = std::chrono::steady_clock::now();
+            if (base && size)
+            {
+                const uint32_t wptr = ReadRegister(CP_RB_WPTR) % size;
+                if (wptr != g_rptr)
+                {
+                    ExecuteStream(*g_cpEnv, Stream{ base, size, 1 }, g_rptr, wptr, 0);
+                    lastWork = std::chrono::steady_clock::now();
+                    g_cpBusyNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(lastWork - now).count());
+                    g_rptr = wptr;
+                    WriteRegister(CP_RB_RPTR, g_rptr);
+                    if (const uint32_t writeback = g_rptrWriteback.load())
+                        guest::Store<uint32_t>(writeback, g_rptr);
+                    if (g_swapCount != swapsBefore)
+                        break; // let the browser show the frame
+                    continue;
+                }
+            }
+            if (now - lastWork > std::chrono::milliseconds(2) || now - sliceStart > std::chrono::milliseconds(50))
+                break;
+            sched_yield();
+        }
+        ScheduleCommandProcessorSlice();
+    }
+
+    static void ScheduleCommandProcessorSlice()
+    {
+        EM_ASM({
+            if (!globalThis.ttt2CpChannel) {
+                globalThis.ttt2CpChannel = new MessageChannel();
+                globalThis.ttt2CpChannel.port1.onmessage = () => _ttt2_cp_slice();
+            }
+            globalThis.ttt2CpChannel.port2.postMessage(0);
+        });
+    }
+
+    static void* CommandProcessorWebThread(void*)
+    {
+        static guest::GuestEnv env = guest::CreateGuestEnv(/*cpu*/ 2);
+        g_cpEnv = &env;
+        ScheduleCommandProcessorSlice();
+        emscripten_exit_with_live_runtime(); // keep the worker for the slices
+        return nullptr;
+    }
+#endif
+
+    static bool WebGpuRequested()
+    {
+        const char* v = std::getenv("TTT2_GPU");
+        return v && std::strcmp(v, "webgpu") == 0;
+    }
+
+    static void StartCommandProcessor()
+    {
+#ifdef __EMSCRIPTEN__
+        // With WebGPU the page canvas moves to the command processor's worker, which renders
+        // and presents to it as an OffscreenCanvas.
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        if (WebGpuRequested())
+            emscripten_pthread_attr_settransferredcanvases(&attr, "#screen");
+        pthread_t thread;
+        if (pthread_create(&thread, &attr, CommandProcessorWebThread, nullptr) != 0)
+            TTT2_LOG("could not start the command processor thread");
+        else
+            pthread_detach(thread);
+        pthread_attr_destroy(&attr);
+#else
+        std::thread(CommandProcessorThread).detach();
+#endif
+    }
+
     static void VblankThread()
     {
         guest::GuestEnv env = guest::CreateGuestEnv(/*cpu*/ 2);
@@ -798,7 +898,7 @@ GUEST_IMPORT(VdInitializeRingBuffer)
     g_ringBase = PhysicalToGuest(ctx.r3.u32);
     TTT2_LOG("ring buffer at %08X, %u dwords", g_ringBase.load(), g_ringDwords.load());
     static std::once_flag started;
-    std::call_once(started, [] { std::thread(CommandProcessorThread).detach(); });
+    std::call_once(started, [] { StartCommandProcessor(); });
 }
 
 // void VdEnableRingBufferRPtrWriteBack(u32 physicalAddress, u32 blockSizeLog2)

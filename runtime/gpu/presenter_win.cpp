@@ -170,7 +170,8 @@ namespace gpu
             const width = $1;
             const height = $2;
             const flag = Number($3);
-            if (canvas) {
+            // With WebGPU the canvas belongs to the command processor's worker.
+            if (canvas && !canvas.controlTransferredOffscreen) {
                 if (canvas.width != width || canvas.height != height) {
                     canvas.width = width;
                     canvas.height = height;
