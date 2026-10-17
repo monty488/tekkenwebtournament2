@@ -76,8 +76,9 @@ node web\serve.mjs build\web-release 8080 --game game
 ```
 
 then open http://localhost:8080/?stream (add `&autostart` to launch straight away;
-any `TTT2_*` switch can be passed in the URL too, e.g. `&TTT2_GPU_STATS=1`). To render
-on the GPU, as natively: http://localhost:8080/?stream&TTT2_GPU=webgpu&autostart
+any `TTT2_*` switch can be passed in the URL too, e.g. `&TTT2_GPU_STATS=1`). The page renders
+with WebGPU whenever the browser offers an adapter; `&TTT2_GPU=soft` keeps the (much
+slower) software renderer.
 
 You can build and serve the web target **before** you have the game: it then
 builds a placeholder runtime, which is a quick way to check the toolchain and
