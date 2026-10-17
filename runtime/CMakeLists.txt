@@ -85,6 +85,11 @@ if (EMSCRIPTEN)
         "-sOFFSCREENCANVASES_TO_PTHREAD=''"
         "-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=$GL"
     )
+    # Keeps function names in the wasm so browser profilers show them (no runtime cost).
+    option(TTT2_WEB_PROFILING "Keep wasm function names for profiling" OFF)
+    if (TTT2_WEB_PROFILING)
+        target_link_options(ttt2 PRIVATE --profiling-funcs)
+    endif()
 
     # Stage the web shell next to the build output so `node web/serve.mjs <build dir>` just works.
     add_custom_command(TARGET ttt2 POST_BUILD

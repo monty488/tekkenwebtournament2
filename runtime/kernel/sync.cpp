@@ -2,10 +2,12 @@
 #include "memory.h"
 #include "threads.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <thread>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <unordered_map>
 
@@ -131,6 +133,38 @@ namespace guest
         return std::chrono::steady_clock::now() + std::chrono::nanoseconds(-value * 100);
     }
 
+    static bool WaitStatsEnabled()
+    {
+        static const bool enabled = [] { const char* v = std::getenv("TTT2_WAIT_STATS"); return v && *v == '1'; }();
+        return enabled;
+    }
+
+    // Time from a signal handing an object to a blocked waiter until that waiter runs.
+    static void RecordWakeLatency(std::chrono::steady_clock::duration latency)
+    {
+        static std::atomic<uint64_t> count{ 0 }, totalNs{ 0 }, maxNs{ 0 }, over100us{ 0 }, over1ms{ 0 };
+        static std::atomic<int64_t> lastPrint{ 0 };
+        if (latency.count() < 0)
+            return; // browser workers' clocks can disagree slightly
+        const uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(latency).count());
+        ++count;
+        totalNs += ns;
+        if (ns > 100000) ++over100us;
+        if (ns > 1000000) ++over1ms;
+        for (uint64_t m = maxNs.load(); ns > m && !maxNs.compare_exchange_weak(m, ns);) {}
+        const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        int64_t last = lastPrint.load();
+        if (!last)
+            lastPrint.compare_exchange_strong(last, now);
+        else if (now - last >= 5000 && lastPrint.compare_exchange_strong(last, now))
+        {
+            const uint64_t c = count.exchange(0);
+            std::fprintf(stderr, "[waits] wake latency: %llu wakes, avg %.1f us, max %.1f ms, %llu over 100 us, %llu over 1 ms\n",
+                (unsigned long long)c, c ? totalNs.exchange(0) / 1e3 / double(c) : 0.0, maxNs.exchange(0) / 1e6,
+                (unsigned long long)over100us.exchange(0), (unsigned long long)over1ms.exchange(0));
+        }
+    }
+
     void DeliverSignals(Waitable& object)
     {
         for (auto it = object.waiters.begin(); it != object.waiters.end();)
@@ -161,6 +195,8 @@ namespace guest
                 }
             }
             it = object.waiters.erase(it);
+            if (WaitStatsEnabled())
+                w->signalledAt = std::chrono::steady_clock::now();
             w->cv.notify_one();
         }
         SyncGuestHeader(object);
@@ -222,6 +258,8 @@ namespace guest
             if (waiter.satisfiedIndex >= 0)
             {
                 unqueue();
+                if (WaitStatsEnabled() && waiter.signalledAt.time_since_epoch().count())
+                    RecordWakeLatency(std::chrono::steady_clock::now() - waiter.signalledAt);
                 return STATUS_SUCCESS + uint32_t(waiter.satisfiedIndex);
             }
 
@@ -330,6 +368,59 @@ namespace guest
                 }
             }
         }
+    }
+
+    WaitStat::WaitStat(uint32_t lr, uint32_t timeout)
+    {
+        if (!WaitStatsEnabled() || !timeout)
+            return;
+        const int64_t value = Load<int64_t>(timeout);
+        this->lr = lr;
+        requestedNs = value <= 0 ? -value * 100 : 0; // absolute deadlines show as 0
+        start = std::chrono::steady_clock::now();
+    }
+
+    WaitStat::WaitStat(uint32_t lr, int64_t requestedNs)
+    {
+        if (!WaitStatsEnabled())
+            return;
+        this->lr = lr;
+        this->requestedNs = requestedNs;
+        start = std::chrono::steady_clock::now();
+    }
+
+    WaitStat::~WaitStat()
+    {
+        if (requestedNs < 0)
+            return;
+        struct Entry { uint64_t count = 0, requestedNs = 0, actualNs = 0, maxNs = 0; uint32_t thread = 0; };
+        static std::mutex mutex;
+        static std::unordered_map<uint32_t, Entry> sites;
+        static auto lastPrint = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        const uint64_t actual = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
+        std::lock_guard lock(mutex);
+        Entry& e = sites[lr];
+        ++e.count;
+        e.requestedNs += uint64_t(requestedNs);
+        e.actualNs += actual;
+        e.maxNs = std::max(e.maxNs, actual);
+        e.thread = CurrentThreadId();
+        if (now - lastPrint < std::chrono::seconds(5))
+            return;
+        std::vector<std::pair<uint32_t, Entry>> top(sites.begin(), sites.end());
+        std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second.actualNs > b.second.actualNs; });
+        const double seconds = std::chrono::duration<double>(now - lastPrint).count();
+        std::fprintf(stderr, "[waits] timed waits and sleeps over %.1f s, by time taken:\n", seconds);
+        for (size_t i = 0; i < top.size() && i < 10; i++)
+        {
+            const Entry& t = top[i].second;
+            std::fprintf(stderr, "[waits]   lr %08X T%u: %llu calls, asked %.3f ms avg, took %.3f ms avg (max %.1f), %.0f ms total/s\n", top[i].first,
+                t.thread, (unsigned long long)t.count, t.requestedNs / 1e6 / double(t.count), t.actualNs / 1e6 / double(t.count), t.maxNs / 1e6,
+                t.actualNs / 1e6 / seconds);
+        }
+        sites.clear();
+        lastPrint = now;
     }
 
     uint32_t SignalObject(const std::shared_ptr<Waitable>& object)
@@ -534,6 +625,7 @@ GUEST_IMPORT(NtWaitForSingleObjectEx)
 {
     auto object = WaitableFromHandle(ctx.r3.u32);
     if (!object) { ctx.r3.u64 = STATUS_INVALID_HANDLE; return; }
+    WaitStat stat(uint32_t(ctx.lr), ctx.r6.u32);
     ctx.r3.u64 = WaitForObjects({ object }, false, ctx.r6.u32);
 }
 
@@ -545,6 +637,7 @@ GUEST_IMPORT(NtSignalAndWaitForSingleObjectEx)
     if (!signal || !wait) { ctx.r3.u64 = STATUS_INVALID_HANDLE; return; }
     const uint32_t status = SignalObject(signal);
     if (status != STATUS_SUCCESS) { ctx.r3.u64 = status; return; }
+    WaitStat stat(uint32_t(ctx.lr), ctx.r7.u32);
     ctx.r3.u64 = WaitForObjects({ wait }, false, ctx.r7.u32);
 }
 
@@ -552,6 +645,7 @@ GUEST_IMPORT(NtSignalAndWaitForSingleObjectEx)
 GUEST_IMPORT(KeWaitForSingleObject)
 {
     auto object = WaitableFromGuest(ctx.r3.u32);
+    WaitStat stat(uint32_t(ctx.lr), ctx.r7.u32);
     ctx.r3.u64 = WaitForObjects({ object }, false, ctx.r7.u32);
 }
 
@@ -562,6 +656,7 @@ GUEST_IMPORT(KeWaitForMultipleObjects)
     std::vector<std::shared_ptr<Waitable>> objects;
     for (uint32_t i = 0; i < ctx.r3.u32; i++)
         objects.push_back(WaitableFromGuest(Load<uint32_t>(ctx.r4.u32 + i * 4)));
+    WaitStat stat(uint32_t(ctx.lr), ctx.r9.u32);
     ctx.r3.u64 = WaitForObjects(objects, ctx.r5.u32 == 0, ctx.r9.u32);
 }
 

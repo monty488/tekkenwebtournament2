@@ -9,6 +9,7 @@
 #include "guest.h"
 #include "objects.h"
 
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <memory>
@@ -38,6 +39,7 @@ namespace guest
         const std::vector<std::shared_ptr<Waitable>>* objects = nullptr;
         bool waitAll = false;
         int satisfiedIndex = -1;
+        std::chrono::steady_clock::time_point signalledAt; // TTT2_WAIT_STATS: wake latency
         bool reported = false; // a long wait was logged
         std::condition_variable cv;
     };
@@ -110,6 +112,19 @@ namespace guest
 
     // Signals an object as NtSignalAndWait* does. Returns an NTSTATUS.
     uint32_t SignalObject(const std::shared_ptr<Waitable>& object);
+
+    // TTT2_WAIT_STATS=1: for each guest call site (return address), how long its timed waits
+    // and sleeps asked for and how long they took; the worst sites are printed every 5 s.
+    // (Short timeouts can last a whole OS timer tick, ~15.6 ms on Windows, in the browser.)
+    struct WaitStat
+    {
+        WaitStat(uint32_t lr, uint32_t timeout); // the guest LARGE_INTEGER* (0 = infinite: not recorded)
+        WaitStat(uint32_t lr, int64_t requestedNs);
+        ~WaitStat();
+        uint32_t lr = 0;
+        int64_t requestedNs = -1;
+        std::chrono::steady_clock::time_point start;
+    };
 }
 
 #ifndef STATUS_TIMEOUT

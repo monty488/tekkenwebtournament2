@@ -112,7 +112,15 @@ Rough milestones, in order. Each depends on the previous one.
       and SignalAndWaits on it until a 64-bit counter changes (~8 M kernel calls/s, all on
       the global wait lock). Waits now detect a run of self-set signals and block up to
       1 ms (a set from another thread still wakes them). Browser intro: ~26 -> 60 fps
-- [ ] Profile the remaining browser slowdowns (frames 2048-4096 average ~51 fps)
+- [x] Fights in the browser at 60 fps (Edge, Ryzen 7800X3D; native-like frame times):
+      critical sections waited through libc++'s `atomic::wait`, which on emscripten polls
+      with growing sleeps (up to 8 ms) and ignores notify: now an emscripten futex. Also:
+      ring uploads batched into one queue write per buffer per submit; per-draw stats clock
+      reads only with `TTT2_GPU_STATS=1` (each is a JS call); GPU-kept resolves no longer
+      force overlapping textures (two depth formats, every frame) to be decoded again
+- [ ] The command processor busy-waits between slices in the browser (`sched_yield` does
+      nothing there): block on the ring write pointer instead, to free a core
+- [ ] Texture change detection hashes ~6 MB per frame in fights
 - [ ] Stable 60 fps in matches (profile; enable XenonRecomp's local-register optimisations)
 - [ ] Input latency pass (fighting games are sensitive to it)
 - [ ] Saves persist in OPFS

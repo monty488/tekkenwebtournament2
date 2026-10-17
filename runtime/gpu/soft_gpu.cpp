@@ -65,8 +65,8 @@ namespace gpu
         struct ScopedTimer
         {
             uint64_t& sink;
-            std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
-            ~ScopedTimer() { sink += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()); }
+            std::chrono::steady_clock::time_point start = StatNow();
+            ~ScopedTimer() { sink += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(StatNow() - start).count()); }
         };
 
         // ---- Worker pool -----------------------------------------------------------
@@ -129,13 +129,13 @@ namespace gpu
             {
                 t_inPool = true;
                 int completed = 0;
-                const auto start = std::chrono::steady_clock::now();
+                const auto start = StatNow();
                 for (int i; (i = job.next.fetch_add(1)) < job.count;)
                 {
                     (*job.fn)(i);
                     ++completed;
                 }
-                g_poolBusyNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+                g_poolBusyNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(StatNow() - start).count());
                 t_inPool = false;
                 if (completed)
                 {
@@ -3050,8 +3050,10 @@ namespace gpu
                     });
             }
 
-            // Textures sampled from the destination must be decoded again.
-            if (command != 3 && destPitch && Reg(0x2319) && bytes)
+            // Textures sampled from the destination must be decoded again. A resolve kept on
+            // the GPU leaves memory as it was (the backend binds its image instead), so decoding
+            // again would only reproduce the same texels, at a cost, every frame.
+            if (command != 3 && destPitch && Reg(0x2319) && bytes && !resolvedOnGpu)
             {
                 const uint32_t pitchAligned = (destPitch + 31) & ~31u;
                 const uint32_t heightAligned = ((destHeight ? destHeight : uint32_t(ey1 - offsetY)) + 31) & ~31u;
@@ -3187,6 +3189,7 @@ namespace gpu
     }
 
     void SoftSetCaptureSink(CaptureSink* sink) { g_sink = sink; }
+    void SoftInvalidateTextures(uint32_t base, uint32_t bytes) { InvalidateTextures(base, bytes); }
 
     bool g_softKeepTexels = false;
 
@@ -3473,7 +3476,7 @@ namespace gpu
         }
 
         // ---- vertex shading (once per distinct index)
-        auto vertexStart = std::chrono::steady_clock::now();
+        auto vertexStart = StatNow();
         std::unordered_map<uint32_t, uint32_t> slotOf;
         std::vector<uint32_t> unique; // distinct indices in first-use order
         std::vector<uint32_t> slots(indices.size());
@@ -3529,7 +3532,7 @@ namespace gpu
                 std::fprintf(stderr, "\n");
             }
         }
-        g_stats.vertex += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - vertexStart).count());
+        g_stats.vertex += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(StatNow() - vertexStart).count());
 
         Renderer renderer{ state, rs, Program{ psCode.data(), uint32_t(psCode.size()), true } };
         // TTT2_SOFT_INTERP=1 interprets every pixel (reference for the compiled path).

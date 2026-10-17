@@ -95,6 +95,8 @@ The native build has switches for chasing startup problems:
 | `TTT2_GPU_LOG=1` | Logs swaps, packet counts and the first draws (with a full state dump of the first) |
 | `TTT2_GPU_LOG_FRAME=<n>` | Logs every draw of swap `n`, with its textures |
 | `TTT2_GPU_STATS=1` | Every 10 swaps, prints software-renderer time per stage (vertex, raster, texture decode, resolve) |
+| `TTT2_WAIT_STATS=1` | Every 5 s, prints the guest call sites whose timed waits and sleeps took longest (asked vs. actual time) and how long blocked threads took to wake |
+| `TTT2_GPU_STATS=2` | Every 10 swaps, prints only the frame time and command-processor time (no per-draw timing, which is costly in the browser) |
 | `TTT2_DUMP_FRAMES=<n,...>` | Writes the presented image of those swaps to `frame_<n>.bmp` in the working directory |
 | `TTT2_GPU=webgpu` | Rasterises and shades pixels on the GPU through WebGPU (wgpu-native natively); the software renderer still shades vertices. Falls back to software if no adapter is found |
 | `TTT2_GPU_VERIFY_FRAME=<n>` | WebGPU: renders every draw of swap `n` with both the GPU and the software renderer from the same inputs, logs draws whose render targets differ and dumps both images (`verify_*.bmp`) |
@@ -106,6 +108,12 @@ The native build has switches for chasing startup problems:
 Bad indirect calls (a function pointer or `bctr` to an address that isn't a
 recompiled function) and access violations print a symbolised host backtrace
 instead of crashing silently.
+
+In the browser, the same switches go in the page URL (`TTT2_AUTOPRESS` included, to drive
+menus unattended). To profile the web build, configure it with `-DTTT2_WEB_PROFILING=ON`
+so the wasm keeps function names. Note that a profiler attached through DevTools changes
+thread scheduling enough to hide some stalls: compare frame times with it detached
+(`TTT2_GPU_STATS=2`).
 
 ## Browser requirements
 
