@@ -33,6 +33,26 @@ function Enter-MsvcEnv {
     if (Test-Path $llvm) { $env:Path = "$llvm;$env:Path" }
 }
 
+# Fetches any third-party submodule that is missing (a clone without --recursive).
+# Submodules already checked out are left alone: they carry our patches (apply-patches.ps1).
+function Ensure-Submodules {
+    $missing = @()
+    foreach ($line in (& git -C $Root config --file .gitmodules --get-regexp '\.path$')) {
+        $path = ($line -split ' ', 2)[1]
+        if (-not (Test-Path (Join-Path $Root "$path\.git"))) { $missing += $path }
+    }
+    if ($missing.Count -eq 0) { return }
+    Write-Host "Fetching submodules: $($missing -join ', ')" -ForegroundColor Cyan
+    # git reports progress on stderr, which Windows PowerShell turns into a terminating
+    # error under 'Stop': judge by the exit code instead.
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    & git -C $Root submodule update --init --recursive -- @missing 2>&1 | ForEach-Object { Write-Host "$_" }
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = $previous
+    if ($code -ne 0) { throw "git submodule update failed (exit code $code)" }
+}
+
 function Require-Command([string]$Name, [string]$Hint) {
     if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
         throw "'$Name' not found. $Hint"

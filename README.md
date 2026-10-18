@@ -45,7 +45,7 @@ browser: import game folder into OPFS, then Launch
 ## Quick start (Windows)
 
 ```powershell
-git clone --recursive https://github.com/monty488/tekkenwebtournament2.git
+git clone --recursive https://github.com/monty488/tekkenwebtournament2.git   # (the scripts fetch missing submodules too)
 cd tekkenwebtournament2
 
 # 1. Toolchain: CMake, Ninja, LLVM, Emscripten. Add -WithMsvc if you don't have Visual Studio.
