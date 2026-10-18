@@ -334,6 +334,24 @@ namespace gpu
             // ---- rings (offsets reset after every submit)
             WGPUBuffer drawRing_ = nullptr, vertexRing_ = nullptr, vertexMemory_ = nullptr, indexRing_ = nullptr;
             uint64_t drawOffset_ = 0, vertexOffset_ = 0, vertexMemoryOffset_ = 0, indexOffset_ = 0;
+
+            // The rings are filled from 0 after each submit. Writes go to a CPU copy and each
+            // ring is uploaded with one queue write just before the submit: thousands of small
+            // writes per frame cost far more than the bytes (in the browser each is a JS call).
+            struct StagedRing
+            {
+                std::vector<uint8_t> data;
+                uint64_t used = 0;
+                uint8_t* At(uint64_t offset, uint64_t bytes)
+                {
+                    if (data.size() < offset + bytes)
+                        data.resize(std::max<uint64_t>(offset + bytes, data.size() * 2));
+                    used = std::max(used, offset + bytes);
+                    return data.data() + offset;
+                }
+            };
+            StagedRing drawStage_, vertexStage_, vertexMemoryStage_, indexStage_;
+            void FlushStaged(WGPUBuffer buffer, StagedRing& ring, uint64_t capacity);
             std::unordered_map<uint64_t, uint32_t> vertexUploads_; // (address, words) -> word offset, per submit
 
             // ---- caches
@@ -1013,9 +1031,24 @@ fn to20e4(f: f32) -> u32 {
             passDepth_ = nullptr;
         }
 
+        void WebGpuBackend::FlushStaged(WGPUBuffer buffer, StagedRing& ring, uint64_t capacity)
+        {
+            if (!ring.used)
+                return;
+            const uint64_t bytes = std::min<uint64_t>((ring.used + 3) & ~3ull, capacity);
+            if (ring.data.size() < bytes)
+                ring.data.resize(bytes);
+            wgpuQueueWriteBuffer(queue_, buffer, 0, ring.data.data(), bytes);
+            ring.used = 0;
+        }
+
         void WebGpuBackend::Submit()
         {
             EndPass();
+            FlushStaged(drawRing_, drawStage_, kDrawRingBytes);
+            FlushStaged(vertexRing_, vertexStage_, kVertexRingBytes);
+            FlushStaged(vertexMemory_, vertexMemoryStage_, kVertexMemoryBytes);
+            FlushStaged(indexRing_, indexStage_, kIndexRingBytes);
             if (encoder_)
             {
                 WGPUCommandBufferDescriptor d = WGPU_COMMAND_BUFFER_DESCRIPTOR_INIT;
@@ -1077,17 +1110,16 @@ fn to20e4(f: f32) -> u32 {
             if (drawOffset_ + kDrawDataStride > kDrawRingBytes)
                 Submit();
             const uint32_t offset = uint32_t(drawOffset_);
-            static std::vector<uint8_t> image(kDrawDataBytes);
-            std::memset(image.data(), 0, image.size());
-            std::memcpy(image.data(), misc, 16);
+            uint8_t* image = drawStage_.At(offset, kDrawDataBytes);
+            std::memset(image, 0, kDrawDataBytes);
+            std::memcpy(image, misc, 16);
             if (xf)
-                std::memcpy(image.data() + 16, xf, 48);
+                std::memcpy(image + 16, xf, 48);
             if (constants && count)
-                std::memcpy(image.data() + 64 + size_t(first) * 16, constants, size_t(count) * 16);
+                std::memcpy(image + 64 + size_t(first) * 16, constants, size_t(count) * 16);
             if (vertexFetch)
-                std::memcpy(image.data() + 64 + 512 * 16, vertexFetch, 96 * 16);
-            wgpuQueueWriteBuffer(queue_, drawRing_, offset, image.data(), image.size());
-            stats_.drawDataBytes += image.size();
+                std::memcpy(image + 64 + 512 * 16, vertexFetch, 96 * 16);
+            stats_.drawDataBytes += kDrawDataBytes;
             drawOffset_ += kDrawDataStride;
             return offset;
         }
@@ -1106,7 +1138,7 @@ fn to20e4(f: f32) -> u32 {
             if (vertexMemoryOffset_ + bytes > kVertexMemoryBytes)
                 Submit();
             const uint32_t wordOffset = uint32_t(vertexMemoryOffset_ / 4);
-            wgpuQueueWriteBuffer(queue_, vertexMemory_, vertexMemoryOffset_, guest::ToHost<const uint8_t>(address), bytes);
+            std::memcpy(vertexMemoryStage_.At(vertexMemoryOffset_, bytes), guest::ToHost<const uint8_t>(address), bytes);
             stats_.vertexBytes += bytes;
             vertexMemoryOffset_ = (vertexMemoryOffset_ + bytes + 255) & ~255ull;
             vertexUploads_[key] = wordOffset;
@@ -1150,14 +1182,14 @@ fn to20e4(f: f32) -> u32 {
             if (skip_ || !drawPipeline_)
                 return true;
 
-            const auto start = std::chrono::steady_clock::now();
+            const auto start = StatNow();
             const uint64_t bytes = request.indices->size() * sizeof(uint32_t);
             if (bytes > kIndexRingBytes)
                 return true;
             if (indexOffset_ + bytes > kIndexRingBytes)
                 Submit();
             const uint64_t offset = indexOffset_;
-            wgpuQueueWriteBuffer(queue_, indexRing_, offset, request.indices->data(), bytes);
+            std::memcpy(indexStage_.At(offset, bytes), request.indices->data(), bytes);
             stats_.indexBytes += bytes;
             indexOffset_ = (indexOffset_ + bytes + 255) & ~255ull;
 
@@ -1183,13 +1215,13 @@ fn to20e4(f: f32) -> u32 {
             wgpuRenderPassEncoderDrawIndexed(pass_, uint32_t(request.indices->size()), 1, 0, 0, 0);
             ++stats_.draws;
             stats_.triangles += request.indices->size() / 3;
-            stats_.encodeNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+            stats_.encodeNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(StatNow() - start).count());
             return true;
         }
 
         bool WebGpuBackend::Prepare(const PrepareArgs& args)
         {
-            const auto start = std::chrono::steady_clock::now();
+            const auto start = StatNow();
             const RasterState& rs = *args.rs;
             rs_ = &rs;
             skip_ = false;
@@ -1262,7 +1294,7 @@ fn to20e4(f: f32) -> u32 {
             for (uint32_t k = 0; k < 32; k += 4)
                 translationKey = Mix(translationKey, options.slotSwizzle[k] | (uint64_t(options.slotSwizzle[k + 1]) << 16) |
                     (uint64_t(options.slotSwizzle[k + 2]) << 32) | (uint64_t(options.slotSwizzle[k + 3]) << 48));
-            const auto tSetup = std::chrono::steady_clock::now();
+            const auto tSetup = StatNow();
             stats_.setupNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(tSetup - start).count());
             Translation& translation = translations_[translationKey];
             if (!translation.key)
@@ -1434,7 +1466,7 @@ fn to20e4(f: f32) -> u32 {
             }
             drawPipeline_ = pipeline;
 
-            const auto tPipeline = std::chrono::steady_clock::now();
+            const auto tPipeline = StatNow();
             stats_.pipelineNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(tPipeline - tSetup).count());
             // ---- constants, vertex memory and textures
             const float misc[4] = { rs.alphaRef, 0, 0, 0 };
@@ -1483,7 +1515,7 @@ fn to20e4(f: f32) -> u32 {
                 drawDataOffset_ = WriteDrawData(misc, nullptr, hasFragment ? args.constants : nullptr, 256, hasFragment ? 256 : 0);
             }
 
-            const auto tData = std::chrono::steady_clock::now();
+            const auto tData = StatNow();
             stats_.dataNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(tData - tPipeline).count());
             if (bindGroupsDirty_)
             {
@@ -1530,8 +1562,8 @@ fn to20e4(f: f32) -> u32 {
             if (!group)
                 group = wgpuDeviceCreateBindGroup(device_, &bgd);
             drawTextures_ = group;
-            stats_.bindNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tData).count());
-            stats_.encodeNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+            stats_.bindNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(StatNow() - tData).count());
+            stats_.encodeNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(StatNow() - start).count());
             return true;
         }
 
@@ -1581,7 +1613,7 @@ fn to20e4(f: f32) -> u32 {
         {
             if (skip_ || vertices_.empty() || !drawPipeline_)
                 return;
-            const auto start = std::chrono::steady_clock::now();
+            const auto start = StatNow();
             const RasterState& rs = *rs_;
             const uint64_t bytes = vertices_.size() * sizeof(float);
             if (bytes > kVertexRingBytes)
@@ -1589,7 +1621,7 @@ fn to20e4(f: f32) -> u32 {
             if (vertexOffset_ + bytes > kVertexRingBytes)
                 Submit();
             const uint64_t offset = vertexOffset_;
-            wgpuQueueWriteBuffer(queue_, vertexRing_, offset, vertices_.data(), bytes);
+            std::memcpy(vertexStage_.At(offset, bytes), vertices_.data(), bytes);
             vertexOffset_ = (vertexOffset_ + bytes + 255) & ~255ull;
 
             BeginPass(drawColor_, drawDepth_);
@@ -1613,7 +1645,7 @@ fn to20e4(f: f32) -> u32 {
             wgpuRenderPassEncoderSetStencilReference(pass_, rs.stencilFace[0].ref);
             wgpuRenderPassEncoderDraw(pass_, uint32_t(vertices_.size() / floatsPerVertex_), 1, 0, 0);
             ++stats_.draws;
-            stats_.encodeNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+            stats_.encodeNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(StatNow() - start).count());
         }
 
         // ---- resolves -------------------------------------------------------------------------
@@ -2132,6 +2164,7 @@ fn to20e4(f: f32) -> u32 {
                     }
                 }
             ++stats_.flushes;
+            SoftInvalidateTextures(base, pitch * ((image.height + 31) & ~31u) * bpp);
         }
 
         bool WebGpuBackend::PresentFrontBuffer(const uint32_t fetch[6])

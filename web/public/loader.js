@@ -138,12 +138,17 @@ async function launch() {
   $('launch').disabled = true;
   const canvas = $('screen');
   try {
+    // Render on the GPU whenever the browser can (the software renderer is far slower);
+    // &TTT2_GPU=soft keeps the software renderer.
+    const gpu = !params.has('TTT2_GPU') && navigator.gpu && (await navigator.gpu.requestAdapter().catch(() => null));
+    log(params.has('TTT2_GPU') ? `Renderer: TTT2_GPU=${params.get('TTT2_GPU')}` : gpu ? 'Renderer: WebGPU' : 'Renderer: software (no WebGPU adapter)');
     const { default: createTTT2 } = await import('./ttt2.js');
     await createTTT2({
       canvas,
       arguments: streaming ? ['--stream'] : [],
       // TTT2_* switches from the page URL, e.g. ?stream&TTT2_GPU_STATS=1
       preRun: [(module) => {
+        if (gpu) module.ENV.TTT2_GPU = 'webgpu';
         for (const [key, value] of params) if (key.startsWith('TTT2_')) module.ENV[key] = value;
       }],
       print: (t) => log(t),

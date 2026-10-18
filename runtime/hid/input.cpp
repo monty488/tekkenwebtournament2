@@ -133,7 +133,7 @@ namespace hid
         PadState pad;
         if (user == 0)
         {
-            pad.buttons = g_keyboardButtons.load();
+            pad.buttons = g_keyboardButtons.load() | AutoPressButtons();
             pad.connected = true; // keyboard always counts as player 1
         }
 

@@ -13,7 +13,12 @@
 #include <condition_variable>
 #include <cstring>
 #include <mutex>
+#include <climits>
 #include <thread>
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten/threading.h>
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -344,6 +349,11 @@ static void WaitForOwnerChange(uint32_t& field, uint32_t owner, std::chrono::mil
 {
 #ifdef _WIN32
     WaitOnAddress(&field, &owner, sizeof(owner), DWORD(timeout.count()));
+#elif defined(__EMSCRIPTEN__)
+    // Not std::atomic_ref::wait: emscripten's libc++ has no futex behind it and polls with
+    // growing sleeps (up to 8 ms) that ignore notify, so contended critical sections stalled
+    // the game's job threads for far longer than they were held.
+    emscripten_futex_wait(&field, owner, double(timeout.count()));
 #else
     std::atomic_ref<uint32_t>(field).wait(owner);
 #endif
@@ -353,6 +363,8 @@ static void WakeOwnerWaiters(uint32_t& field)
 {
 #ifdef _WIN32
     WakeByAddressAll(&field);
+#elif defined(__EMSCRIPTEN__)
+    emscripten_futex_wake(&field, INT_MAX);
 #else
     std::atomic_ref<uint32_t>(field).notify_all();
 #endif
@@ -407,6 +419,7 @@ GUEST_IMPORT(KeQueryPerformanceFrequency)
 GUEST_IMPORT(KeDelayExecutionThread)
 {
     const int64_t interval = Load<int64_t>(ctx.r5.u32);
+    WaitStat stat(uint32_t(ctx.lr), interval < 0 ? -interval * 100 : 0);
     if (interval < 0)
         std::this_thread::sleep_for(std::chrono::nanoseconds(-interval * 100));
     else

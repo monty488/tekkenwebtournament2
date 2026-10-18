@@ -6,7 +6,9 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <functional>
 #include <cstdint>
 #include <vector>
@@ -15,6 +17,18 @@
 namespace gpu
 {
     using F4 = std::array<float, 4>;
+
+    // Clock for the TTT2_GPU_STATS timings. Without stats it reads nothing: in the browser
+    // each clock read is a call out to JS, and a draw used to take a dozen of them.
+    inline bool GpuStatsEnabled()
+    {
+        static const bool enabled = [] { const char* v = std::getenv("TTT2_GPU_STATS"); return v && *v == '1'; }();
+        return enabled;
+    }
+    inline std::chrono::steady_clock::time_point StatNow()
+    {
+        return GpuStatsEnabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    }
 
     constexpr uint32_t kEdramTiles = 2048;
     constexpr uint32_t kTileSamples = 80 * 16;
@@ -225,6 +239,10 @@ namespace gpu
     };
 
     void SoftSetCaptureSink(CaptureSink* sink);
+
+    // Makes textures decoded from [base, base + bytes) decode again on their next use (a
+    // backend wrote a GPU-kept resolve back to memory).
+    void SoftInvalidateTextures(uint32_t base, uint32_t bytes);
 
     // Verification (TTT2_GPU_VERIFY_FRAME): while set, backends keep decoded texels (the
     // software renderer samples them too) and do not keep resolves on the GPU.

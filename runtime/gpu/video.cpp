@@ -230,6 +230,8 @@ namespace gpu
     }
 
     static uint64_t g_cpBusyNs = 0, g_presentNs = 0; // TTT2_GPU_STATS timings (command processor thread)
+    // Browser: command-processor slices and the time between them (the worker's event loop).
+    static uint64_t g_slices = 0, g_sliceGapNs = 0, g_sliceGapMaxNs = 0;
 
     static void OnSwap(uint32_t frontBuffer, uint32_t width, uint32_t height, const std::array<uint32_t, 6>& fetch)
     {
@@ -251,7 +253,8 @@ namespace gpu
         if (g_gpuLog && (swaps <= 3 || (swaps & (swaps - 1)) == 0))
             std::fprintf(stderr, "[gpu]   soft renderer: %llu pixels, %llu resolves so far\n",
                 (unsigned long long)SoftPixelsWritten(), (unsigned long long)SoftResolves());
-        static const bool softStats = [] { const char* v = std::getenv("TTT2_GPU_STATS"); return v && *v == '1'; }();
+        // TTT2_GPU_STATS=2: just this line, without timing every draw (cheaper in the browser).
+        static const bool softStats = [] { const char* v = std::getenv("TTT2_GPU_STATS"); return v && (*v == '1' || *v == '2'); }();
         if (softStats && swaps % 10 == 0)
         {
             // Command processor time per 10 swaps: executing packets (rendering included)
@@ -260,16 +263,23 @@ namespace gpu
             const auto now = std::chrono::steady_clock::now();
             std::fprintf(stderr, "[gpu] 10 swaps in %.1f ms: command processor busy %.1f ms, present %.1f ms\n",
                 std::chrono::duration<double, std::milli>(now - last).count(), g_cpBusyNs / 1e6, g_presentNs / 1e6);
+            if (g_slices)
+                std::fprintf(stderr, "[gpu]   %llu slices, %.1f ms between them in all (max %.1f ms)\n", (unsigned long long)g_slices,
+                    g_sliceGapNs / 1e6, g_sliceGapMaxNs / 1e6);
+            g_slices = g_sliceGapNs = g_sliceGapMaxNs = 0;
             last = now;
             g_cpBusyNs = 0;
             g_presentNs = 0;
-            SoftPrintStats();
-            WebGpuPrintStats();
+            if (GpuStatsEnabled())
+            {
+                SoftPrintStats();
+                WebGpuPrintStats();
+            }
         }
         struct PresentTimer
         {
-            std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
-            ~PresentTimer() { g_presentNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()); }
+            std::chrono::steady_clock::time_point start = StatNow();
+            ~PresentTimer() { g_presentNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(StatNow() - start).count()); }
         } presentTimer;
 
         // Show the front buffer the game just swapped to.
@@ -770,6 +780,14 @@ namespace gpu
         const uint64_t swapsBefore = g_swapCount;
         auto lastWork = std::chrono::steady_clock::now();
         const auto sliceStart = lastWork;
+        static std::chrono::steady_clock::time_point lastSliceEnd;
+        if (lastSliceEnd.time_since_epoch().count())
+        {
+            const uint64_t gap = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(sliceStart - lastSliceEnd).count());
+            ++g_slices;
+            g_sliceGapNs += gap;
+            g_sliceGapMaxNs = std::max(g_sliceGapMaxNs, gap);
+        }
         for (;;)
         {
             const uint32_t base = g_ringBase.load();
@@ -796,6 +814,7 @@ namespace gpu
                 break;
             sched_yield();
         }
+        lastSliceEnd = std::chrono::steady_clock::now();
         ScheduleCommandProcessorSlice();
     }
 
