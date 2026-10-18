@@ -46,6 +46,7 @@ try {
 } finally { Pop-Location }
 
 & "$PSScriptRoot\fetch-wgpu.ps1"
+& "$PSScriptRoot\fetch-ffmpeg.ps1" # XMA sound; needs Git Bash, MSVC and the emsdk above
 & "$PSScriptRoot\apply-patches.ps1"
 
 Write-Host "`nDone. Open a NEW terminal so PATH changes apply, then run scripts\build-tools.ps1" -ForegroundColor Green

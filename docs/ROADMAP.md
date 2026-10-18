@@ -98,7 +98,11 @@ Rough milestones, in order. Each depends on the previous one.
       stereo, mixed one per tick, and played through WASAPI (native) or an AudioWorklet
       reading the ring from wasm memory (browser); the device's clock paces the callbacks.
       The intro movie and logos have sound; menus and fights need XMA
-- [ ] XMA decoding (FFmpeg xma2 → wasm)
+- [x] XMA decoding: FFmpeg's WMA Pro frame decoder, one frame per 512 output samples
+      (`runtime/apu/xma_decoder.c`), frames found by their length fields across packets and
+      input buffers; a minimal FFmpeg (avcodec + avutil, xma decoders only) is fetched and
+      configured by `scripts/fetch-ffmpeg.ps1` for both targets. Menus and fights have sound
+- [ ] XMA: loop subframes (loops start on frame boundaries), multi-stream contexts
 
 ## M5: Playable in the browser
 - [x] wasm64 build runs in Chrome/Edge: boots from game data streamed off the dev server

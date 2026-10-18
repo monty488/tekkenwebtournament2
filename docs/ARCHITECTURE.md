@@ -178,11 +178,18 @@ The game's XAudio2 is statically linked. It mixes in software and hands 256-samp
   callbacks run whenever the queue drops below ~32 ms, so the device clock paces the
   game's mixing (plain timer while the device is not consuming, e.g. before the first
   click in the browser);
-* decode **XMA**, the hardware decoder exposed through `XMA*` kernel calls and the
+* decodes **XMA**, the hardware decoder exposed through `XMA*` kernel calls and the
   register file at 0x7FEA0000. `runtime/apu/xma.cpp` emulates the contexts (Xenia's
-  layout) and outputs silence; MMIO stores to the register file reach it through
-  `recomp/mmio.h`. FFmpeg's `xma2` decoder, compiled to wasm, is the most direct
-  route to real output.
+  layout; MMIO stores to the register file reach it through `recomp/mmio.h`): each kicked
+  context takes frames by their 15-bit length fields, gathering them across packets and
+  input buffers, and decodes one 512-sample frame per call with FFmpeg's WMA Pro frame
+  decoder (`runtime/apu/xma_decoder.c` includes `libavcodec/wmaprodec.c` to reach it;
+  FFmpeg's own xma2 decoder buffers thousands of samples, which breaks the hardware's
+  1:1 pacing). Read offsets the guest sets (loop starts) point one bit before a frame,
+  so reading snaps to the next frame start in the packet. FFmpeg is fetched and
+  configured by `scripts/fetch-ffmpeg.ps1` (configure under Git Bash generates
+  `config.h`; `scripts/ffmpeg_sources.py` lists the sources from its Makefiles, and
+  CMake compiles them, so no make is needed).
 
 ## 8. Input
 

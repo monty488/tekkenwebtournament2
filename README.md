@@ -136,6 +136,7 @@ Desktop Chrome or Edge is the primary target.
 | `thirdparty/XenonRecomp` | PPC → C++ recompiler (submodule) |
 | `thirdparty/XenosRecomp` | Xenos shader → HLSL recompiler (submodule) |
 | `thirdparty/extract-xiso` | Xbox disc image extractor (submodule) |
+| `.tools/` | *(fetched, ignored)* emsdk, wgpu-native, and a minimal FFmpeg for XMA audio (`scripts/fetch-ffmpeg.ps1`, LGPL) |
 | `patches/` | Our changes to submodules (WebAssembly support), applied by the scripts |
 | `tools/ttt2-scan` | Dumps the XEX image, import list, and finds the register save/restore helper addresses |
 | `recomp/config` | XenonRecomp configuration for TTT2 |
