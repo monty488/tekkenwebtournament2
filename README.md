@@ -105,6 +105,8 @@ The native build has switches for chasing startup problems:
 | `TTT2_WGSL_DUMP=1` | Writes every pixel shader translated for the WebGPU backend to `shader_<hash>.wgsl` |
 | `TTT2_SOFT_GPU=0` | Skips rendering (draws are only tracked); frames are then black but run at full speed |
 | `TTT2_FILE_LOG=1` | Logs every file open and read |
+| `TTT2_AUDIO=0` | No sound output (the game's audio still runs on its clock) |
+| `TTT2_AUDIO_DUMP=<file.wav>` | Also writes the game's stereo output to a WAV file |
 
 Bad indirect calls (a function pointer or `bctr` to an address that isn't a
 recompiled function) and access violations print a symbolised host backtrace

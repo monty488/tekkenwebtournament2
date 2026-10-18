@@ -166,14 +166,18 @@ dominates, but the low-level path already reaches 60 fps in fights natively.
 
 The game's XAudio2 is statically linked. It mixes in software and hands 256-sample,
 6-channel float frames to the kernel render driver
-(`XAudioRegisterRenderDriverClient` / `XAudioSubmitRenderDriverFrame`, stubbed
-in `runtime/apu/audio.cpp`). The runtime must:
+(`XAudioRegisterRenderDriverClient` / `XAudioSubmitRenderDriverFrame`, in
+`runtime/apu/audio.cpp`; output in `runtime/apu/output.cpp`). The runtime:
 
 * call every registered client callback every 256 samples (5.33 ms at 48 kHz),
   from a dedicated guest thread (TTT2 runs two XAudio2 engines, each with its own
   client; an engine whose callback stops never drains its voices);
-* downmix 5.1 to stereo and push into a `SharedArrayBuffer` ring buffer read by an
-  **AudioWorklet**;
+* downmixes 5.1 to stereo, sums one frame per engine per tick and pushes it into a ring
+  buffer: WASAPI drains it natively, and in the browser an **AudioWorklet**
+  (`web/public/audio-worklet.js`) reads it straight out of the shared wasm memory. The
+  callbacks run whenever the queue drops below ~32 ms, so the device clock paces the
+  game's mixing (plain timer while the device is not consuming, e.g. before the first
+  click in the browser);
 * decode **XMA**, the hardware decoder exposed through `XMA*` kernel calls and the
   register file at 0x7FEA0000. `runtime/apu/xma.cpp` emulates the contexts (Xenia's
   layout) and outputs silence; MMIO stores to the register file reach it through

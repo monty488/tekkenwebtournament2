@@ -21,6 +21,7 @@ if (TTT2_HAVE_RECOMP)
         gpu/webgpu_backend.cpp
         gpu/presenter_win.cpp
         apu/audio.cpp
+        apu/output.cpp
         apu/xma.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../recomp/generated/import_stubs.cpp
     )

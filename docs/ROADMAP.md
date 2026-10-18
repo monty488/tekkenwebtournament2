@@ -94,7 +94,10 @@ Rough milestones, in order. Each depends on the previous one.
 - [ ] Browser: emdawnwebgpu build of the same backend, canvas presentation
 
 ## M4: Sound
-- [ ] Render-driver callback thread and AudioWorklet output
+- [x] Render-driver callback thread and output: each engine's frames are downmixed to
+      stereo, mixed one per tick, and played through WASAPI (native) or an AudioWorklet
+      reading the ring from wasm memory (browser); the device's clock paces the callbacks.
+      The intro movie and logos have sound; menus and fights need XMA
 - [ ] XMA decoding (FFmpeg xma2 → wasm)
 
 ## M5: Playable in the browser
