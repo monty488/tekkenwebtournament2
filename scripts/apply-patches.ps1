@@ -1,5 +1,6 @@
 # Applies patches\<Submodule>-NNNN-*.patch to thirdparty\<Submodule>. Safe to re-run.
 . "$PSScriptRoot\common.ps1"
+Ensure-Submodules
 
 Get-ChildItem (Join-Path $Root 'patches') -Filter '*.patch' | Sort-Object Name | ForEach-Object {
     $module = $_.Name.Split('-')[0]
