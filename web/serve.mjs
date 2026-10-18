@@ -3,7 +3,7 @@
 // cross-origin isolated, which requires COOP + COEP on every response.
 //
 //   node web/serve.mjs [directory] [port] [--game <game dir>]
-//   node web/serve.mjs build/web-release 8080 --game game
+//   node web/serve.mjs build/web-release 8080 --game game   (its runtime/ folder is served)
 //
 // With --game, the local game folder (files/ and scan/) is served under /game/ with
 // HTTP range support, plus /game/manifest.txt listing every file. The page then streams
@@ -11,14 +11,19 @@
 // Development only: it serves to 127.0.0.1 and nothing leaves the machine.
 
 import { createServer } from 'node:http';
-import { createReadStream } from 'node:fs';
+import { createReadStream, existsSync } from 'node:fs';
 import { readdir, stat } from 'node:fs/promises';
 import { extname, join, normalize, relative, resolve, sep } from 'node:path';
 
 const args = process.argv.slice(2);
 const gameIndex = args.indexOf('--game');
 const gameRoot = gameIndex >= 0 ? resolve(args.splice(gameIndex, 2)[1]) : null;
-const root = resolve(args[0] ?? 'web/public');
+// A build folder (build/web-release) holds the page in its runtime/ subfolder.
+let root = resolve(args[0] ?? 'web/public');
+if (!existsSync(join(root, 'index.html')) && existsSync(join(root, 'runtime', 'index.html')))
+  root = join(root, 'runtime');
+if (!existsSync(join(root, 'index.html')))
+  console.warn(`Warning: no index.html in ${root}. Build the web target first (scripts\\build-web.ps1).`);
 const port = Number(args[1] ?? 8080);
 
 const types = {
