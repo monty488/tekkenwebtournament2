@@ -46,7 +46,13 @@ try {
 } finally { Pop-Location }
 
 & "$PSScriptRoot\fetch-wgpu.ps1"
-& "$PSScriptRoot\fetch-ffmpeg.ps1" # XMA sound; needs Git Bash, MSVC and the emsdk above
 & "$PSScriptRoot\apply-patches.ps1"
+# XMA sound; needs Git Bash, MSVC and the emsdk above. Optional: without it the game runs
+# with sound effects silent, so a failure here does not stop the setup.
+try {
+    & "$PSScriptRoot\fetch-ffmpeg.ps1"
+} catch {
+    Write-Warning "FFmpeg setup failed ($_). XMA sound will be silent; fix the error above and run scripts\fetch-ffmpeg.ps1 again."
+}
 
 Write-Host "`nDone. Open a NEW terminal so PATH changes apply, then run scripts\build-tools.ps1" -ForegroundColor Green
