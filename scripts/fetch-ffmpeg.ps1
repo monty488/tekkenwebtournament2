@@ -73,9 +73,20 @@ if ($Target -in 'native', 'all') {
 }
 if ($Target -in 'web', 'all') {
     $emsdk = Join-Path $ToolsDir 'emsdk'
-    if (-not (Test-Path (Join-Path $emsdk 'emsdk_env.sh'))) { throw 'emsdk not found in .tools\emsdk. Run scripts\bootstrap.ps1' }
+    $emscripten = Join-Path $emsdk 'upstream\emscripten'
+    if (-not (Test-Path (Join-Path $emscripten 'emcc.exe'))) {
+        throw 'emsdk (with emcc.exe) not found in .tools\emsdk. Run scripts\bootstrap.ps1'
+    }
+    # Emscripten's environment comes from PowerShell (as for the web build) and its tools
+    # folder goes straight onto bash's PATH: sourcing emsdk_env.sh inside Git Bash needs a
+    # working python there, and silently does nothing without one.
+    $ErrorActionPreference = 'Continue'
+    . (Join-Path $emsdk 'emsdk_env.ps1') *> $null
+    $ErrorActionPreference = 'Stop'
+    $setup = "export PATH=`"$(To-Posix $emscripten):`$PATH`" && " +
+             "{ command -v emcc > /dev/null || { echo 'emcc not runnable from Git Bash' >&2; exit 1; }; } && "
     # wasm64 (memory64), as the runtime: pointer sizes are baked into config.h.
-    Configure-Target 'web' "source '$(To-Posix $emsdk)/emsdk_env.sh' > /dev/null 2>&1 && " `
+    Configure-Target 'web' $setup `
         ('--enable-cross-compile --target-os=none --arch=wasm --cc=emcc --cxx=em++ --host-cc=emcc --ar=emar --ranlib=emranlib --nm=emnm ' +
          '--extra-cflags=-sMEMORY64=1 --extra-ldflags=-sMEMORY64=1')
 }
