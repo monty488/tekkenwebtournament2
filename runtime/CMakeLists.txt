@@ -21,6 +21,7 @@ if (TTT2_HAVE_RECOMP)
         gpu/webgpu_backend.cpp
         gpu/presenter_win.cpp
         apu/audio.cpp
+        apu/output.cpp
         apu/xma.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../recomp/generated/import_stubs.cpp
     )
@@ -52,6 +53,48 @@ if (MSVC AND TTT2_HAVE_RECOMP)
     # RelWithDebInfo defaults to /Ob1 (only explicitly inline functions), which leaves the
     # software renderer's small per-pixel helpers as calls; inline like Release does.
     target_compile_options(ttt2 PRIVATE $<$<CONFIG:RelWithDebInfo>:/Ob2>)
+endif()
+
+# XMA decoding: a minimal FFmpeg (libavcodec's xma1/xma2 decoders + libavutil), prepared by
+# scripts/fetch-ffmpeg.ps1. Without it XMA voices play silence.
+if (TTT2_HAVE_RECOMP)
+    if (EMSCRIPTEN)
+        set(TTT2_FFMPEG_BUILD ${CMAKE_SOURCE_DIR}/.tools/ffmpeg/web)
+    else()
+        set(TTT2_FFMPEG_BUILD ${CMAKE_SOURCE_DIR}/.tools/ffmpeg/native)
+    endif()
+    if (EXISTS ${TTT2_FFMPEG_BUILD}/ffmpeg_sources.cmake)
+        include(${TTT2_FFMPEG_BUILD}/ffmpeg_sources.cmake)
+        # apu/xma_decoder.c includes wmaprodec.c to reach its frame decoder (and so replaces it).
+        list(FILTER FFMPEG_SOURCES EXCLUDE REGEX "/libavcodec/wmaprodec\\.c$")
+        list(APPEND FFMPEG_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/apu/xma_decoder.c)
+        add_library(ttt2_ffmpeg STATIC ${FFMPEG_SOURCES})
+        set_target_properties(ttt2_ffmpeg PROPERTIES C_STANDARD 17)
+        target_include_directories(ttt2_ffmpeg PRIVATE ${FFMPEG_INCLUDES})
+        target_include_directories(ttt2_ffmpeg INTERFACE ${TTT2_FFMPEG_BUILD} ${CMAKE_SOURCE_DIR}/.tools/ffmpeg/src)
+        target_compile_definitions(ttt2_ffmpeg PRIVATE ${FFMPEG_DEFINES} HAVE_AV_CONFIG_H)
+        # FFmpeg's make adds -DBUILDING_<library> per directory.
+        foreach (source ${FFMPEG_SOURCES})
+            if (source MATCHES "/libavutil/")
+                set_source_files_properties(${source} PROPERTIES COMPILE_DEFINITIONS BUILDING_avutil)
+            else()
+                set_source_files_properties(${source} PROPERTIES COMPILE_DEFINITIONS BUILDING_avcodec)
+            endif()
+        endforeach()
+        if (MSVC)
+            target_compile_options(ttt2_ffmpeg PRIVATE /w)
+        else()
+            target_compile_options(ttt2_ffmpeg PRIVATE -w)
+        endif()
+        if (WIN32)
+            target_link_libraries(ttt2_ffmpeg INTERFACE bcrypt) # libavutil's random seed
+        endif()
+        target_link_libraries(ttt2 PRIVATE ttt2_ffmpeg)
+        target_compile_definitions(ttt2 PRIVATE TTT2_HAVE_FFMPEG=1)
+        message(STATUS "TTT2: XMA decoding with FFmpeg from ${TTT2_FFMPEG_BUILD}")
+    else()
+        message(WARNING "FFmpeg not prepared in ${TTT2_FFMPEG_BUILD}: run scripts\\fetch-ffmpeg.ps1 for XMA sound")
+    endif()
 endif()
 
 if (EMSCRIPTEN)

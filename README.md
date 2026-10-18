@@ -105,6 +105,9 @@ The native build has switches for chasing startup problems:
 | `TTT2_WGSL_DUMP=1` | Writes every pixel shader translated for the WebGPU backend to `shader_<hash>.wgsl` |
 | `TTT2_SOFT_GPU=0` | Skips rendering (draws are only tracked); frames are then black but run at full speed |
 | `TTT2_FILE_LOG=1` | Logs every file open and read |
+| `TTT2_AUDIO=0` | No sound output (the game's audio still runs on its clock) |
+| `TTT2_AUDIO_DUMP=<file.wav>` | Also writes the game's stereo output to a WAV file |
+| `TTT2_XMA_STATS=1` | Every 5 s, per active XMA context: format, frames decoded, average frame size, peak level, skipped packets, stalls |
 
 Bad indirect calls (a function pointer or `bctr` to an address that isn't a
 recompiled function) and access violations print a symbolised host backtrace
@@ -134,6 +137,7 @@ Desktop Chrome or Edge is the primary target.
 | `thirdparty/XenonRecomp` | PPC → C++ recompiler (submodule) |
 | `thirdparty/XenosRecomp` | Xenos shader → HLSL recompiler (submodule) |
 | `thirdparty/extract-xiso` | Xbox disc image extractor (submodule) |
+| `.tools/` | *(fetched, ignored)* emsdk, wgpu-native, and a minimal FFmpeg for XMA audio (`scripts/fetch-ffmpeg.ps1`, LGPL) |
 | `patches/` | Our changes to submodules (WebAssembly support), applied by the scripts |
 | `tools/ttt2-scan` | Dumps the XEX image, import list, and finds the register save/restore helper addresses |
 | `recomp/config` | XenonRecomp configuration for TTT2 |

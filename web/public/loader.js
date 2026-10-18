@@ -134,9 +134,43 @@ async function clearImported() {
 const params = new URLSearchParams(location.search);
 const streaming = params.has('stream');
 
+// Sound: the runtime calls ttt2StartAudio with its output ring once the game's audio starts.
+// Browsers only start an AudioContext after a user gesture, so it is created at launch
+// (a click on Launch counts) and resumed on the first click or key press otherwise.
+let audioContext = null;
+function createAudio() {
+  try {
+    audioContext = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' });
+  } catch (err) {
+    log(`No audio: ${err.message}`);
+    return;
+  }
+  const resume = () => audioContext.state === 'suspended' && audioContext.resume();
+  for (const type of ['pointerdown', 'keydown']) window.addEventListener(type, resume);
+}
+
+async function startAudio(buffer, ptr) {
+  if (!audioContext) return;
+  try {
+    await audioContext.audioWorklet.addModule('audio-worklet.js');
+    const capacity = new Uint32Array(buffer, ptr, 4)[2];
+    const node = new AudioWorkletNode(audioContext, 'ttt2-output', {
+      numberOfInputs: 0,
+      outputChannelCount: [2],
+      processorOptions: { buffer, ptr, capacity },
+    });
+    node.connect(audioContext.destination);
+    window.ttt2Audio = { context: audioContext, ring: new Uint32Array(buffer, ptr, 4) }; // for debugging
+    log(audioContext.state === 'running' ? 'Audio: on' : 'Audio: click or press a key to start sound');
+  } catch (err) {
+    log(`No audio: ${err.message}`);
+  }
+}
+
 async function launch() {
   $('launch').disabled = true;
   const canvas = $('screen');
+  createAudio();
   try {
     // Render on the GPU whenever the browser can (the software renderer is far slower);
     // &TTT2_GPU=soft keeps the software renderer.
@@ -153,6 +187,7 @@ async function launch() {
       }],
       print: (t) => log(t),
       printErr: (t) => log(t),
+      ttt2StartAudio: startAudio,
     });
     $('fullscreen').disabled = false;
   } catch (err) {
