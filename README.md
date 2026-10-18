@@ -107,6 +107,7 @@ The native build has switches for chasing startup problems:
 | `TTT2_FILE_LOG=1` | Logs every file open and read |
 | `TTT2_AUDIO=0` | No sound output (the game's audio still runs on its clock) |
 | `TTT2_AUDIO_DUMP=<file.wav>` | Also writes the game's stereo output to a WAV file |
+| `TTT2_XMA_STATS=1` | Every 5 s, per active XMA context: format, frames decoded, average frame size, peak level, skipped packets, stalls |
 
 Bad indirect calls (a function pointer or `bctr` to an address that isn't a
 recompiled function) and access violations print a symbolised host backtrace

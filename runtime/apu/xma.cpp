@@ -29,6 +29,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <thread>
@@ -63,6 +64,10 @@ namespace apu
         TTT2XmaDecoder* decoder = nullptr;
         uint32_t decoderChannels = 0, decoderRate = 0;
 #endif
+        // TTT2_XMA_STATS (g_mutex): activity since the last report.
+        uint64_t statFrames = 0, statBits = 0, statSkips = 0, statStalls = 0;
+        float statPeak = 0;
+        uint32_t statChannels = 0, statRate = 0;
     };
 
     static uint32_t g_contextArray = 0; // guest virtual address of context 0
@@ -377,9 +382,15 @@ namespace apu
                 uint32_t frameBits = 0;
                 const FrameResult result = TakeFrame(data, frame, frameBits);
                 if (result == FrameResult::NeedInput)
+                {
+                    ++g_contexts[id].statStalls;
                     break;
+                }
                 if (result == FrameResult::Skipped)
+                {
+                    ++g_contexts[id].statSkips;
                     continue;
+                }
 
                 float left[kSamplesPerFrame] = {}, right[kSamplesPerFrame] = {};
                 const bool stereo = data.isStereo();
@@ -403,6 +414,15 @@ namespace apu
                             (unsigned long long)corrupt, (unsigned long long)decoded);
                 }
 #endif
+                {
+                    Context& c = g_contexts[id];
+                    ++c.statFrames;
+                    c.statBits += frameBits;
+                    c.statChannels = stereo ? 2 : 1;
+                    c.statRate = data.sampleRate();
+                    for (uint32_t i = 0; i < kSamplesPerFrame; ++i)
+                        c.statPeak = std::max({ c.statPeak, std::abs(left[i]), std::abs(right[i]) });
+                }
                 WriteFrame(output, capacity, writeOffset, left, stereo ? right : nullptr);
                 space -= frameBytes;
 
@@ -426,11 +446,33 @@ namespace apu
             guest::Store<uint32_t>(address + i * 4, data.d[i]);
     }
 
+    // TTT2_XMA_STATS=1: every 5 s, what each active context decoded.
+    static void ReportStats()
+    {
+        static const bool enabled = [] { const char* v = std::getenv("TTT2_XMA_STATS"); return v && *v == '1'; }();
+        static auto last = std::chrono::steady_clock::now();
+        if (!enabled || std::chrono::steady_clock::now() - last < std::chrono::seconds(5))
+            return;
+        last = std::chrono::steady_clock::now();
+        for (uint32_t id = 0; id < kContextCount; ++id)
+        {
+            Context& c = g_contexts[id];
+            if (!c.statFrames && !c.statSkips && !c.statStalls)
+                continue;
+            TTT2_LOG("xma ctx %u: %uch %u Hz, %llu frames (avg %llu bits), peak %.3f, %llu skips, %llu stalls", id, c.statChannels, c.statRate,
+                (unsigned long long)c.statFrames, (unsigned long long)(c.statFrames ? c.statBits / c.statFrames : 0), c.statPeak,
+                (unsigned long long)c.statSkips, (unsigned long long)c.statStalls);
+            c.statFrames = c.statBits = c.statSkips = c.statStalls = 0;
+            c.statPeak = 0;
+        }
+    }
+
     static void DecoderThread()
     {
         std::unique_lock lock(g_mutex);
         for (;;)
         {
+            ReportStats();
             // Kicks notify; the timeout only bounds the wait if a notify slips past.
             g_kicked.wait_for(lock, std::chrono::milliseconds(5));
             for (uint32_t id = 0; id < kContextCount; ++id)

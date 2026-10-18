@@ -102,7 +102,12 @@ Rough milestones, in order. Each depends on the previous one.
       (`runtime/apu/xma_decoder.c`), frames found by their length fields across packets and
       input buffers; a minimal FFmpeg (avcodec + avutil, xma decoders only) is fetched and
       configured by `scripts/fetch-ffmpeg.ps1` for both targets. Menus and fights have sound
-- [ ] XMA: loop subframes (loops start on frame boundaries), multi-stream contexts
+- [ ] Music is silent: it plays as three stereo 48 kHz contexts started together (5.1
+      split over 3 streams; `TTT2_XMA_STATS=1` shows them decoding with real levels, the
+      middle one empty). Next: check whether these contexts' buffers interleave packets of
+      several streams (follow the packet skip counts for every frame, not just
+      continuations) and how XAudio2 routes the voices to the mix
+- [ ] XMA: loop subframes (loops start on frame boundaries)
 
 ## M5: Playable in the browser
 - [x] wasm64 build runs in Chrome/Edge: boots from game data streamed off the dev server
