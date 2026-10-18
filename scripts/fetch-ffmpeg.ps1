@@ -55,7 +55,15 @@ function Configure-Target([string]$Name, [string]$Setup, [string]$Options) {
     Write-Host "Configuring FFmpeg ($Name) ..." -ForegroundColor Cyan
     $script = "$Setup cd '$(To-Posix $out)' && '$(To-Posix $src)/configure' $common $Options > configure.log 2>&1"
     & $bash -lc $script
-    if ($LASTEXITCODE -ne 0) { throw "FFmpeg configure ($Name) failed: see $out\configure.log" }
+    if ($LASTEXITCODE -ne 0) {
+        # configure.log only says that a test failed; config.log says why.
+        $details = Join-Path $out 'ffbuild\config.log'
+        if (Test-Path $details) {
+            Write-Host "--- last lines of $details ---" -ForegroundColor Yellow
+            Get-Content $details -Tail 30 | ForEach-Object { Write-Host $_ }
+        }
+        throw "FFmpeg configure ($Name) failed: see $out\configure.log and $details"
+    }
     Invoke-Checked python @('-I', (Join-Path $PSScriptRoot 'ffmpeg_sources.py'), $src, $out)
 }
 
